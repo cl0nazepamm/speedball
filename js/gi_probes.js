@@ -45,8 +45,9 @@ const RAYS_PER_PROBE = 64;         // MVP ray budget (doc target 144)
 const CLASSIFY_RAYS = 32;          // fixed full-sphere rays for classification
 const BACKFACE_FRACTION = 0.25;    // > this fraction backface hits → probe is buried → INACTIVE
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
-const TARGET_PROBES_LONG_AXIS = 12;
-const MAX_PROBES_PER_AXIS = 24;
+const TARGET_PROBES_LONG_AXIS = 12;   // default probes along the longest grid axis (live via setDivisions)
+const MAX_PROBES_PER_AXIS = 32;
+const ATLAS_DIM_FALLBACK = 8192;      // assumed GPU maxTextureDimension2D when the device limit is unreadable
 const MAX_PROBES_PER_TICK = 128;    // cap compute bursts on room-scale grids
 const SURFACE_NORMAL_BIAS_CELL = 0.03; // sample 3% of a cell off the shaded wall, not half a cell
 const TRACE_SURFACE_BIAS_CELL = 0.005; // shadow/NEE ray origin bias, scaled to scene units
@@ -112,11 +113,8 @@ export class GiProbeNode extends LightingNode {
         this.resNode = uniform(new THREE.Vector3(2, 2, 2));
         this.atlasDimNode = uniform(new THREE.Vector2(1, 1));
         this.intensityNode = uniform(1.0);
-        // Live enable gate (1 = on, 0 = off). Enable/disable is a UNIFORM, not a graph
-        // edit: the node stays compiled into the material whenever the field has data, so
-        // toggling never needs a shader recompile (which three.js WebGPU does NOT reliably
-        // trigger from material.needsUpdate alone — only a cacheToken change does, and that
-        // path flip-flopped the node in/out of the graph, leaving enable/intensity dead).
+        // Runtime enable gate. The graph membership below is still the authoritative
+        // on/off switch; this uniform remains as a cheap extra guard for compiled graphs.
         this.enabledNode = uniform(1.0);
         this.normalBiasNode = uniform(0.04);
         // 0 → no visibility test = pure trilinear "radiosity" look (THE DEFAULT, by user pref:
@@ -133,12 +131,10 @@ export class GiProbeNode extends LightingNode {
         this.classifyStrengthNode = uniform(0.0);
     }
 
-    // Graph membership = "is there a field to sample". Decoupled from enabled/intensity
-    // so the node is folded into the shader ONCE (when data first appears) and stays put;
-    // enable/disable/intensity are then pure uniform flips that always take effect. Gating
-    // membership on enabled/intensity was the bug: those flips changed only the cacheToken,
-    // which never forced a recompile, so the toggles silently did nothing.
-    get active() { return this._hasData; }
+    // Graph membership is the authoritative GI switch. WebGPU node uniforms can stay
+    // cached in already-built light graphs, so enable/disable must change whether this
+    // lighting node is pushed at all; the page marks PBR materials dirty after flips.
+    get active() { return this._enabled && this._hasData && this.intensity > 0; }
     // structure-only token: data writes (textureStore) do NOT change this, so
     // materials never recompile on a probe tick — only on resize / first data.
     get cacheToken() { return `gi-halo-probes:${this._structGen}`; }
@@ -270,16 +266,19 @@ export function getGiProbeNode() {
     return _node;
 }
 
-function computeGridResolution(size) {
+function computeGridResolution(size, targetLongAxis = TARGET_PROBES_LONG_AXIS) {
     const longest = Math.max(size.x, size.y, size.z, 1e-3);
-    const spacing = longest / TARGET_PROBES_LONG_AXIS;
+    const spacing = longest / Math.max(1, targetLongAxis);
     const axis = (s) => THREE.MathUtils.clamp(Math.round(s / spacing) + 1, 2, MAX_PROBES_PER_AXIS);
     return new THREE.Vector3(axis(size.x), axis(size.y), axis(size.z));
 }
 
-export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis = 0.95, onRebuilt = null } = {}) {
+export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis = 0.95, onRebuilt = null, divisions = TARGET_PROBES_LONG_AXIS } = {}) {
     const node = getGiProbeNode();
     node.setIntensity(intensity);
+    // Live grid density: probes along the longest axis. setDivisions() updates it and
+    // requests a (resize) rebuild; per-axis counts derive from it so cells stay ~cubic.
+    let targetLongAxis = THREE.MathUtils.clamp(Math.round(divisions) || TARGET_PROBES_LONG_AXIS, 2, MAX_PROBES_PER_AXIS);
 
     const gridMin = new THREE.Vector3();
     const gridSize = new THREE.Vector3(1, 1, 1);
@@ -915,7 +914,14 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         // Manual divisions: a single explicit volume with a res override sets grid
         // resolution directly; otherwise derive from box size.
         const resOverride = (hasVolumes && manualVolumes.length === 1 && manualVolumes[0].res) ? manualVolumes[0].res : null;
-        res.copy(resOverride ? resOverride : computeGridResolution(gridSize));
+        res.copy(resOverride ? resOverride : computeGridResolution(gridSize, targetLongAxis));
+        // Keep the octahedral atlas within the GPU's 2D texture limit. atlasH = resY·resZ·TILE
+        // is the tall axis, so a dense grid on a cubic scene can blow past 8192. Shrink res
+        // uniformly until both atlas dims fit (bounded loop; each step trims ~15%).
+        const maxDim = renderer?.backend?.device?.limits?.maxTextureDimension2D || ATLAS_DIM_FALLBACK;
+        for (let g = 0; g < 12 && (res.x * TILE > maxDim || res.y * res.z * TILE > maxDim); g++) {
+            res.set(Math.max(2, Math.floor(res.x * 0.85)), Math.max(2, Math.floor(res.y * 0.85)), Math.max(2, Math.floor(res.z * 0.85)));
+        }
         probeTotal = res.x * res.y * res.z;
         atlasW = res.x * TILE;
         atlasH = res.y * res.z * TILE;
@@ -1186,6 +1192,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             node.setClassifyStrength(v); // node-side: classification gate + relocation apply
             if (Number.isFinite(v)) U.classifyStrength.value = THREE.MathUtils.clamp(v, 0, 1); // trace-side relocation apply
         },
+        setDivisions: (n) => {
+            const v = THREE.MathUtils.clamp(Math.round(Number(n)) || TARGET_PROBES_LONG_AXIS, 2, MAX_PROBES_PER_AXIS);
+            if (v === targetLongAxis) return;
+            targetLongAxis = v;
+            requestRebuild(); // grid resize → full rebuild (idle-gated; recompiles once)
+        },
+        getDivisions: () => targetLongAxis,
         setFilterStrength: (v) => { if (Number.isFinite(v)) U.filterStrength.value = THREE.MathUtils.clamp(v, 0, 1); }, // CORE denoise: 0 = off (harness baseline), 1 = full
         setSmoothness: (v) => { if (Number.isFinite(v)) U.filterSmooth.value = THREE.MathUtils.clamp(v, 0, 1); }, // UI "Smoothness": widen the denoise edge-stop
         requestRebuild,

@@ -49,8 +49,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { createProbeField } from './js/gi_probes.js?v=sun-radiosity-15';
-import { giLights } from './js/gi_lights_node.js?v=sun-radiosity-15';
+import { createProbeField } from './js/gi_probes.js?v=sun-radiosity-16';
+import { giLights } from './js/gi_lights_node.js?v=sun-radiosity-16';
 
 const statusEl = document.getElementById('status');
 const setStatus = (msg, err = false) => { statusEl.textContent = msg; statusEl.classList.toggle('err', err); statusEl.classList.remove('hide'); };
@@ -111,7 +111,7 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const params = {
   azimuth: 89, elevation: 65.5, turbidity: 6, rayleigh: 2.2,
   sunIntensity: 8.2, exposure: 0.7,
-  giEnabled: true, giIntensity: 6, giSmoothness: 0.9, showProbes: false,
+  giEnabled: true, giIntensity: 6, giSmoothness: 0.9, giDivisions: 12, showProbes: false,
   camX: 1.1982, camY: 4.5833, camZ: -3.463,
   targetX: -3.2952, targetY: 4.4996, targetZ: -3.2815,
 };
@@ -166,14 +166,15 @@ fSky.add(params, 'azimuth', 0, 360, 1).name('azimuth°').onChange(updateSun);
 fSky.add(params, 'elevation', -3, 88, 0.5).name('elevation°').onChange(updateSun);
 fSky.add(params, 'turbidity', 0, 20, 0.1).onChange(updateSun);
 fSky.add(params, 'rayleigh', 0, 8, 0.1).onChange(updateSun);
-fSky.add(params, 'sunIntensity', 0, 10, 0.05).name('sun intensity').onChange(updateSun);
+fSky.add(params, 'sunIntensity').min(0).step(0.05).name('sun intensity').onChange(updateSun);   // uncapped
 const fGI = gui.addFolder('HALO-GI');
 const giCtrls = [];
 giCtrls.push(fGI.add(params, 'giEnabled').name('enabled').onChange((v) => { gi?.setEnabled(v); markInteraction(); }));
-giCtrls.push(fGI.add(params, 'giIntensity', 0, 6, 0.05).name('intensity').onChange((v) => { gi?.setIntensity(v); markInteraction(); }));
+giCtrls.push(fGI.add(params, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => { gi?.setIntensity(v); markInteraction(); })); // uncapped
 giCtrls.push(fGI.add(params, 'giSmoothness', 0, 1, 0.05).name('smoothness').onChange((v) => { gi?.setSmoothness(v); markInteraction(); }));
+fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi?.setDivisions(v); updateProbeHelpers(); markInteraction(); });
 fGI.add(params, 'showProbes').name('show probes').onChange(updateProbeHelpers);
-gui.add(params, 'exposure', 0, 2, 0.01).onChange((v) => { renderer.toneMappingExposure = v; });
+gui.add(params, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => { renderer.toneMappingExposure = v; });   // uncapped
 
 updateSun();
 
@@ -240,12 +241,11 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
 
   // HALO-GI: build the probe field over the model (sky already excluded). Auto-fit
   // bounds the grid to the visible geometry; opt-in, idle-gated tick in the loop.
-  gi = createProbeField({ renderer, scene, intensity: params.giIntensity, hysteresis: 0.95, onRebuilt: markGiMaterialsDirty });
+  gi = createProbeField({ renderer, scene, intensity: params.giIntensity, hysteresis: 0.95, divisions: params.giDivisions, onRebuilt: markGiMaterialsDirty });
   if (!gi.isSupported()) { setStatus('HALO-GI needs WebGPU storage features.', true); return; }
   gi.setEnabled(params.giEnabled);
   gi.setSmoothness(params.giSmoothness);
   window.gi = gi; // console handle for poking
-  window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = markGiMaterialsDirty; // diagnostics
 
   hideStatus();
   markInteraction();
