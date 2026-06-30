@@ -205,7 +205,8 @@ export class GiProbeNode extends LightingNode {
         const gridF = P.sub(this.gridMinNode).div(cell.max(vec3(1e-6)));
         const baseF = gridF.floor().clamp(vec3(0.0), res.sub(2.0).max(vec3(0.0)));
         const frac = gridF.sub(baseF).clamp(0.0, 1.0);
-        const octN = octEncodeNode(N.normalize(), TSL); // irradiance dir = shading normal
+        const Nn = N.normalize();
+        const octN = octEncodeNode(Nn, TSL); // irradiance dir = shading normal
 
         // PURE-EXPRESSION accumulation (NO toVar/addAssign): this runs inside a
         // fragment material colorNode (not an Fn-wrapped compute kernel), where
@@ -254,8 +255,16 @@ export class GiProbeNode extends LightingNode {
             const cheby = select(dist.lessThanEqual(m1.add(db)), float(1.0), chebyRaw);
             const visW = mix(float(1.0), tslMax(cheby.mul(cheby).mul(cheby), float(0.05)), this.chebyStrengthNode);
 
+            // Smooth backface/wrap weight (standard DDGI; was MISSING). Fades out probes whose
+            // hemisphere faces AWAY from the surface, so the Chebyshev term no longer has to
+            // HARD-cut them — that hard cut is the splotch that fights normal bias. Gated by
+            // chebyStrength so leak control = 0 stays the exact pure-trilinear look.
+            const dirToProbe = probePos.sub(P).div(dist.max(float(1e-6)));
+            const wrap = dot(dirToProbe, Nn).mul(0.5).add(0.5);
+            const wrapW = mix(float(1.0), tslMax(wrap.mul(wrap), float(0.05)), this.chebyStrengthNode);
+
             const stateEff = mix(float(1.0), stateV, this.classifyStrengthNode);
-            const w = wTri.mul(visW).mul(stateEff);
+            const w = wTri.mul(wrapW).mul(visW).mul(stateEff);
             const e = texture(atlas, this._tileUV(col, row, octN)).xyz;
             acc = acc.add(e.mul(w));
             wsum = wsum.add(w);
@@ -1255,7 +1264,14 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         setChebyStrength: (v) => node.setChebyStrength(v),
         setClassifyStrength: (v) => {
             node.setClassifyStrength(v); // node-side: classification gate + relocation apply
-            if (Number.isFinite(v)) U.classifyStrength.value = THREE.MathUtils.clamp(v, 0, 1); // trace-side relocation apply
+            if (Number.isFinite(v)) {
+                U.classifyStrength.value = THREE.MathUtils.clamp(v, 0, 1); // trace-side relocation apply
+                // The classify kernel only runs when classifyStrength>0, and the state buffer
+                // is zero-init (= "buried"). So turning solid-scene on AFTER load read every
+                // probe as buried and killed GI. (Re)run classification now so the state atlas
+                // actually reflects which probes are buried vs free.
+                if (U.classifyStrength.value > 0) needsClassify = true;
+            }
         },
         setDivisions: (n) => {
             const v = THREE.MathUtils.clamp(Math.round(Number(n)) || TARGET_PROBES_LONG_AXIS, 2, MAX_PROBES_PER_AXIS);
@@ -1304,7 +1320,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         _debugRead: async (which) => {
             const buf = which === 'irr' ? gpu?.irrBuffer
                 : which === 'mat' ? gpu?.buffers?.materials
-                : which === 'lights' ? gpu?.buffers?.lights : null;
+                : which === 'lights' ? gpu?.buffers?.lights
+                : which === 'state' ? gpu?.stateBuffer : null;
             if (!buf || typeof renderer.getArrayBufferAsync !== 'function') return null;
             try { return new Float32Array(await renderer.getArrayBufferAsync(buf)); } catch (e) { return { error: String(e) }; }
         },
