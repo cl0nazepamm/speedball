@@ -41,7 +41,13 @@ const TSL = { float, vec2, vec3, abs: tslAbs, select, max: tslMax, normalize };
 const OCT_RES = 6;                 // interior octahedral resolution per probe
 const BORDER = 1;                  // 1px gutter on every side
 const TILE = OCT_RES + 2 * BORDER; // 8×8 atlas tile
-const RAYS_PER_PROBE = 64;         // MVP ray budget (doc target 144)
+const RAYS_PER_PROBE_DEFAULT = 64; // MVP ray budget (doc target 144). LOCKED baseline:
+                                   // divisions=12 → 624 probes is tuned at 64 rays. Live via setRays().
+const RAYS_MIN = 32, RAYS_MAX = 256;
+// DIAGNOSTIC: gate the in-trace albedo/emissive TEXTURE sampling. false → packed-color
+// baseline (the proven-working path); true → Lumen-style textured bounce. Flipped to
+// isolate whether the texture path is what's blacking out the field.
+const GI_SAMPLE_TEXTURES = false;
 const CLASSIFY_RAYS = 32;          // fixed full-sphere rays for classification
 const BACKFACE_FRACTION = 0.25;    // > this fraction backface hits → probe is buried → INACTIVE
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
@@ -134,7 +140,12 @@ export class GiProbeNode extends LightingNode {
     // Graph membership is the authoritative GI switch. WebGPU node uniforms can stay
     // cached in already-built light graphs, so enable/disable must change whether this
     // lighting node is pushed at all; the page marks PBR materials dirty after flips.
-    get active() { return this._enabled && this._hasData && this.intensity > 0; }
+    // Graph membership = "is there a field to sample". MUST stay decoupled from
+    // enabled/intensity: setup() gates those via the enabledNode/intensityNode UNIFORMS,
+    // so the node is folded into the shader ONCE (when data appears) and stays put.
+    // Gating active on _enabled/intensity reintroduces the original bug — toggling them
+    // only flips the cacheToken, which never forces a recompile, so GI silently drops out.
+    get active() { return this._hasData; }
     // structure-only token: data writes (textureStore) do NOT change this, so
     // materials never recompile on a probe tick — only on resize / first data.
     get cacheToken() { return `gi-halo-probes:${this._structGen}`; }
@@ -279,6 +290,15 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     // Live grid density: probes along the longest axis. setDivisions() updates it and
     // requests a (resize) rebuild; per-axis counts derive from it so cells stay ~cubic.
     let targetLongAxis = THREE.MathUtils.clamp(Math.round(divisions) || TARGET_PROBES_LONG_AXIS, 2, MAX_PROBES_PER_AXIS);
+    // Live ray budget per probe (structural — changing it re-sizes the ray scratch buffer and
+    // rebuilds the trace/blend kernels, so setRays() requests an idle-gated rebuild). Default
+    // 64 keeps the locked 624-probe baseline visually-equivalent.
+    let raysPerProbe = RAYS_PER_PROBE_DEFAULT;
+    // Normal-bias scale (×) over the auto-computed minCell·SURFACE_NORMAL_BIAS_CELL offset, and the
+    // most-recent minCell, so setNormalBias() can rewrite the node uniform INSTANTLY (no rebuild)
+    // and the scale survives the next rebuild's auto-bias recompute.
+    let normalBiasScale = 1.0;
+    let curMinCell = 0.1;
 
     const gridMin = new THREE.Vector3();
     const gridSize = new THREE.Vector3(1, 1, 1);
@@ -288,6 +308,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
 
     let gpu = null;           // { buffers, kernels, atlases, buffers... }
     let dirty = true;
+    // Cached CPU build (BVH soup + material textures). The BVH depends ONLY on geometry,
+    // so a divisions/rays change must NOT rebuild it — that ~200ms synchronous MeshBVH +
+    // soup-flatten is the one remaining main-thread hitch. buildDirty gates a fresh build:
+    // it's set by geometry/light-count/volume changes (true at start), and left FALSE by
+    // setDivisions/setRays so those resize the grid/kernels off the cached soup (no hitch).
+    let cachedBuilt = null;
+    let buildDirty = true;
     let manualVolumes = null; // explicit probe volumes (Probe Origin boxes); null = auto-fit scene
     let needsClassify = true; // one-shot probe classification after a rebuild
     let needsClear = true;    // zero the atlas+depthAtlas ONCE on a FULL rebuild (fresh textures
@@ -307,7 +334,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     let quantStep = 1;        // translation deadband (~quarter cell) for the geo signature (A1)
     let lightQuant = 1;       // scene-relative position deadband for the light signature (B4)
     // reactivity: self-detect live light/geometry edits and re-converge fast.
-    const baseHysteresis = THREE.MathUtils.clamp(hysteresis, 0, 0.99);
+    let baseHysteresis = THREE.MathUtils.clamp(hysteresis, 0, 0.99);
     let lastLightSig = null;
     let lastGeoSig = null;
     let geoStable = -1;       // -1 = no pending geo change; >=0 = stable-check count since a change (debounce, A1)
@@ -377,7 +404,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         // toroidally shift BOTH z and azimuth by the per-frame jitter. Same 64
         // rays, materially lower variance than the old raw index-shift; keeps the
         // (k, jitter) signature so the blend gather reproduces each ray identically.
-        const sk = float(kNode).add(0.5).div(float(RAYS_PER_PROBE));
+        const sk = float(kNode).add(0.5).div(float(raysPerProbe));
         const u = sk.add(jitterNode);
         const uw = u.sub(floor(u));                           // wrap to [0,1) (fract is not imported)
         const z = float(1.0).sub(uw.mul(2.0));
@@ -427,14 +454,14 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const Utrav = { nodeCount: uniform(built.nodeCount >>> 0, 'uint'), envRotation: uniform(0.0), envIntensity: uniform(1.0) };
         const trav = buildTraversal({
             storages: { bvhNodes, triIndex, vertexData, triMaterial, materials },
-            U: Utrav, env: null, lut: null, lutRes: 0, maps: {},
+            U: Utrav, env: null, lut: null, lutRes: 0, maps: built.maps,
         });
-        const { fetchVert, fetchNorm, traverseClosest, traverseAny, matFloat, triVert } = trav;
+        const { fetchVert, fetchNorm, traverseClosest, traverseAny, matFloat, triVert, fetchUV, hitUV, sampleLayer, srgbToLinear, albedoTex, emissiveTex, haveAlbedoMap, haveEmissiveMap } = trav;
 
         // ray scratch: 4 floats per (probe,ray) = rgb + hitT. itemSize-1 'float'
         // scalar storage — the proven in-repo pattern (gi_irradiance_volume), not
         // the unproven vec4 binding.
-        const rayBuffer = new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, updatedCap() * RAYS_PER_PROBE * 4)), 1);
+        const rayBuffer = new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, updatedCap() * raysPerProbe * 4)), 1);
         const rayData = storage(rayBuffer, 'float', rayBuffer.count);
 
         // irradiance STATE buffer (read_write): 4 floats per probe texel. Reused on a
@@ -522,9 +549,9 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         // ── TRACE: one thread per (updated probe, ray). RGB shade; miss=BLACK ──
         const traceKernel = Fn(() => {
             const gid = instanceIndex.toVar();
-            const slot = gid.div(uint(RAYS_PER_PROBE)).toVar();
+            const slot = gid.div(uint(raysPerProbe)).toVar();
             If(slot.greaterThanEqual(U.updatedCount), () => { Return(); });
-            const k = gid.mod(uint(RAYS_PER_PROBE)).toVar();
+            const k = gid.mod(uint(raysPerProbe)).toVar();
             const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
             const ro = probeWorldPos(probeIndex).toVar();
             // apply relocation offset (gated by classifyStrength; 0 = no relocation).
@@ -552,8 +579,34 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const traceBias = tslMax(U.cellMin.mul(float(TRACE_SURFACE_BIAS_CELL)), float(RAY_EPS));
                 const hitPos = hitPoint.add(ng.mul(traceBias)).toVar();
 
+                // Recover hit UV via Möller–Trumbore barycentrics (traverseClosest
+                // discards them). Mirror the traversal's op order/float types so the
+                // UVs are numerically identical. A real hit guarantees |det|>0.
+                const e1 = p1.sub(p0);
+                const e2 = p2.sub(p0);
+                const pv = cross(rd, e2);
+                const det = dot(e1, pv);
+                const invDet = float(1.0).div(det);
+                const tv = ro.sub(p0);
+                const ub = dot(tv, pv).mul(invDet);
+                const qv = cross(tv, e1);
+                const vb = dot(rd, qv).mul(invDet);
+                const uv0 = hitUV(triId, ub, vb);
+                const uv = uv0.mul(vec2(matFloat(matId, 18), matFloat(matId, 19))).add(vec2(matFloat(matId, 20), matFloat(matId, 21)));
+
                 const baseColor = vec3(matFloat(matId, 0), matFloat(matId, 1), matFloat(matId, 2)).toVar();
-                const emissive = vec3(matFloat(matId, 7), matFloat(matId, 8), matFloat(matId, 9));
+                if (GI_SAMPLE_TEXTURES && haveAlbedoMap) {
+                    const aL = matFloat(matId, 12);
+                    const texRGB = srgbToLinear(sampleLayer(albedoTex, uv, aL));
+                    // factor × texture; layer −1 (no map) falls back to the packed factor.
+                    baseColor.assign(select(aL.greaterThan(float(-0.5)), baseColor.mul(texRGB), baseColor));
+                }
+                const emissive = vec3(matFloat(matId, 7), matFloat(matId, 8), matFloat(matId, 9)).toVar();
+                if (GI_SAMPLE_TEXTURES && haveEmissiveMap) {
+                    const eL = matFloat(matId, 16);
+                    const eTex = srgbToLinear(sampleLayer(emissiveTex, uv, eL));
+                    emissive.assign(select(eL.greaterThan(float(-0.5)), emissive.mul(eTex), emissive));
+                }
                 const radiance = emissive.toVar();
 
                 // energy-weighted diffuse albedo: metals (slot 4) and glass (slot 5)
@@ -613,12 +666,12 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             // miss → outRgb stays BLACK (CRITICAL: never sample sky here — IBL
             // owns the sky hemisphere; sampling it would double-count IBL).
 
-            const rb = slot.mul(uint(RAYS_PER_PROBE)).add(k).mul(uint(4)).toVar();
+            const rb = slot.mul(uint(raysPerProbe)).add(k).mul(uint(4)).toVar();
             rayData.element(rb).assign(outRgb.x);
             rayData.element(rb.add(uint(1))).assign(outRgb.y);
             rayData.element(rb.add(uint(2))).assign(outRgb.z);
             rayData.element(rb.add(uint(3))).assign(hitT);
-        })().compute(updatedCap() * RAYS_PER_PROBE);
+        })().compute(updatedCap() * raysPerProbe);
 
         // ── BLEND: one thread per (updated probe, atlas texel). Cosine-gather
         // the probe's rays for this texel's octahedral direction; hysteresis. ──
@@ -642,8 +695,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const dAcc = float(0.0).toVar();   // Σ w·dist  (sharp cosine weight)
             const dAcc2 = float(0.0).toVar();  // Σ w·dist²
             const dwsum = float(0.0).toVar();
-            Loop({ start: uint(0), end: uint(RAYS_PER_PROBE), type: 'uint', condition: '<' }, ({ i: k }) => {
-                const rb = slot.mul(uint(RAYS_PER_PROBE)).add(k).mul(uint(4));
+            Loop({ start: uint(0), end: uint(raysPerProbe), type: 'uint', condition: '<' }, ({ i: k }) => {
+                const rb = slot.mul(uint(raysPerProbe)).add(k).mul(uint(4));
                 const rrgb = vec3(rayData.element(rb), rayData.element(rb.add(uint(1))), rayData.element(rb.add(uint(2))));
                 const hitT = rayData.element(rb.add(uint(3)));
                 const rdir = normalize(rayDir(k, U.frameJitter));
@@ -885,12 +938,20 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     }
 
     async function rebuild() {
-        const buildSpectralScene = await ensureSceneBuilder();
-        const built = buildSpectralScene({ THREE, scene, maxTriangles: MAX_TRIANGLES });
-        // On a failed/empty build, keep the EXISTING field as history (don't tear it
-        // down) — tick() arms a backoff so we don't re-enter the synchronous build
-        // every frame. (A7)
-        if (!built || built.error) return false;
+        // Reuse the cached BVH+texture soup unless geometry actually changed. A
+        // divisions/rays change (buildDirty=false) skips the synchronous MeshBVH build
+        // entirely → no main-thread hitch; it only resizes the grid/atlas/kernels below.
+        let built = cachedBuilt;
+        if (!built || buildDirty) {
+            const buildSpectralScene = await ensureSceneBuilder();
+            built = await buildSpectralScene({ THREE, scene, maxTriangles: MAX_TRIANGLES });
+            // On a failed/empty build, keep the EXISTING field as history (don't tear it
+            // down) — tick() arms a backoff so we don't re-enter the synchronous build
+            // every frame. (A7)
+            if (!built || built.error) return false;
+            cachedBuilt = built;
+            buildDirty = false;
+        }
 
         const box = new THREE.Box3();
         scene.updateMatrixWorld(true);
@@ -927,6 +988,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         atlasH = res.y * res.z * TILE;
 
         const minCell = Math.min(gridSize.x / Math.max(1, res.x - 1), gridSize.y / Math.max(1, res.y - 1), gridSize.z / Math.max(1, res.z - 1));
+        curMinCell = Math.max(1e-4, minCell);                   // remembered so setNormalBias() can rewrite the node uniform live
         quantStep = Math.max(1e-4, minCell * 0.25);             // A1: geo-signature translation deadband (~¼ cell)
         lightQuant = Math.max(1e-3, gridSize.length() * 0.003); // B4: light-signature position deadband (~0.3% of scene)
 
@@ -952,7 +1014,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             U.relocClamp.value = 0.45 * minCell;
             // res / probeTotal / atlasDim are unchanged by definition → leave those uniforms.
             // Churn-free: update the NODE's placement uniforms WITHOUT bumping _structGen.
-            node.updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL, minCell * GI_CHEBY_BIAS_CELL);
+            node.updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL * normalBiasScale, minCell * GI_CHEBY_BIAS_CELL);
             probeCursor = 0;
             refreshStarted = false;
             needsClear = false;             // reuse the live atlas history (no black flash)
@@ -976,7 +1038,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         U.cellMin.value = Math.max(1e-4, minCell);
         U.relocClamp.value = 0.45 * minCell;
         node.setAtlases(gpu.atlas, gpu.depthAtlas, gpu.stateAtlas);
-        node.setGrid(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL, minCell * GI_CHEBY_BIAS_CELL);
+        node.setGrid(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL * normalBiasScale, minCell * GI_CHEBY_BIAS_CELL);
         prevAtlasW = atlasW; prevAtlasH = atlasH; prevProbeTotal = probeTotal;
         probeCursor = 0;
         refreshStarted = false;
@@ -1104,7 +1166,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     }
 
     function setEnabled(on) { node.setEnabled(on === true); if (on && (!gpu || !node._hasData)) requestRebuild(); }
-    function requestRebuild() { dirty = true; rebuildBackoff = 0; } // a genuine request clears any failure backoff
+    // freshBuild=true (default) invalidates the cached BVH+texture soup so rebuild()
+    // rebuilds it (geometry/light-count/volume change, or first build). Grid-only callers
+    // (setDivisions/setRays) pass false → the cached soup is reused, no MeshBVH hitch.
+    function requestRebuild(freshBuild = true) { dirty = true; rebuildBackoff = 0; if (freshBuild) buildDirty = true; }
     // Set explicit probe volume(s) — e.g. synced "HALO-GI Probe Grid" helpers. Each
     // entry is a world-space THREE.Box3 (auto resolution) OR { box, res } where res is
     // a Vector3/[x,y,z] of MANUAL per-axis divisions. Pass null/empty to revert to
@@ -1180,7 +1245,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         reactiveTicks = REACTIVE_TICKS;
     }
 
-    function dispose() { disposed = true; disposeGPU(); node.setEnabled(false); }
+    function dispose() { disposed = true; disposeGPU(); cachedBuilt = null; buildDirty = true; node.setEnabled(false); }
 
     return {
         node,
@@ -1196,17 +1261,39 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const v = THREE.MathUtils.clamp(Math.round(Number(n)) || TARGET_PROBES_LONG_AXIS, 2, MAX_PROBES_PER_AXIS);
             if (v === targetLongAxis) return;
             targetLongAxis = v;
-            requestRebuild(); // grid resize → full rebuild (idle-gated; recompiles once)
+            requestRebuild(false); // grid-only resize → reuse cached BVH+textures (no MeshBVH hitch)
         },
         getDivisions: () => targetLongAxis,
+        // ── STRUCTURAL knob: ray budget per probe. Re-sizes the ray scratch + rebuilds the
+        // trace/blend kernels, so it goes through the idle-gated rebuild (never a per-tick recompile).
+        setRays: (n) => {
+            const v = THREE.MathUtils.clamp(Math.round(Number(n) / 16) * 16 || RAYS_PER_PROBE_DEFAULT, RAYS_MIN, RAYS_MAX);
+            if (v === raysPerProbe) return;
+            raysPerProbe = v;
+            requestRebuild(false); // ray budget only → reuse cached BVH+textures (kernel rebuild, no MeshBVH hitch)
+        },
+        getRays: () => raysPerProbe,
+        // ── UNIFORM knobs (apply INSTANTLY — no recompile, no rebuild). ──
         setFilterStrength: (v) => { if (Number.isFinite(v)) U.filterStrength.value = THREE.MathUtils.clamp(v, 0, 1); }, // CORE denoise: 0 = off (harness baseline), 1 = full
         setSmoothness: (v) => { if (Number.isFinite(v)) U.filterSmooth.value = THREE.MathUtils.clamp(v, 0, 1); }, // UI "Smoothness": widen the denoise edge-stop
+        setHysteresis: (v) => {
+            if (!Number.isFinite(v)) return;
+            baseHysteresis = THREE.MathUtils.clamp(v, 0, 0.99); // steady-state temporal blend (higher = more stable/slower)
+            U.hysteresis.value = baseHysteresis;                // apply now; tick() re-asserts it when no reactive burst is active
+        },
+        setNormalBias: (v) => {
+            if (!Number.isFinite(v)) return;
+            normalBiasScale = THREE.MathUtils.clamp(v, 0, 8);   // × the auto minCell·SURFACE_NORMAL_BIAS_CELL offset
+            node.normalBiasNode.value = Math.max(1e-4, curMinCell * SURFACE_NORMAL_BIAS_CELL * normalBiasScale);
+        },
+        setRadianceClamp: (v) => { if (Number.isFinite(v)) U.radianceClamp.value = Math.max(0, v); },   // cap multibounce feedback (anti-runaway)
+        setDepthSharpness: (v) => { if (Number.isFinite(v)) U.depthSharpness.value = THREE.MathUtils.clamp(v, 1, 200); }, // depth-moment cosine power (Chebyshev crispness)
         requestRebuild,
         setBounds,
         setVolumes,
         isSupported,
         hasData: () => node._hasData === true,
-        getStats: () => ({ probes: probeTotal, res: res.clone(), atlas: [atlasW, atlasH], rays: RAYS_PER_PROBE, oct: OCT_RES, tile: TILE, active: node.active }),
+        getStats: () => ({ probes: probeTotal, res: res.clone(), atlas: [atlasW, atlasH], rays: raysPerProbe, oct: OCT_RES, tile: TILE, active: node.active }),
         getResolution: () => res.clone(),
         getBounds: () => new THREE.Box3(gridMin.clone(), gridMin.clone().add(gridSize)),
         _debugUpload: async () => { if (gpu && !disposed) { try { await renderer.computeAsync(gpu.uploadKernel); } catch (e) { /* harness-only */ } } },
@@ -1214,6 +1301,14 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         _debugDepthAtlas: () => gpu?.depthAtlas || null,
         _debugStateAtlas: () => gpu?.stateAtlas || null,
         _debugStateBuffer: () => gpu?.stateBuffer || null,
+        _debugRead: async (which) => {
+            const buf = which === 'irr' ? gpu?.irrBuffer
+                : which === 'mat' ? gpu?.buffers?.materials
+                : which === 'lights' ? gpu?.buffers?.lights : null;
+            if (!buf || typeof renderer.getArrayBufferAsync !== 'function') return null;
+            try { return new Float32Array(await renderer.getArrayBufferAsync(buf)); } catch (e) { return { error: String(e) }; }
+        },
+        _debugLightCount: () => gpu?.lightCount,
         dispose,
     };
 }

@@ -269,7 +269,7 @@ function extractTextureRGBA(tex, size) {
 // Walk every uber material, extract each map type, build the DataArrayTextures,
 // and write the assigned layer index back into each uber record. Returns
 // { albedo, normal, roughness, metalness, emissive, alpha } (DataArrayTexture | null).
-function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
+async function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
     const TYPES = [
         { field: 'map', recIdx: 12, out: 'albedo' },
         { field: 'normalMap', recIdx: 13, out: 'normal' },
@@ -289,6 +289,13 @@ function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
             if (!tex || !tex.isTexture) continue;
             let layer = byUuid.get(tex.uuid);
             if (layer === undefined) {
+                // Time-slice: yield a frame before each unique-texture canvas
+                // resample so the per-texture drawImage+getImageData cost is
+                // spread across frames instead of one synchronous stall. Cheap
+                // (already-extracted) repeats of the same uuid don't yield.
+                if (typeof requestAnimationFrame === 'function') {
+                    await new Promise((r) => requestAnimationFrame(r));
+                }
                 const data = extractTextureRGBA(tex, size);
                 if (!data) continue; // unreadable → leave record layer at −1
                 layer = layers.length;
@@ -441,7 +448,7 @@ export function collectLights(THREE, scene, camera = null) {
 
 // ── Main build ─────────────────────────────────────────────────────
 
-export function buildSpectralScene({ THREE, scene, camera = null, maxTriangles = 4_000_000 } = {}) {
+export async function buildSpectralScene({ THREE, scene, camera = null, maxTriangles = 4_000_000 } = {}) {
     if (!scene) return null;
     scene.updateMatrixWorld(true);
 
@@ -617,7 +624,7 @@ export function buildSpectralScene({ THREE, scene, camera = null, maxTriangles =
     // Extract PBR maps into array textures FIRST — this writes each material's
     // assigned layer index into its uber record ([12..16]) before we pack the
     // materials buffer below.
-    const maps = buildMaterialTextures(THREE, uberList, uberMaterials, TEXTURE_ATLAS_SIZE);
+    const maps = await buildMaterialTextures(THREE, uberList, uberMaterials, TEXTURE_ATLAS_SIZE);
 
     // Materials buffer
     const materials = new Float32Array(uberList.length * MAT_STRIDE);

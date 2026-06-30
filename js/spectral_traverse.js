@@ -321,7 +321,7 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
     };
 
     return {
-        fetchVert, fetchNorm, fetchUV, triVert, matFloat,
+        fetchVert, fetchNorm, fetchUV, hitUV, triVert, matFloat,
         srgbToLinear, sampleLayer,
         jhReflectance, jhEmission, envAtLambda, cosineSample,
         traverseClosest, traverseAny,

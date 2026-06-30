@@ -49,8 +49,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { createProbeField } from './js/gi_probes.js?v=sun-radiosity-16';
-import { giLights } from './js/gi_lights_node.js?v=sun-radiosity-16';
+import { createProbeField } from './js/gi_probes.js?v=halo1';
+import { giLights } from './js/gi_lights_node.js?v=halo1';
 
 const statusEl = document.getElementById('status');
 const setStatus = (msg, err = false) => { statusEl.textContent = msg; statusEl.classList.toggle('err', err); statusEl.classList.remove('hide'); };
@@ -111,7 +111,10 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const params = {
   azimuth: 89, elevation: 65.5, turbidity: 6, rayleigh: 2.2,
   sunIntensity: 8.2, exposure: 0.7,
-  giEnabled: true, giIntensity: 6, giSmoothness: 0.9, giDivisions: 12, showProbes: false,
+  giEnabled: true, giIntensity: 6, giDivisions: 12, showProbes: false,
+  // quality knobs (defaults mirror gi_probes.js). smoothness is pinned to 1 (no slider).
+  giRays: 64, giDenoise: 1, giHysteresis: 0.95, giNormalBias: 1,
+  giRadianceClamp: 8, giDepthSharpness: 50, giLeak: 0, giSolid: 0,
   camX: 1.1982, camY: 4.5833, camZ: -3.463,
   targetX: -3.2952, targetY: 4.4996, targetZ: -3.2815,
 };
@@ -171,9 +174,21 @@ const fGI = gui.addFolder('HALO-GI');
 const giCtrls = [];
 giCtrls.push(fGI.add(params, 'giEnabled').name('enabled').onChange((v) => { gi?.setEnabled(v); markInteraction(); }));
 giCtrls.push(fGI.add(params, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => { gi?.setIntensity(v); markInteraction(); })); // uncapped
-giCtrls.push(fGI.add(params, 'giSmoothness', 0, 1, 0.05).name('smoothness').onChange((v) => { gi?.setSmoothness(v); markInteraction(); }));
+// STRUCTURAL knobs (idle-gated rebuild — never a per-tick recompile).
 fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi?.setDivisions(v); updateProbeHelpers(); markInteraction(); });
+fGI.add(params, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi?.setRays(v); markInteraction(); });
 fGI.add(params, 'showProbes').name('show probes').onChange(updateProbeHelpers);
+
+// Quality subfolder — UNIFORM-backed, apply instantly (no recompile/rebuild).
+// smoothness is intentionally NOT exposed: pinned to 1 at init.
+const fQ = fGI.addFolder('Quality');
+giCtrls.push(fQ.add(params, 'giDenoise', 0, 1, 0.05).name('denoise').onChange((v) => { gi?.setFilterStrength(v); markInteraction(); }));
+giCtrls.push(fQ.add(params, 'giHysteresis', 0.5, 0.99, 0.01).name('hysteresis').onChange((v) => { gi?.setHysteresis(v); markInteraction(); }));
+giCtrls.push(fQ.add(params, 'giNormalBias', 0, 4, 0.05).name('normal bias').onChange((v) => { gi?.setNormalBias(v); markInteraction(); }));
+giCtrls.push(fQ.add(params, 'giRadianceClamp', 0, 32, 0.5).name('radiance clamp').onChange((v) => { gi?.setRadianceClamp(v); markInteraction(); }));
+giCtrls.push(fQ.add(params, 'giDepthSharpness', 1, 200, 1).name('depth sharpness').onChange((v) => { gi?.setDepthSharpness(v); markInteraction(); }));
+giCtrls.push(fQ.add(params, 'giLeak', 0, 1, 0.05).name('leak control').onChange((v) => { gi?.setChebyStrength(v); markInteraction(); }));
+giCtrls.push(fQ.add(params, 'giSolid', 0, 1, 0.05).name('solid-scene').onChange((v) => { gi?.setClassifyStrength(v); markInteraction(); }));
 gui.add(params, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => { renderer.toneMappingExposure = v; });   // uncapped
 
 updateSun();
@@ -188,12 +203,23 @@ function markGiMaterialsDirty() {
     if (!m || seen.has(m)) return; seen.add(m);
     if (m.isMeshBasicMaterial || m.isLineBasicMaterial) return;
     if (m.visible === false) return;
+    // In this three.js WebGPU build, material.needsUpdate alone does NOT rebuild the node
+    // graph, so the just-activated GI lighting node never folds into the program (the GI
+    // field has energy but never injects → "GI lost"). Disposing the compiled program
+    // forces a true rebuild on the next draw, re-running the lights graph so GI folds in.
+    // Only fires on an idle-gated rebuild (first data / grid resize), never per frame.
+    m.dispose?.();
     m.needsUpdate = true;
   };
   scene.traverse((o) => {
     if (!o.material) return;
     if (Array.isArray(o.material)) o.material.forEach(mark); else mark(o.material);
   });
+  // NOTE: do NOT call renderer.compileAsync() here. It compiles+caches the materials
+  // and consumes the needsUpdate flag, baking a variant that can omit the just-activated
+  // GI lighting node — the render then reuses that non-GI program and GI is silently lost.
+  // The lazy recompile on the next draw folds GI in correctly (proven baseline). Pipeline
+  // warm-up is not worth dropping GI.
 }
 
 function prepareSponzaMaterialForGi(material) {
@@ -244,7 +270,16 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
   gi = createProbeField({ renderer, scene, intensity: params.giIntensity, hysteresis: 0.95, divisions: params.giDivisions, onRebuilt: markGiMaterialsDirty });
   if (!gi.isSupported()) { setStatus('HALO-GI needs WebGPU storage features.', true); return; }
   gi.setEnabled(params.giEnabled);
-  gi.setSmoothness(params.giSmoothness);
+  // Push the quality defaults so the GUI and the GI uniforms agree on first paint.
+  gi.setSmoothness(1);                       // pinned (no slider)
+  gi.setFilterStrength(params.giDenoise);
+  gi.setHysteresis(params.giHysteresis);
+  gi.setNormalBias(params.giNormalBias);
+  gi.setRadianceClamp(params.giRadianceClamp);
+  gi.setDepthSharpness(params.giDepthSharpness);
+  gi.setChebyStrength(params.giLeak);
+  gi.setClassifyStrength(params.giSolid);
+  gi.setRays(params.giRays);
   window.gi = gi; // console handle for poking
 
   hideStatus();

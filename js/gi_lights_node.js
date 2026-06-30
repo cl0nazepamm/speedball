@@ -10,8 +10,8 @@
 
 import DynamicLightsNode from 'three/addons/tsl/lighting/DynamicLightsNode.js';
 import { NodeUtils } from 'three/webgpu';
-import { getGiProbeNode } from './gi_probes.js?v=sun-radiosity-16';
-import { getGiVolumeNode } from './gi_irradiance_volume.js?v=sun-radiosity-16';
+import { getGiProbeNode } from './gi_probes.js?v=halo1';
+import { getGiVolumeNode } from './gi_irradiance_volume.js?v=halo1';
 
 export default class GiLightsNode extends DynamicLightsNode {
     static get type() { return 'GiLightsNode'; }
