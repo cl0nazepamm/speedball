@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>HALO-GI — standalone (WebGPU DDGI + Sky)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #11151c; color: #cdd6e0;
+    font: 12px/1.5 ui-monospace, "Cascadia Code", Menlo, monospace; }
+  #c { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; left: 12px; top: 10px; pointer-events: none;
+    text-shadow: 0 1px 2px #000a; max-width: 46ch; }
+  #hud b { color: #8fd0ff; font-weight: 600; letter-spacing: .04em; }
+  #hud .sub { color: #7c8794; }
+  #status { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    padding: 14px 20px; border-radius: 10px; background: #1a2230d0; border: 1px solid #2c384a;
+    color: #cdd6e0; white-space: pre; text-align: center; }
+  #status.err { border-color: #6b2330; color: #ff9aa6; background: #2a161bd0; }
+  #status.hide { display: none; }
+  .lil-gui { --width: 290px; --font-size: 11px; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three-r185/build/three.webgpu.js",
+    "three/webgpu": "./vendor/three-r185/build/three.webgpu.js",
+    "three/tsl": "./vendor/three-r185/build/three.tsl.js",
+    "three/addons/": "./vendor/three-r185/examples/",
+    "three-mesh-bvh": "./node_modules/three-mesh-bvh/src/index.js"
+  },
+  "scopes": {
+    "./node_modules/three-mesh-bvh/": { "three": "./vendor/three-r185/build/three.module.js" }
+  }
+}
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <b>HALO-GI</b> <span class="sub">· BVH-traced DDGI · WebGPU</span><br>
+  <span class="sub">drag to orbit · scroll to zoom · sun = azimuth/elevation</span><br>
+  <span class="sub" id="gi-stat">GI: starting…</span>
+</div>
+<div id="status">initializing WebGPU…</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
+import GUI from 'three/addons/libs/lil-gui.module.min.js';
+import { createProbeField } from './js/gi_probes.js?v=sun-radiosity-15';
+import { giLights } from './js/gi_lights_node.js?v=sun-radiosity-15';
+
+const statusEl = document.getElementById('status');
+const setStatus = (msg, err = false) => { statusEl.textContent = msg; statusEl.classList.toggle('err', err); statusEl.classList.remove('hide'); };
+const hideStatus = () => statusEl.classList.add('hide');
+window.addEventListener('error', (e) => setStatus('Error:\n' + (e.error?.stack || e.message), true));
+window.addEventListener('unhandledrejection', (e) => setStatus('Error:\n' + (e.reason?.stack || e.reason), true));
+
+// ── Renderer ────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGPURenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.toneMappingExposure = 0.7;
+await renderer.init();
+if (renderer.backend?.isWebGPUBackend !== true) {
+  setStatus('WebGPU not available.\nThis demo needs a WebGPU-capable browser\n(Chrome/Edge 121+, or Firefox Nightly).', true);
+  throw new Error('WebGPU unavailable');
+}
+
+// ── Non-Studio HALO-GI lighting node ─────────────────────────────────────────
+// GiLightsNode = stock batched DynamicLightsNode + opt-in probe-irradiance
+// injection. Installing it as the renderer's lights factory is all that's needed
+// for HALO-GI to fold into every PBR material — no per-material wiring.
+renderer.lighting.createNode = (lights = []) => giLights({
+  maxDirectionalLights: 4, maxPointLights: 16, maxSpotLights: 16, maxHemisphereLights: 2,
+}).setLights(lights);
+
+// ── Scene & camera ────────────────────────────────────────────────────────────
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.05, 4000);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+
+// ── Sky (Preetham, WebGPU) + sun ──────────────────────────────────────────────
+const sky = new SkyMesh();
+sky.scale.setScalar(1500);                 // within the camera far plane (no z-precision hit)
+sky.userData.maxjsVisible = false;          // keep the sky OUT of the GI BVH (spectral_scene gate)
+scene.add(sky);
+
+const sun = new THREE.DirectionalLight(0xffffff, 3.2);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.05;
+scene.add(sun);
+scene.add(sun.target);
+
+// soft sky/ground fill so shadowed areas aren't pure black before GI converges
+const hemi = new THREE.HemisphereLight(0x9fc6ff, 0x4a4036, 0.25);
+scene.add(hemi);
+
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+// ── Parameters & controls ─────────────────────────────────────────────────────
+const params = {
+  azimuth: 89, elevation: 65.5, turbidity: 6, rayleigh: 2.2,
+  sunIntensity: 8.2, exposure: 0.7,
+  giEnabled: true, giIntensity: 6, giSmoothness: 0.9, showProbes: false,
+  camX: 1.1982, camY: 4.5833, camZ: -3.463,
+  targetX: -3.2952, targetY: 4.4996, targetZ: -3.2815,
+};
+
+function applyCamera() {
+  camera.position.set(params.camX, params.camY, params.camZ);
+  controls.target.set(params.targetX, params.targetY, params.targetZ);
+}
+applyCamera();
+window.camera = camera;
+window.controls = controls;
+window.dumpCamera = () => ({
+  camX: +camera.position.x.toFixed(4),
+  camY: +camera.position.y.toFixed(4),
+  camZ: +camera.position.z.toFixed(4),
+  targetX: +controls.target.x.toFixed(4),
+  targetY: +controls.target.y.toFixed(4),
+  targetZ: +controls.target.z.toFixed(4),
+});
+
+const sunVec = new THREE.Vector3();
+function updateSun() {
+  const phi = THREE.MathUtils.degToRad(90 - params.elevation);  // 0 = zenith
+  const theta = THREE.MathUtils.degToRad(params.azimuth);
+  sunVec.setFromSphericalCoords(1, phi, theta);
+  sky.sunPosition.value.copy(sunVec);
+  sky.turbidity.value = params.turbidity;
+  sky.rayleigh.value = params.rayleigh;
+  // place the directional light far along the sun vector, aimed at the scene
+  sun.position.copy(sunVec).multiplyScalar(60);
+  sun.target.position.set(0, 0, 0);
+  sun.intensity = params.sunIntensity;
+  // warm the sun as it nears the horizon
+  const warm = THREE.MathUtils.clamp(params.elevation / 18, 0, 1);
+  sun.color.setRGB(1.0, 0.6 + 0.4 * warm, 0.35 + 0.65 * warm);
+  markInteraction();
+}
+
+let lastInteractionMs = 0;
+const markInteraction = () => { lastInteractionMs = performance.now(); };
+controls.addEventListener('change', markInteraction);
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  markInteraction();
+});
+
+const gui = new GUI({ title: 'HALO-GI · Sky' });
+const fSky = gui.addFolder('Sky / Sun');
+fSky.add(params, 'azimuth', 0, 360, 1).name('azimuth°').onChange(updateSun);
+fSky.add(params, 'elevation', -3, 88, 0.5).name('elevation°').onChange(updateSun);
+fSky.add(params, 'turbidity', 0, 20, 0.1).onChange(updateSun);
+fSky.add(params, 'rayleigh', 0, 8, 0.1).onChange(updateSun);
+fSky.add(params, 'sunIntensity', 0, 10, 0.05).name('sun intensity').onChange(updateSun);
+const fGI = gui.addFolder('HALO-GI');
+const giCtrls = [];
+giCtrls.push(fGI.add(params, 'giEnabled').name('enabled').onChange((v) => { gi?.setEnabled(v); markInteraction(); }));
+giCtrls.push(fGI.add(params, 'giIntensity', 0, 6, 0.05).name('intensity').onChange((v) => { gi?.setIntensity(v); markInteraction(); }));
+giCtrls.push(fGI.add(params, 'giSmoothness', 0, 1, 0.05).name('smoothness').onChange((v) => { gi?.setSmoothness(v); markInteraction(); }));
+fGI.add(params, 'showProbes').name('show probes').onChange(updateProbeHelpers);
+gui.add(params, 'exposure', 0, 2, 0.01).onChange((v) => { renderer.toneMappingExposure = v; });
+
+updateSun();
+
+// Force PBR materials to recompile so the probe node folds into the lights graph
+// the MOMENT the field first produces data (mirrors max.js markLightProbeMaterialsDirty).
+// Without this, materials compiled before the field was active never include the GI
+// term — the field builds, but intensity/smoothness do nothing. Fires once per rebuild.
+function markGiMaterialsDirty() {
+  const seen = new WeakSet();
+  const mark = (m) => {
+    if (!m || seen.has(m)) return; seen.add(m);
+    if (m.isMeshBasicMaterial || m.isLineBasicMaterial) return;
+    if (m.visible === false) return;
+    m.needsUpdate = true;
+  };
+  scene.traverse((o) => {
+    if (!o.material) return;
+    if (Array.isArray(o.material)) o.material.forEach(mark); else mark(o.material);
+  });
+}
+
+function prepareSponzaMaterialForGi(material) {
+  if (!material || material.userData?.powerlightGiPrepared) return;
+  material.userData = material.userData || {};
+  material.userData.powerlightGiPrepared = true;
+
+  // This Sponza glTF imports with scalar metalness = 1 on stone/fabric surfaces.
+  // HALO-GI intentionally kills diffuse bounce for metals, so normalize the demo
+  // asset to dielectric before the spectral scene is packed.
+  if (Number.isFinite(material.metalness) && material.metalness > 0.5) {
+    material.metalness = 0;
+    material.needsUpdate = true;
+  }
+  if (Number.isFinite(material.roughness) && material.roughness < 0.85) {
+    material.roughness = 0.85;
+    material.needsUpdate = true;
+  }
+}
+
+// ── Load Sponza, then start HALO-GI ───────────────────────────────────────────
+let gi = null;
+setStatus('loading Sponza…');
+new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
+  const sponza = gltf.scene;
+  sponza.traverse((o) => {
+    if (!o.isMesh) return;
+    o.castShadow = true;
+    o.receiveShadow = true;
+    if (Array.isArray(o.material)) o.material.forEach(prepareSponzaMaterialForGi);
+    else prepareSponzaMaterialForGi(o.material);
+  });
+  scene.add(sponza);
+
+  // frame the camera to the model and size the shadow camera to its bounds
+  const box = new THREE.Box3().setFromObject(sponza);
+  const size = box.getSize(new THREE.Vector3());
+  const radius = Math.max(size.x, size.y, size.z) * 0.5;
+  applyCamera();
+  camera.near = radius * 0.01; camera.far = radius * 30; camera.updateProjectionMatrix();
+  const sc = sun.shadow.camera;
+  sc.left = -radius; sc.right = radius; sc.top = radius; sc.bottom = -radius;
+  sc.near = 0.1; sc.far = radius * 8; sc.updateProjectionMatrix();
+  sky.scale.setScalar(camera.far * 0.5);
+
+  // HALO-GI: build the probe field over the model (sky already excluded). Auto-fit
+  // bounds the grid to the visible geometry; opt-in, idle-gated tick in the loop.
+  gi = createProbeField({ renderer, scene, intensity: params.giIntensity, hysteresis: 0.95, onRebuilt: markGiMaterialsDirty });
+  if (!gi.isSupported()) { setStatus('HALO-GI needs WebGPU storage features.', true); return; }
+  gi.setEnabled(params.giEnabled);
+  gi.setSmoothness(params.giSmoothness);
+  window.gi = gi; // console handle for poking
+  window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = markGiMaterialsDirty; // diagnostics
+
+  hideStatus();
+  markInteraction();
+}, (xhr) => {
+  if (xhr.total) setStatus('loading Sponza… ' + Math.round(xhr.loaded / xhr.total * 100) + '%');
+}, (err) => {
+  setStatus('Failed to load ./Sponza/glTF/Sponza.gltf\n' + (err?.message || err), true);
+});
+
+// ── Render loop ───────────────────────────────────────────────────────────────
+// ── Diagnostics: draw the probe field as a grid of spheres ────────────────────
+let probeHelperMesh = null, probeHelperSig = '';
+const _pgVec = new THREE.Vector3(), _pgMat = new THREE.Matrix4();
+function updateProbeHelpers() {
+  if (!params.showProbes) { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
+  if (!gi || gi.hasData?.() === false || typeof gi.getResolution !== 'function') {
+    if (probeHelperMesh) probeHelperMesh.visible = false; return;
+  }
+  const res = gi.getResolution(); const bounds = gi.getBounds?.();
+  if (!res || !bounds) { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
+  const rx = Math.max(1, Math.round(res.x)), ry = Math.max(1, Math.round(res.y)), rz = Math.max(1, Math.round(res.z));
+  const total = rx * ry * rz;
+  const min = bounds.min, size = _pgVec.subVectors(bounds.max, bounds.min);
+  const sx = size.x, sy = size.y, sz = size.z;
+  const sig = `${rx},${ry},${rz}|${min.x.toFixed(2)},${min.y.toFixed(2)},${min.z.toFixed(2)}|${sx.toFixed(2)},${sy.toFixed(2)},${sz.toFixed(2)}`;
+  if (sig === probeHelperSig && probeHelperMesh) { probeHelperMesh.visible = true; return; }
+  probeHelperSig = sig;
+  if (!probeHelperMesh || probeHelperMesh.count !== total) {
+    if (probeHelperMesh) { scene.remove(probeHelperMesh); probeHelperMesh.geometry.dispose(); probeHelperMesh.material.dispose(); }
+    const cell = Math.max(sx / Math.max(1, rx - 1), sy / Math.max(1, ry - 1), sz / Math.max(1, rz - 1));
+    const geo = new THREE.SphereGeometry(cell * 0.08 + 1e-3, 8, 6);
+    const mat = new THREE.MeshBasicMaterial({ color: 0x33ddff, depthWrite: false, transparent: true, opacity: 0.85, toneMapped: false });
+    probeHelperMesh = new THREE.InstancedMesh(geo, mat, total);
+    probeHelperMesh.frustumCulled = false;
+    probeHelperMesh.renderOrder = 9999;
+    probeHelperMesh.userData.maxjsVisible = false; // keep probe spheres OUT of the GI BVH
+    scene.add(probeHelperMesh);
+  }
+  let idx = 0;
+  for (let k = 0; k < rz; k++) for (let j = 0; j < ry; j++) for (let i = 0; i < rx; i++) {
+    const fx = rx > 1 ? i / (rx - 1) : 0, fy = ry > 1 ? j / (ry - 1) : 0, fz = rz > 1 ? k / (rz - 1) : 0;
+    _pgMat.makeTranslation(min.x + fx * sx, min.y + fy * sy, min.z + fz * sz);
+    probeHelperMesh.setMatrixAt(idx++, _pgMat);
+  }
+  probeHelperMesh.instanceMatrix.needsUpdate = true;
+  probeHelperMesh.visible = true;
+}
+
+const giStatEl = document.getElementById('gi-stat');
+let statMs = 0;
+renderer.setAnimationLoop((nowMs) => {
+  controls.update();
+  // HALO-GI self-gates on idle: the BVH build + GPU solve are held while orbiting
+  // or dragging a slider (world-space GI is lossless held static), then converge
+  // once the view rests — so a frame hitch can never land mid-interaction.
+  gi?.tick({ idleMs: nowMs - lastInteractionMs, playing: false });
+  updateProbeHelpers();
+  renderer.render(scene, camera);
+  if (gi && nowMs - statMs > 250) {
+    statMs = nowMs;
+    const s = gi.getStats?.();
+    giStatEl.textContent = s
+      ? `GI: probes ${s.probes} (${s.res.x}×${s.res.y}×${s.res.z}) · active ${s.active}`
+      : 'GI: building…';
+  }
+});
+</script>
+</body>
+</html>
