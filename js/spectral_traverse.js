@@ -1,5 +1,5 @@
 // spectral_traverse.js — shared TSL traversal + shading helpers for the
-// spectral path tracer AND the HALO-GI probe kernel (docs/GI_HALO_design.md §3.4).
+// spectral path tracer AND the SPEEDBALL GI probe kernel (docs/GI_SPEEDBALL_design.md §3.4).
 //
 // EXTRACTED VERBATIM from spectral_kernel.js buildKernels() so both kernels
 // trace the SAME resident stackless BVH with byte-identical logic — there is no

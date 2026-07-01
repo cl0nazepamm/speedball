@@ -1,4 +1,4 @@
-// gi_probes.js — HALO-GI DDGI irradiance field (docs/GI_HALO_design.md §3).
+// gi_probes.js — SPEEDBALL GI DDGI irradiance field (docs/GI_SPEEDBALL_design.md §3).
 //
 // A world-space grid of octahedral irradiance probes traced against the SAME
 // stackless BVH the spectral path tracer uses (shared byte-identically via
@@ -87,7 +87,7 @@ const GEO_SETTLE_INTERVALS = 2;    // geo must be stable this many checks before
 // during motion is visually lossless; it resumes and converges once the view rests.
 const GI_IDLE_MS = 200;            // ms of camera/sync quiet before GI work resumes
 const REBUILD_BACKOFF_TICKS = 45;  // ticks to wait after a failed/empty rebuild before retrying
-// ── denoise uplift (CORE, docs/GI_HALO_design.md §11) tunables ──
+// ── denoise uplift (CORE, docs/GI_SPEEDBALL_design.md §11) tunables ──
 const GI_FILTER_K = 8.0;           // spatial filter: variance→edge-stop bandwidth
 const GI_FILTER_EPS = 0.001;       // spatial filter luma² absolute floor (avoids /0 on black)
 const GI_FILTER_REL = 0.0225;      // spatial filter RELATIVE floor (~15% luma)²: even a temporally
@@ -148,7 +148,7 @@ export class GiProbeNode extends LightingNode {
     get active() { return this._hasData; }
     // structure-only token: data writes (textureStore) do NOT change this, so
     // materials never recompile on a probe tick — only on resize / first data.
-    get cacheToken() { return `gi-halo-probes:${this._structGen}`; }
+    get cacheToken() { return `gi-speedball-probes:${this._structGen}`; }
 
     setEnabled(on) { this._enabled = on === true; this.enabledNode.value = this._enabled ? 1.0 : 0.0; }
     setIntensity(v) {
@@ -728,7 +728,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const ib = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(4)).toVar();
             const prev = vec3(irr.element(ib), irr.element(ib.add(uint(1))), irr.element(ib.add(uint(2))));
             const wasBlack = dot(prev, vec3(1.0)).lessThan(float(1e-6));
-            // Stable temporal accumulation: HALO intentionally jitters rays every
+            // Stable temporal accumulation: SPEEDBALL intentionally jitters rays every
             // tick, so luminance disagreement is expected on steady walls. Treating
             // that as disocclusion collapses history and causes visible flicker.
             // Real light/geometry edits are handled by temporarily lowering
@@ -1167,7 +1167,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 renderer.computeAsync(gpu.uploadKernel),
             ]);
         } catch (e) {
-            console.warn('max.js HALO-GI probe tick failed:', e);
+            console.warn('max.js SPEEDBALL GI probe tick failed:', e);
             dirty = true;
         } finally {
             inFlight = false;
@@ -1179,7 +1179,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     // rebuilds it (geometry/light-count/volume change, or first build). Grid-only callers
     // (setDivisions/setRays) pass false → the cached soup is reused, no MeshBVH hitch.
     function requestRebuild(freshBuild = true) { dirty = true; rebuildBackoff = 0; if (freshBuild) buildDirty = true; }
-    // Set explicit probe volume(s) — e.g. synced "HALO-GI Probe Grid" helpers. Each
+    // Set explicit probe volume(s) — e.g. synced "SPEEDBALL GI Probe Grid" helpers. Each
     // entry is a world-space THREE.Box3 (auto resolution) OR { box, res } where res is
     // a Vector3/[x,y,z] of MANUAL per-axis divisions. Pass null/empty to revert to
     // whole-scene auto-fit. When set, auto-fit is OFF (the box bounds the field).

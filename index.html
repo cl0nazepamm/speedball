@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>HALO-GI — standalone (WebGPU DDGI + Sky)</title>
+<title>SPEEDBALL GI — standalone (WebGPU DDGI + Sky)</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #11151c; color: #cdd6e0;
     font: 12px/1.5 ui-monospace, "Cascadia Code", Menlo, monospace; }
@@ -37,7 +37,7 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">
-  <b>HALO-GI</b> <span class="sub">· BVH-traced DDGI · WebGPU</span><br>
+  <b>SPEEDBALL GI</b> <span class="sub">· BVH-traced DDGI · WebGPU</span><br>
   <span class="sub">drag to orbit · scroll to zoom · sun = azimuth/elevation</span><br>
   <span class="sub" id="gi-stat">GI: starting…</span>
 </div>
@@ -49,8 +49,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { createProbeField } from './js/gi_probes.js?v=halo4';
-import { giLights } from './js/gi_lights_node.js?v=halo4';
+import { createProbeField } from './js/gi_probes.js?v=speedball4';
+import { giLights } from './js/gi_lights_node.js?v=speedball4';
 
 const statusEl = document.getElementById('status');
 const setStatus = (msg, err = false) => { statusEl.textContent = msg; statusEl.classList.toggle('err', err); statusEl.classList.remove('hide'); };
@@ -71,10 +71,10 @@ if (renderer.backend?.isWebGPUBackend !== true) {
   throw new Error('WebGPU unavailable');
 }
 
-// ── Non-Studio HALO-GI lighting node ─────────────────────────────────────────
+// ── Non-Studio SPEEDBALL GI lighting node ─────────────────────────────────────────
 // GiLightsNode = stock batched DynamicLightsNode + opt-in probe-irradiance
 // injection. Installing it as the renderer's lights factory is all that's needed
-// for HALO-GI to fold into every PBR material — no per-material wiring.
+// for SPEEDBALL GI to fold into every PBR material — no per-material wiring.
 renderer.lighting.createNode = (lights = []) => giLights({
   maxDirectionalLights: 4, maxPointLights: 16, maxSpotLights: 16, maxHemisphereLights: 2,
 }).setLights(lights);
@@ -163,14 +163,14 @@ window.addEventListener('resize', () => {
   markInteraction();
 });
 
-const gui = new GUI({ title: 'HALO-GI · Sky' });
+const gui = new GUI({ title: 'SPEEDBALL GI · Sky' });
 const fSky = gui.addFolder('Sky / Sun');
 fSky.add(params, 'azimuth', 0, 360, 1).name('azimuth°').onChange(updateSun);
 fSky.add(params, 'elevation', -3, 88, 0.5).name('elevation°').onChange(updateSun);
 fSky.add(params, 'turbidity', 0, 20, 0.1).onChange(updateSun);
 fSky.add(params, 'rayleigh', 0, 8, 0.1).onChange(updateSun);
 fSky.add(params, 'sunIntensity').min(0).step(0.05).name('sun intensity').onChange(updateSun);   // uncapped
-const fGI = gui.addFolder('HALO-GI');
+const fGI = gui.addFolder('SPEEDBALL GI');
 const giCtrls = [];
 giCtrls.push(fGI.add(params, 'giEnabled').name('enabled').onChange((v) => { gi?.setEnabled(v); markInteraction(); }));
 giCtrls.push(fGI.add(params, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => { gi?.setIntensity(v); markInteraction(); })); // uncapped
@@ -228,7 +228,7 @@ function prepareSponzaMaterialForGi(material) {
   material.userData.powerlightGiPrepared = true;
 
   // This Sponza glTF imports with scalar metalness = 1 on stone/fabric surfaces.
-  // HALO-GI intentionally kills diffuse bounce for metals, so normalize the demo
+  // SPEEDBALL GI intentionally kills diffuse bounce for metals, so normalize the demo
   // asset to dielectric before the spectral scene is packed.
   if (Number.isFinite(material.metalness) && material.metalness > 0.5) {
     material.metalness = 0;
@@ -240,7 +240,7 @@ function prepareSponzaMaterialForGi(material) {
   }
 }
 
-// ── Load Sponza, then start HALO-GI ───────────────────────────────────────────
+// ── Load Sponza, then start SPEEDBALL GI ───────────────────────────────────────────
 let gi = null;
 setStatus('loading Sponza…');
 new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
@@ -265,10 +265,10 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
   sc.near = 0.1; sc.far = radius * 8; sc.updateProjectionMatrix();
   sky.scale.setScalar(camera.far * 0.5);
 
-  // HALO-GI: build the probe field over the model (sky already excluded). Auto-fit
+  // SPEEDBALL GI: build the probe field over the model (sky already excluded). Auto-fit
   // bounds the grid to the visible geometry; opt-in, idle-gated tick in the loop.
   gi = createProbeField({ renderer, scene, intensity: params.giIntensity, hysteresis: 0.95, divisions: params.giDivisions, onRebuilt: markGiMaterialsDirty });
-  if (!gi.isSupported()) { setStatus('HALO-GI needs WebGPU storage features.', true); return; }
+  if (!gi.isSupported()) { setStatus('SPEEDBALL GI needs WebGPU storage features.', true); return; }
   gi.setEnabled(params.giEnabled);
   // Push the quality defaults so the GUI and the GI uniforms agree on first paint.
   gi.setSmoothness(1);                       // pinned (no slider)
@@ -334,7 +334,7 @@ const giStatEl = document.getElementById('gi-stat');
 let statMs = 0;
 renderer.setAnimationLoop((nowMs) => {
   controls.update();
-  // HALO-GI self-gates on idle: the BVH build + GPU solve are held while orbiting
+  // SPEEDBALL GI self-gates on idle: the BVH build + GPU solve are held while orbiting
   // or dragging a slider (world-space GI is lossless held static), then converge
   // once the view rests — so a frame hitch can never land mid-interaction.
   gi?.tick({ idleMs: nowMs - lastInteractionMs, playing: false });

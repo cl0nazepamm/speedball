@@ -1,7 +1,7 @@
-// GiLightsNode — stock batched lights (DynamicLightsNode) + opt-in HALO-GI / surfel
+// GiLightsNode — stock batched lights (DynamicLightsNode) + opt-in SPEEDBALL GI / surfel
 // irradiance injection, for NON-Studio WebGPU modes.
 //
-// HALO-GI used to be Studio-only because the GI term is injected by the lights node,
+// SPEEDBALL GI used to be Studio-only because the GI term is injected by the lights node,
 // and only Studio installed a custom lights node (MaxLightsNode). This adds the same
 // GI injection to a plain DynamicLightsNode so GI works in every WebGPU mode WITHOUT
 // the Studio light-linking overhead. The GI nodes only join the graph (and the cache
@@ -10,8 +10,8 @@
 
 import DynamicLightsNode from 'three/addons/tsl/lighting/DynamicLightsNode.js';
 import { NodeUtils } from 'three/webgpu';
-import { getGiProbeNode } from './gi_probes.js?v=halo4';
-import { getGiVolumeNode } from './gi_irradiance_volume.js?v=halo4';
+import { getGiProbeNode } from './gi_probes.js?v=speedball4';
+import { getGiVolumeNode } from './gi_irradiance_volume.js?v=speedball4';
 
 export default class GiLightsNode extends DynamicLightsNode {
     static get type() { return 'GiLightsNode'; }

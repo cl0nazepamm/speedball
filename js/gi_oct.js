@@ -1,6 +1,6 @@
-// gi_oct.js — octahedral direction <-> [0,1]² mapping for HALO-GI probe atlases.
+// gi_oct.js — octahedral direction <-> [0,1]² mapping for SPEEDBALL GI probe atlases.
 //
-// Phase-0 primitive (design spec docs/GI_HALO_design.md §7). r185 TSL ships no
+// Phase-0 primitive (design spec docs/GI_SPEEDBALL_design.md §7). r185 TSL ships no
 // octahedral helper (equirectUV exists, octahedral = 0), so we hand-roll the
 // signNotZero map (Cigolle/Donow/Meyer/McGuire/Luebke 2014, "A Survey of
 // Efficient Representations for Independent Unit Vectors").

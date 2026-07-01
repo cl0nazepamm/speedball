@@ -603,7 +603,7 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     geometry.clearGroups();
     geometry.computeBoundingBox();
     // World-space AABB of the EXACT traced triangle soup. Returned so consumers
-    // (HALO-GI grid auto-fit) bound to what the BVH actually contains — no second
+    // (SPEEDBALL GI grid auto-fit) bound to what the BVH actually contains — no second
     // scene walk, no dependency on per-object visibility flags. Cloned because the
     // geometry is disposed below.
     const bounds = geometry.boundingBox ? geometry.boundingBox.clone() : null;

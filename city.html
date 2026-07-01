@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>HALO-GI — Procedural City (WebGPU DDGI + Sky)</title>
+<title>SPEEDBALL GI — Procedural City (WebGPU DDGI + Sky)</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #11151c; color: #cdd6e0;
     font: 12px/1.5 ui-monospace, "Cascadia Code", Menlo, monospace; }
@@ -37,7 +37,7 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">
-  <b>HALO-GI</b> <span class="sub">· procedural city · BVH-traced DDGI · WebGPU</span><br>
+  <b>SPEEDBALL GI</b> <span class="sub">· procedural city · BVH-traced DDGI · WebGPU</span><br>
   <span class="sub">WASD + drag to look · sun = time of day</span><br>
   <span class="sub" id="gi-stat">GI: starting…</span>
 </div>
@@ -49,8 +49,8 @@ import { FirstPersonControls } from 'three/addons/controls/FirstPersonControls.j
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { Inspector } from 'three/addons/inspector/Inspector.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { createProbeField } from './js/gi_probes.js?v=halo4';
-import { giLights } from './js/gi_lights_node.js?v=halo4';
+import { createProbeField } from './js/gi_probes.js?v=speedball4';
+import { giLights } from './js/gi_lights_node.js?v=speedball4';
 import { CityGenerator, createBuildingMaterial, createRoadMaterial } from 'three/addons/generators/CityGenerator.js';
 
 const statusEl = document.getElementById('status');
@@ -75,7 +75,7 @@ if (renderer.backend?.isWebGPUBackend !== true) {
   throw new Error('WebGPU unavailable');
 }
 
-// ── HALO-GI lighting node — install BEFORE any material compiles ──────────────
+// ── SPEEDBALL GI lighting node — install BEFORE any material compiles ──────────────
 renderer.lighting.createNode = (lights = []) => giLights({
   maxDirectionalLights: 4, maxPointLights: 16, maxSpotLights: 16, maxHemisphereLights: 2,
 }).setLights(lights);
@@ -131,14 +131,14 @@ let gi = null, cityGroup = null;
 const city = new CityGenerator({ seed: parameters.seed });
 const materials = { building: createBuildingMaterial(city.layout, parameters.seed) };
 
-// HALO-GI traces packed scalar PBR; the procedural buildings import metallic, which
+// SPEEDBALL GI traces packed scalar PBR; the procedural buildings import metallic, which
 // kills diffuse bounce (metals don't bounce Lambert) — the Sponza trap. Normalise the
 // trace-side scalar to dielectric so the city actually bounces. Node visual is untouched.
 function prepMaterials(o) {
   const ms = Array.isArray(o.material) ? o.material : (o.material ? [o.material] : []);
   for (const m of ms) {
-    if (!m || m.userData?.haloGiPrepared) continue;
-    m.userData = m.userData || {}; m.userData.haloGiPrepared = true;
+    if (!m || m.userData?.speedballGiPrepared) continue;
+    m.userData = m.userData || {}; m.userData.speedballGiPrepared = true;
     if (Number.isFinite(m.metalness) && m.metalness > 0.5) { m.metalness = 0; m.needsUpdate = true; }
     if (Number.isFinite(m.roughness) && m.roughness < 0.6) { m.roughness = 0.6; m.needsUpdate = true; }
   }
@@ -205,7 +205,7 @@ window.addEventListener('resize', () => {
   markInteraction();
 });
 
-// ── HALO-GI probe field over the runtime city (NO post-processing — only GI) ───
+// ── SPEEDBALL GI probe field over the runtime city (NO post-processing — only GI) ───
 function markGiMaterialsDirty() {
   const seen = new WeakSet();
   const mark = (m) => {
@@ -217,7 +217,7 @@ function markGiMaterialsDirty() {
 }
 
 gi = createProbeField({ renderer, scene, intensity: parameters.giIntensity, hysteresis: 0.95, divisions: parameters.giDivisions, onRebuilt: markGiMaterialsDirty });
-if (!gi.isSupported()) setStatus('HALO-GI needs WebGPU storage features.', true);
+if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', true);
 gi.setEnabled(parameters.giEnabled);
 gi.setSmoothness(1);                         // pinned (no slider)
 gi.setFilterStrength(parameters.giDenoise);
@@ -233,11 +233,11 @@ hideStatus();
 markInteraction();
 
 // ── GUI ────────────────────────────────────────────────────────────────────────
-const gui = new GUI({ title: 'HALO-GI · City' });
+const gui = new GUI({ title: 'SPEEDBALL GI · City' });
 const fCity = gui.addFolder('City / Sun');
 fCity.add(parameters, 'seed', 0, 100, 1).onChange(generateCity);
 fCity.add(parameters, 'timeOfDay', 6, 18, 0.1).name('time of day').onChange(updateSun);
-const fGI = gui.addFolder('HALO-GI');
+const fGI = gui.addFolder('SPEEDBALL GI');
 fGI.add(parameters, 'giEnabled').name('enabled').onChange((v) => { gi?.setEnabled(v); markInteraction(); });
 fGI.add(parameters, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => { gi?.setIntensity(v); markInteraction(); });
 fGI.add(parameters, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi?.setDivisions(v); updateProbeHelpers(); markInteraction(); });
@@ -255,7 +255,7 @@ gui.add(parameters, 'exposure').min(0).step(0.01).name('exposure').onChange((v) 
 
 // ── Persist camera + all settings to localStorage, restore on load ──────────────
 // This is what stops every reload (mine included) from resetting your view/time/GI.
-const STORE_KEY = 'halo-city-state-v1';
+const STORE_KEY = 'speedball-city-state-v1';
 const _fwd = new THREE.Vector3();
 function saveState() {
   try {
@@ -294,7 +294,7 @@ function loadState() {
 }
 gui.onChange(() => scheduleSave());   // any GUI change → save (debounced)
 loadState();                          // restore last session (camera, time, GI, exposure)
-window.haloResetView = () => { try { localStorage.removeItem(STORE_KEY); } catch (e) {} location.reload(); };
+window.speedballResetView = () => { try { localStorage.removeItem(STORE_KEY); } catch (e) {} location.reload(); };
 
 // ── Probe helper spheres (diagnostic) ──────────────────────────────────────────
 let probeHelperMesh = null, probeHelperSig = '';
@@ -330,7 +330,7 @@ function updateProbeHelpers() {
   probeHelperMesh.visible = true;
 }
 
-// ── Render loop — direct render (no bloom / no AO / no post-FX), only HALO-GI ───
+// ── Render loop — direct render (no bloom / no AO / no post-FX), only SPEEDBALL GI ───
 const giStatEl = document.getElementById('gi-stat');
 let statMs = 0;
 renderer.setAnimationLoop((nowMs) => {
