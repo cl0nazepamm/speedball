@@ -80,7 +80,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { positionWorld, normalWorld } from 'three/tsl';
+import { positionWorld, normalWorld, pass, renderOutput } from 'three/tsl';
+import { FilmPipeline, FILM_PRESETS, FILM_PRESET_KEYS, applyFilmPreset, filmPass } from './vendor/powershot/index.js';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { createBenchmark } from './js/bench.js';
 import { loadGiSettings, saveGiSettings, applyGiSettings, addGiPanel } from './js/gi_settings.js';
@@ -146,6 +147,12 @@ const params = {
   giChangeThreshold: 2.5, giSnapAmount: 0.30, giFireflyClamp: 6.0,   // adaptive temporal blend
   camX: 1.1982, camY: 4.5833, camZ: -3.463,
   targetX: -3.2952, targetY: 4.4996, targetZ: -3.2815,
+  // PowerShot film emulation (experimental — not persisted). gamma=1 → gamma-correct.
+  // Defaults mirror the kodak_500t preset so the sliders read true on load.
+  filmEnabled: true, filmStock: 'kodak_500t', filmAmount: 1.0, filmExposure: 0, filmGamma: 1.0,
+  filmGrain: 1.0, filmGrainSize: 1.6, filmGrainSat: 0.8,
+  filmHalation: 0.35, filmHalThreshold: 0.55, filmHalSoftness: 0.35, filmHalRadius: 1.5, filmHalColor: [1.0, 0.35, 0.08],
+  filmWeave: 0.4, filmFlicker: 0.12, filmPrintExposure: 0, filmPrintWarmth: 0, filmNegative: false,
 };
 // GI settings are SHARED across the demo pages (one localStorage store; this scene's
 // values above are the canonical defaults). Camera/sun stay per-page.
@@ -253,6 +260,67 @@ gui.onChange(() => saveGiSettings(params));   // persist the SHARED GI settings 
 window.gi = gi; // console handle for poking
 window.gui = gui;
 window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = gi.markMaterialsDirty; // diagnostics
+
+// ── PowerShot film emulation (motion-picture negative→print chain) ──────────────
+// Runs as a post pass on the tone-mapped, sRGB-encoded scene: pass() → renderOutput()
+// gives the display-referred image the film shader expects; outputColorTransform=false
+// so the film's own sRGB output is presented verbatim (no double-encode). This is the
+// same "effect needs sRGB input" pattern three.js documents for FXAA.
+const film = new FilmPipeline(renderer);
+applyFilmPreset(film.ctx, FILM_PRESETS[params.filmStock]);
+const P = film.ctx.P;
+// Non-preset overrides (applyFilmPreset never touches these, so they persist across stocks).
+film.ctx.power.value = params.filmAmount;        // 1.0 = full film, no blend with source
+P.inputGamma.value = params.filmGamma;           // 1.0 = gamma-correct (scene-linear source)
+P.printExposure.value = params.filmPrintExposure;
+P.printWarmth.value = params.filmPrintWarmth;
+P.negativeView.value = params.filmNegative ? 1 : 0;
+const post = new THREE.PostProcessing(renderer);
+post.outputColorTransform = false;               // film already emits display-encoded sRGB
+post.outputNode = filmPass(renderOutput(pass(scene, camera)), film);
+window.film = film;
+
+// Every knob below is a point-op uniform → live, no recompile, no hitch.
+const fFilm = gui.addFolder('Film (PowerShot)');
+const filmCtrls = [];   // preset-backed controllers, refreshed when the stock changes
+fFilm.add(params, 'filmEnabled').name('enabled');
+fFilm.add(params, 'filmStock', FILM_PRESET_KEYS).name('stock').onChange((v) => {
+  applyFilmPreset(film.ctx, FILM_PRESETS[v]);     // rewrites the preset-backed uniforms…
+  P.exposure.value = params.filmExposure;         // exposure is a creative override — keep the user's
+  P.halColor.value.toArray(params.filmHalColor);  // …pull the stock's characteristics back into the GUI
+  params.filmGrain = P.grainStrength.value;
+  params.filmGrainSize = P.grainSize.value;
+  params.filmGrainSat = P.grainSaturation.value;
+  params.filmHalation = P.halStrength.value;
+  params.filmHalThreshold = P.halThreshold.value;
+  params.filmHalSoftness = P.halSoftness.value;
+  params.filmHalRadius = P.halRadius.value;
+  params.filmWeave = P.weave.value;
+  params.filmFlicker = P.flicker.value;
+  filmCtrls.forEach((c) => c.updateDisplay());
+});
+fFilm.add(params, 'filmAmount', 0, 1, 0.01).name('amount').onChange((v) => { film.ctx.power.value = v; });
+fFilm.add(params, 'filmExposure', -3, 3, 0.01).name('exposure (stops)').onChange((v) => { P.exposure.value = v; });
+fFilm.add(params, 'filmGamma', 0.4, 1.5, 0.01).name('input gamma').onChange((v) => { P.inputGamma.value = v; });
+fFilm.add(params, 'filmNegative').name('negative view').onChange((v) => { P.negativeView.value = v ? 1 : 0; });
+
+const fGrain = fFilm.addFolder('Grain');
+filmCtrls.push(fGrain.add(params, 'filmGrain', 0, 2, 0.01).name('strength').onChange((v) => { P.grainStrength.value = v; }));
+filmCtrls.push(fGrain.add(params, 'filmGrainSize', 0.5, 4, 0.05).name('size').onChange((v) => { P.grainSize.value = v; }));
+filmCtrls.push(fGrain.add(params, 'filmGrainSat', 0, 1, 0.01).name('color spread').onChange((v) => { P.grainSaturation.value = v; }));
+
+const fHal = fFilm.addFolder('Halation');
+filmCtrls.push(fHal.add(params, 'filmHalation', 0, 1.5, 0.01).name('strength').onChange((v) => { P.halStrength.value = v; }));
+filmCtrls.push(fHal.add(params, 'filmHalThreshold', 0, 1, 0.01).name('threshold').onChange((v) => { P.halThreshold.value = v; }));
+filmCtrls.push(fHal.add(params, 'filmHalSoftness', 0, 1, 0.01).name('softness').onChange((v) => { P.halSoftness.value = v; }));
+filmCtrls.push(fHal.add(params, 'filmHalRadius', 0.2, 4, 0.05).name('radius').onChange((v) => { P.halRadius.value = v; }));
+filmCtrls.push(fHal.addColor(params, 'filmHalColor').name('color').onChange((v) => { P.halColor.value.fromArray(v); }));
+
+const fGate = fFilm.addFolder('Gate / Print');
+filmCtrls.push(fGate.add(params, 'filmWeave', 0, 3, 0.01).name('gate weave').onChange((v) => { P.weave.value = v; }));
+filmCtrls.push(fGate.add(params, 'filmFlicker', 0, 1, 0.01).name('flicker').onChange((v) => { P.flicker.value = v; }));
+fGate.add(params, 'filmPrintExposure', -1, 1, 0.01).name('print exposure').onChange((v) => { P.printExposure.value = v; });
+fGate.add(params, 'filmPrintWarmth', -1, 1, 0.01).name('print warmth').onChange((v) => { P.printWarmth.value = v; });
 
 // ── BVH-hitch benchmark: churn an object in/out to force repeated full-soup rebuilds. ──
 // Watch the yellow HUD line for `rebuild-hitch` (worst frame right after each load/unload)
@@ -364,7 +432,8 @@ renderer.setAnimationLoop((nowMs) => {
   // once the view rests — so a frame hitch can never land mid-interaction.
   gi?.update({ playing: false });   // idle-gated solve (camera-rest detection is built in)
   updateProbeHelpers();
-  renderer.render(scene, camera);
+  if (params.filmEnabled) post.render();          // PowerShot film post-chain
+  else renderer.render(scene, camera);
   if (gi && nowMs - statMs > 250) {
     statMs = nowMs;
     const s = gi.getStats?.();

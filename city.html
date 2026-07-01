@@ -161,7 +161,12 @@ const parameters = {
 
 let gi = null, cityGroup = null;
 const city = new CityGenerator({ seed: parameters.seed });
-const materials = { building: createBuildingMaterial(city.layout, parameters.seed) };
+// DEBUG: flat untextured materials (flicker isolation) — set false to restore the
+// procedural building/road looks.
+const DEBUG_FLAT_MATERIALS = true;
+const materials = { building: DEBUG_FLAT_MATERIALS
+  ? new THREE.MeshStandardMaterial({ color: 0xb0a99a, roughness: 0.9 })
+  : createBuildingMaterial(city.layout, parameters.seed) };
 // The building/road looks are node-driven (colorNode), so the GI trace can't read
 // them — give the packer representative albedos (visual untouched, colorNode wins).
 materials.building.userData.giColor = 0xb0a99a;   // limestone average of the tower palette
@@ -173,9 +178,11 @@ materials.building.userData.giColor = 0xb0a99a;   // limestone average of the to
 // as area lights — local warm spill with real falloff, instead of a facade-wide
 // average that lit the whole city. Identical construction → identical on-screen look.
 const GLASS_PART_ID = 4;
-materials.buildingGlass = createBuildingMaterial(city.layout, parameters.seed);
+materials.buildingGlass = DEBUG_FLAT_MATERIALS
+  ? new THREE.MeshStandardMaterial({ color: 0x22282e, roughness: 0.3 })
+  : createBuildingMaterial(city.layout, parameters.seed);
 materials.buildingGlass.userData.giColor = 0x22282e;                        // dark glass albedo
-materials.buildingGlass.userData.giEmissive = new THREE.Color(0.5, 0.34, 0.16); // avg pane emission (lit × curtains)
+// materials.buildingGlass.userData.giEmissive = new THREE.Color(0.5, 0.34, 0.16); // avg pane emission — OFF while debugging
 
 function separateEmissiveGlass(group) {
   group.traverse((o) => {
@@ -337,7 +344,7 @@ function generateCity() {
   if (cityGroup) scene.remove(cityGroup);
   city.parameters.seed = parameters.seed;
   cityGroup = city.build(materials);
-  separateEmissiveGlass(cityGroup);   // demo-only: glass panes → own group/material so GI sees them as area lights
+  if (!window.__noGlassSplit) separateEmissiveGlass(cityGroup);   // demo-only: glass panes → own group/material so GI sees them as area lights
   cityGroup.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; prepMaterials(o); } });
   scene.add(cityGroup);
   generateProps();
@@ -347,7 +354,9 @@ function generateCity() {
 
 const floorW = city.layout.cityW + 2 * city.layout.street;
 const floorD = city.layout.cityD + 2 * city.layout.street;
-const ground = new THREE.Mesh(new THREE.PlaneGeometry(floorW, floorD).rotateX(-Math.PI / 2), createRoadMaterial(city.layout));
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(floorW, floorD).rotateX(-Math.PI / 2), DEBUG_FLAT_MATERIALS
+  ? new THREE.MeshStandardMaterial({ color: 0x30343a, roughness: 0.95 })
+  : createRoadMaterial(city.layout));
 ground.material.userData.giColor = 0x30343a;      // wet-asphalt average (road look is node-driven too)
 ground.receiveShadow = true;
 prepMaterials(ground);
