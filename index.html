@@ -83,6 +83,7 @@ import GUI from 'three/addons/libs/lil-gui.module.min.js';
 import { positionWorld, normalWorld } from 'three/tsl';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { createBenchmark } from './js/bench.js';
+import { loadGiSettings, saveGiSettings, applyGiSettings, addGiPanel } from './js/gi_settings.js';
 
 const statusEl = document.getElementById('status');
 const setStatus = (msg, err = false) => { statusEl.textContent = msg; statusEl.classList.toggle('err', err); statusEl.classList.remove('hide'); };
@@ -146,6 +147,9 @@ const params = {
   camX: 1.1982, camY: 4.5833, camZ: -3.463,
   targetX: -3.2952, targetY: 4.4996, targetZ: -3.2815,
 };
+// GI settings are SHARED across the demo pages (one localStorage store; this scene's
+// values above are the canonical defaults). Camera/sun stay per-page.
+Object.assign(params, loadGiSettings());
 
 function applyCamera() {
   camera.position.set(params.camX, params.camY, params.camZ);
@@ -198,33 +202,7 @@ fSky.add(params, 'elevation', -3, 88, 0.5).name('elevation°').onChange(updateSu
 fSky.add(params, 'turbidity', 0, 20, 0.1).onChange(updateSun);
 fSky.add(params, 'rayleigh', 0, 8, 0.1).onChange(updateSun);
 fSky.add(params, 'sunIntensity').min(0).step(0.05).name('sun intensity').onChange(updateSun);   // uncapped
-const fGI = gui.addFolder('SPEEDBALL GI');
-const giCtrls = [];
-giCtrls.push(fGI.add(params, 'giEnabled').name('enabled').onChange((v) => { gi?.setEnabled(v); markInteraction(); }));
-giCtrls.push(fGI.add(params, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => { gi?.setIntensity(v); markInteraction(); })); // uncapped
-// STRUCTURAL knobs (idle-gated rebuild — never a per-tick recompile).
-fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi?.setDivisions(v); updateProbeHelpers(); markInteraction(); });
-fGI.add(params, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi?.setRays(v); markInteraction(); });
-fGI.add(params, 'giCascades', { 'single grid': 1, 'cascaded (2)': 2 }).name('cascades').onChange((v) => { gi?.setCascades(+v); updateProbeHelpers(); markInteraction(); });
-fGI.add(params, 'giContinuous').name('continuous (solve while moving)').onChange((v) => { gi?.setContinuous(v); markInteraction(); });
-fGI.add(params, 'showProbes').name('show probes').onChange(updateProbeHelpers);
-
-// Quality subfolder — UNIFORM-backed, apply instantly (no recompile/rebuild).
-// smoothness is intentionally NOT exposed: pinned to 1 at init.
-const fQ = fGI.addFolder('Quality');
-giCtrls.push(fQ.add(params, 'giHysteresis', 0.5, 0.99, 0.01).name('hysteresis').onChange((v) => { gi?.setHysteresis(v); markInteraction(); }));
-giCtrls.push(fQ.add(params, 'giNormalBias', 0, 4, 0.05).name('normal bias').onChange((v) => { gi?.setNormalBias(v); markInteraction(); }));
-giCtrls.push(fQ.add(params, 'giRadianceClamp', 0, 32, 0.5).name('radiance clamp').onChange((v) => { gi?.setRadianceClamp(v); markInteraction(); }));
-giCtrls.push(fQ.add(params, 'giDepthSharpness', 1, 200, 1).name('depth sharpness').onChange((v) => { gi?.setDepthSharpness(v); markInteraction(); }));
-giCtrls.push(fQ.add(params, 'giLeak', 0, 1, 0.05).name('chebyshev strength').onChange((v) => { gi?.setChebyStrength(v); markInteraction(); }));
-// solid-scene (classify) stays hidden + pinned to 0 — a backface test misreads Sponza's
-// thin two-sided curtains, so it's an opt-in for enclosed solids only (matches city.html).
-// ── Temporal: live adaptive-blend tuning (pairs with continuous mode). ──
-const fT = fGI.addFolder('Temporal (adaptive blend)');
-fT.add(params, 'giChangeThreshold', 0.5, 8, 0.05).name('change threshold σ').onChange((v) => { gi?.setChangeThreshold(v); markInteraction(); });
-fT.add(params, 'giSnapAmount', 0, 0.9, 0.01).name('snap amount').onChange((v) => { gi?.setSnapAmount(v); markInteraction(); });
-fT.add(params, 'giFireflyClamp', 1, 20, 0.5).name('firefly clamp σ').onChange((v) => { gi?.setFireflyClamp(v); markInteraction(); });
-gui.add(params, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => { renderer.toneMappingExposure = v; });   // uncapped
+// (the SPEEDBALL GI panel is added after gi is installed below — see addGiPanel)
 
 updateSun();
 
@@ -262,22 +240,18 @@ const gi = installSpeedballGI({
   hysteresis: 0.95,
 });
 if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', true);
-// Push the quality defaults so the GUI and the GI uniforms agree on first paint.
+// Push the (shared, possibly restored) settings so the GUI and the GI uniforms agree
+// on first paint. Smoothness/denoise stay pinned (no slider, not part of the store).
 gi.setSmoothness(1);                       // pinned (no slider)
 gi.setFilterStrength(1);   // denoise pinned on (no slider): redundant at these defaults, but harmless
-gi.setHysteresis(params.giHysteresis);
-gi.setChangeThreshold(params.giChangeThreshold);
-gi.setSnapAmount(params.giSnapAmount);
-gi.setFireflyClamp(params.giFireflyClamp);
-gi.setNormalBias(params.giNormalBias);
-gi.setRadianceClamp(params.giRadianceClamp);
-gi.setDepthSharpness(params.giDepthSharpness);
-gi.setChebyStrength(params.giLeak);
-gi.setClassifyStrength(params.giSolid);
-gi.setRays(params.giRays);
-gi.setCascades(params.giCascades);
-gi.setContinuous(params.giContinuous);
+applyGiSettings(gi, params);
+// The GI panel is SHARED (js/gi_settings.js) — identical controls on every demo page;
+// trimming a slider there trims it everywhere. smoothness/denoise stay unexposed.
+addGiPanel(gui, gi, params, { onInteract: markInteraction, onStructure: () => updateProbeHelpers() });
+gui.add(params, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => { renderer.toneMappingExposure = v; });   // uncapped
+gui.onChange(() => saveGiSettings(params));   // persist the SHARED GI settings (GI keys only)
 window.gi = gi; // console handle for poking
+window.gui = gui;
 window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = gi.markMaterialsDirty; // diagnostics
 
 // ── BVH-hitch benchmark: churn an object in/out to force repeated full-soup rebuilds. ──

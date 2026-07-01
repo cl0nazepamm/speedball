@@ -81,6 +81,7 @@ import { Inspector } from 'three/addons/inspector/Inspector.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
 import { positionWorld, normalWorld } from 'three/tsl';
 import { createProbeField, giLights } from './js/index.js';
+import { loadGiSettings, saveGiSettings, applyGiSettings, addGiPanel } from './js/gi_settings.js';
 import { CityGenerator, createBuildingMaterial, createRoadMaterial } from 'three/addons/generators/CityGenerator.js';
 
 const statusEl = document.getElementById('status');
@@ -152,10 +153,10 @@ scene.add(sunLight);
 // ── Procedural city (generated at RUNTIME — no GLB) ────────────────────────────
 const parameters = {
   seed: 94, timeOfDay: 12, exposure: 0.45,   // noon = bright (was dawn/dim); overridden by saved state
-  giEnabled: true, giIntensity: 8, giDivisions: 14, showProbes: false,
-  giRays: 64, giHysteresis: 0.95, giNormalBias: 1,
-  giRadianceClamp: 8, giDepthSharpness: 50, giLeak: 0, giSolid: 0,
   showTrees: true, showCars: true,
+  // GI settings come from the SHARED store (Sponza is the canonical scene) — one set
+  // of values across every demo page. Scene state above stays city-only.
+  ...loadGiSettings(),
 };
 
 let gi = null, cityGroup = null;
@@ -373,16 +374,9 @@ function markGiMaterialsDirty() {
 
 gi = createProbeField({ renderer, scene, intensity: parameters.giIntensity, hysteresis: 0.95, divisions: parameters.giDivisions, onRebuilt: markGiMaterialsDirty });
 if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', true);
-gi.setEnabled(parameters.giEnabled);
 gi.setSmoothness(1);                         // pinned (no slider)
 gi.setFilterStrength(1);
-gi.setHysteresis(parameters.giHysteresis);
-gi.setNormalBias(parameters.giNormalBias);
-gi.setRadianceClamp(parameters.giRadianceClamp);
-gi.setDepthSharpness(parameters.giDepthSharpness);
-gi.setChebyStrength(parameters.giLeak);
-gi.setClassifyStrength(0);                    // solid-scene pinned off
-gi.setRays(parameters.giRays);
+applyGiSettings(gi, parameters);             // the shared settings, incl. cascades/continuous
 window.gi = gi; window.camera = camera; window.controls = controls; window.renderer = renderer; window.scene = scene;
 hideStatus();
 markInteraction();
@@ -394,20 +388,10 @@ fCity.add(parameters, 'seed', 0, 100, 1).onChange(generateCity);
 fCity.add(parameters, 'timeOfDay', 6, 18, 0.1).name('time of day').onChange(updateSun);
 fCity.add(parameters, 'showTrees').name('trees').onChange(() => { generateProps(); gi?.requestRebuild(); markInteraction(); });
 fCity.add(parameters, 'showCars').name('cars').onChange(() => { generateProps(); gi?.requestRebuild(); markInteraction(); });
-const fGI = gui.addFolder('SPEEDBALL GI');
-fGI.add(parameters, 'giEnabled').name('enabled').onChange((v) => { gi?.setEnabled(v); markInteraction(); });
-fGI.add(parameters, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => { gi?.setIntensity(v); markInteraction(); });
-fGI.add(parameters, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi?.setDivisions(v); updateProbeHelpers(); markInteraction(); });
-fGI.add(parameters, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi?.setRays(v); markInteraction(); });
-fGI.add(parameters, 'showProbes').name('show probes').onChange(updateProbeHelpers);
-const fQ = fGI.addFolder('Quality');
-fQ.add(parameters, 'giHysteresis', 0.5, 0.99, 0.01).name('hysteresis').onChange((v) => { gi?.setHysteresis(v); markInteraction(); });
-fQ.add(parameters, 'giNormalBias', 0, 4, 0.05).name('normal bias').onChange((v) => { gi?.setNormalBias(v); markInteraction(); });
-fQ.add(parameters, 'giRadianceClamp', 0, 32, 0.5).name('radiance clamp').onChange((v) => { gi?.setRadianceClamp(v); markInteraction(); });
-fQ.add(parameters, 'giDepthSharpness', 1, 200, 1).name('depth sharpness').onChange((v) => { gi?.setDepthSharpness(v); markInteraction(); });
-fQ.add(parameters, 'giLeak', 0, 1, 0.05).name('chebyshev strength').onChange((v) => { gi?.setChebyStrength(v); markInteraction(); });
-// solid-scene (classify) stays hidden + pinned to 0 (no buried probes in this open city).
+// The GI panel is SHARED (js/gi_settings.js) — identical controls on every demo page.
+addGiPanel(gui, gi, parameters, { onInteract: markInteraction, onStructure: () => updateProbeHelpers() });
 gui.add(parameters, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => { renderer.toneMappingExposure = v; });
+window.gui = gui;
 
 // ── Persist camera + all settings to localStorage, restore on load ──────────────
 // This is what stops every reload (mine included) from resetting your view/time/GI.
@@ -419,11 +403,9 @@ function saveState() {
     const look = camera.position.clone().add(_fwd.multiplyScalar(80));
     localStorage.setItem(STORE_KEY, JSON.stringify({
       cam: camera.position.toArray(), look: look.toArray(), exposure: renderer.toneMappingExposure,
+      // scene-only state — GI settings live in the SHARED store (js/gi_settings.js)
       p: {
         seed: parameters.seed, timeOfDay: parameters.timeOfDay,
-        giEnabled: parameters.giEnabled, giIntensity: parameters.giIntensity, giDivisions: parameters.giDivisions, giRays: parameters.giRays,
-        giHysteresis: parameters.giHysteresis, giNormalBias: parameters.giNormalBias,
-        giRadianceClamp: parameters.giRadianceClamp, giDepthSharpness: parameters.giDepthSharpness, giLeak: parameters.giLeak,
         showTrees: parameters.showTrees, showCars: parameters.showCars,
       },
     }));
@@ -434,15 +416,11 @@ function scheduleSave() { clearTimeout(_saveTimer); _saveTimer = setTimeout(save
 function loadState() {
   let s; try { s = JSON.parse(localStorage.getItem(STORE_KEY)); } catch (e) { return; }
   if (!s) return;
-  if (s.p) Object.assign(parameters, s.p);
+  // scene-only keys — GI settings were already merged from the shared store and
+  // applied via applyGiSettings (old city stores may still carry gi* keys; ignore them).
+  if (s.p) for (const k of ['seed', 'timeOfDay', 'showTrees', 'showCars']) if (k in s.p) parameters[k] = s.p[k];
   if (Number.isFinite(s.exposure)) renderer.toneMappingExposure = s.exposure;
   if (parameters.seed !== city.parameters.seed) generateCity();
-  gi.setEnabled(parameters.giEnabled); gi.setIntensity(parameters.giIntensity);
-  gi.setDivisions(parameters.giDivisions); gi.setRays(parameters.giRays);
-  gi.setFilterStrength(1); gi.setHysteresis(parameters.giHysteresis);
-  gi.setNormalBias(parameters.giNormalBias); gi.setRadianceClamp(parameters.giRadianceClamp);
-  gi.setDepthSharpness(parameters.giDepthSharpness);
-  gi.setChebyStrength(parameters.giLeak); gi.setClassifyStrength(0);   // solid-scene stays pinned off
   generateProps(); gi.requestRebuild();   // apply restored tree/car toggles (same-seed path skips generateCity)
   if (Array.isArray(s.cam)) camera.position.fromArray(s.cam);
   if (Array.isArray(s.look)) controls.lookAt(s.look[0], s.look[1], s.look[2]);
@@ -450,7 +428,7 @@ function loadState() {
   gui.controllersRecursive().forEach((c) => c.updateDisplay());
   markInteraction();
 }
-gui.onChange(() => scheduleSave());   // any GUI change → save (debounced)
+gui.onChange(() => { scheduleSave(); saveGiSettings(parameters); });   // scene state + shared GI settings (debounced)
 loadState();                          // restore last session (camera, time, GI, exposure)
 window.speedballResetView = () => { try { localStorage.removeItem(STORE_KEY); } catch (e) {} location.reload(); };
 
