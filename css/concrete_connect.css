@@ -1,0 +1,127 @@
+/* Concrete Connect reusable chrome: WinBox E16 skin + desktop pager. */
+
+.winbox.e16-window {
+    color: #111;
+    background: linear-gradient(to bottom, #eeeeee, #b8b8b8);
+    border: 1px solid #242424;
+    border-radius: 8px 8px 3px 3px;
+    box-shadow:
+        7px 9px 24px rgba(0,0,0,0.48),
+        inset 1px 1px 2px rgba(255,255,255,0.96),
+        inset -1px -1px 1px rgba(0,0,0,0.26);
+}
+
+.winbox.e16-window .wb-header {
+    height: 27px;
+    line-height: 27px;
+    background: linear-gradient(to bottom, #d9d9d9 0%, #bdbdbd 44%, #8f8f8f 50%, #b8b8b8 100%);
+    border-bottom: 1px solid #555;
+    border-radius: 7px 7px 0 0;
+    color: #050505;
+    text-shadow: 1px 1px 0 #fff;
+}
+
+.winbox.e16-window .wb-drag {
+    padding-left: 11px;
+}
+
+.winbox.e16-window .wb-title {
+    color: #050505;
+    font: 800 11px/27px Verdana, system-ui, sans-serif;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    text-shadow: 1px 1px 0 #fff;
+}
+
+.winbox.e16-window .wb-control * {
+    width: 22px;
+    background-size: 11px auto;
+    filter: invert(1) drop-shadow(1px 1px 0 rgba(255,255,255,0.55));
+}
+
+.winbox.e16-window .wb-body {
+    top: 27px;
+    color: #111;
+    background:
+        repeating-linear-gradient(0deg, rgba(255,255,255,0.18), rgba(255,255,255,0.18) 1px, transparent 1px, transparent 4px),
+        radial-gradient(circle at top, #f8f8f8, #cfcfcf);
+    box-shadow: inset 2px 2px 8px rgba(0,0,0,0.18);
+}
+
+.e16-menubar {
+    height: 25px;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 0 12px;
+    border-bottom: 1px solid #8b8b8b;
+    background: linear-gradient(to bottom, #dadada, #c7c7c7);
+    font: 700 10px/1 Verdana, system-ui, sans-serif;
+    color: #222;
+}
+
+.e16-window-body {
+    min-height: 100%;
+    display: grid;
+    grid-template-columns: 70px minmax(0, 1fr);
+    gap: 16px;
+    padding: 20px;
+}
+
+.e16-window-icon {
+    width: 58px;
+    height: 50px;
+    display: grid;
+    place-items: center;
+    border: 1px solid #333;
+    border-radius: 5px;
+    background: linear-gradient(to bottom, #f1f1f1, #8d8d8d);
+    box-shadow: 2px 4px 5px rgba(0,0,0,0.35), inset 1px 1px 1px #fff;
+    font: 900 20px/1 var(--mono);
+}
+
+.e16-window h3 {
+    margin: 0 0 8px;
+    font: 900 13px/1.2 Verdana, system-ui, sans-serif;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+}
+
+.e16-window p {
+    margin: 0;
+    color: #333;
+    font: 700 11px/1.55 var(--mono);
+}
+
+.desktop-pager {
+    position: absolute;
+    right: 28px;
+    bottom: 42px;
+    pointer-events: auto;
+    display: grid;
+    grid-template-columns: repeat(2, 22px);
+    gap: 4px;
+    padding: 6px;
+    border: 1px solid #333;
+    border-radius: 4px;
+    background: linear-gradient(to bottom, #dedede, #9a9a9a);
+    box-shadow: 4px 4px 10px rgba(0,0,0,0.45), inset 1px 1px 2px #fff;
+}
+
+.desktop-pager span {
+    width: 22px;
+    height: 16px;
+    border: 1px solid #222;
+    background: #676767;
+    box-shadow: inset 1px 1px 1px rgba(255,255,255,0.35);
+}
+
+.desktop-pager span.active {
+    background: #f0f0f0;
+}
+
+@media (max-width: 720px) {
+    .winbox.e16-window {
+        max-width: calc(100vw - 24px);
+    }
+}

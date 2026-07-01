@@ -4,20 +4,59 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>SPEEDBALL GI — Procedural City (WebGPU DDGI + Sky)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./css/concrete_connect.css">
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #11151c; color: #cdd6e0;
-    font: 12px/1.5 ui-monospace, "Cascadia Code", Menlo, monospace; }
+  /* Concrete Connect / E16 branding (see css/concrete_connect.css). */
+  :root { --mono: 'JetBrains Mono', ui-monospace, "Cascadia Code", Menlo, monospace; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #9a9a9a; color: #111;
+    font: 12px/1.5 var(--mono); }
   #c { display: block; width: 100vw; height: 100vh; }
-  #hud { position: fixed; left: 12px; top: 10px; pointer-events: none;
-    text-shadow: 0 1px 2px #000a; max-width: 46ch; }
-  #hud b { color: #8fd0ff; font-weight: 600; letter-spacing: .04em; }
-  #hud .sub { color: #7c8794; }
+
+  /* ── HUD as a static E16 window ─────────────────────────────────────────── */
+  #hud.e16-window { position: fixed; left: 14px; top: 12px; width: 360px; z-index: 10;
+    color: #111; overflow: hidden;
+    background: linear-gradient(to bottom, #eeeeee, #b8b8b8);
+    border: 1px solid #242424; border-radius: 8px 8px 3px 3px;
+    box-shadow: 7px 9px 24px rgba(0,0,0,0.48), inset 1px 1px 2px rgba(255,255,255,0.96), inset -1px -1px 1px rgba(0,0,0,0.26); }
+  #hud .e16-titlebar { height: 27px; line-height: 27px; padding-left: 11px;
+    background: linear-gradient(to bottom, #d9d9d9 0%, #bdbdbd 44%, #8f8f8f 50%, #b8b8b8 100%);
+    border-bottom: 1px solid #555; border-radius: 7px 7px 0 0; color: #050505; text-shadow: 1px 1px 0 #fff;
+    font: 800 11px/27px Verdana, system-ui, sans-serif; letter-spacing: 0.12em; text-transform: uppercase; }
+  #hud .e16-window-body { min-height: 0; grid-template-columns: 58px minmax(0,1fr); gap: 14px; padding: 16px;
+    background: repeating-linear-gradient(0deg, rgba(255,255,255,0.18), rgba(255,255,255,0.18) 1px, transparent 1px, transparent 4px), radial-gradient(circle at top, #f8f8f8, #cfcfcf);
+    box-shadow: inset 2px 2px 8px rgba(0,0,0,0.18); }
+  #hud h3 { margin: 0 0 6px; }
+  #hud p { margin: 0; }
+  #hud #gi-stat { margin-top: 8px; color: #0b3d6b; }
+
+  /* ── status / loading overlay ───────────────────────────────────────────── */
   #status { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
-    padding: 14px 20px; border-radius: 10px; background: #1a2230d0; border: 1px solid #2c384a;
-    color: #cdd6e0; white-space: pre; text-align: center; }
-  #status.err { border-color: #6b2330; color: #ff9aa6; background: #2a161bd0; }
+    padding: 14px 22px; color: #111; white-space: pre; text-align: center;
+    background: linear-gradient(to bottom, #eeeeee, #b8b8b8); border: 1px solid #242424; border-radius: 6px;
+    box-shadow: 6px 8px 20px rgba(0,0,0,0.45), inset 1px 1px 2px rgba(255,255,255,0.9);
+    font: 700 11px/1.5 var(--mono); text-shadow: 1px 1px 0 #fff; }
+  #status.err { border-color: #6b2330; color: #7a0e1c; background: linear-gradient(to bottom, #f0dede, #cc9a9a); text-shadow: none; }
   #status.hide { display: none; }
-  .lil-gui { --width: 290px; --font-size: 11px; }
+
+  /* ── lil-gui: concrete skin ─────────────────────────────────────────────── */
+  .lil-gui { --width: 300px; --font-size: 11px;
+    --background-color: #cccccc; --text-color: #141414;
+    --title-background-color: #b8b8b8; --title-text-color: #050505;
+    --widget-color: #909090; --hover-color: #9e9e9e; --focus-color: #ababab;
+    --number-color: #0b3d6b; --string-color: #3a5f2a;
+    --font-family: Verdana, system-ui, sans-serif; --font-family-mono: var(--mono);
+    --widget-height: 20px; }
+  .lil-gui.root { border: 1px solid #242424; border-radius: 8px 8px 3px 3px;
+    background: linear-gradient(to bottom, #e4e4e4, #bcbcbc);
+    box-shadow: 7px 9px 24px rgba(0,0,0,0.48), inset 1px 1px 2px rgba(255,255,255,0.96); }
+  .lil-gui.root > .title { background: linear-gradient(to bottom, #d9d9d9 0%, #bdbdbd 44%, #8f8f8f 50%, #b8b8b8 100%);
+    border-bottom: 1px solid #555; color: #050505; text-shadow: 1px 1px 0 #fff;
+    font: 800 11px/1 Verdana, system-ui, sans-serif; letter-spacing: 0.10em; text-transform: uppercase; }
+  .lil-gui .children { background: transparent; }
+  .lil-gui .title { text-shadow: 1px 1px 0 rgba(255,255,255,0.45); }
 </style>
 <script type="importmap">
 {
@@ -36,10 +75,16 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="hud">
-  <b>SPEEDBALL GI</b> <span class="sub">· procedural city · BVH-traced DDGI · WebGPU</span><br>
-  <span class="sub">WASD + drag to look · sun = time of day</span><br>
-  <span class="sub" id="gi-stat">GI: starting…</span>
+<div id="hud" class="e16-window">
+  <div class="e16-titlebar">SPEEDBALL GI · CITY</div>
+  <div class="e16-window-body">
+    <div class="e16-window-icon">SB</div>
+    <div>
+      <h3>Procedural City · BVH-traced DDGI</h3>
+      <p>WASD + drag to look<br>sun = time of day</p>
+      <p id="gi-stat">GI: starting…</p>
+    </div>
+  </div>
 </div>
 <div id="status">initializing WebGPU…</div>
 
