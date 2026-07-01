@@ -816,7 +816,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 // hue-stable firefly rolloff (vs the old per-channel hard clamp that
                 // clipped saturated bounce hues): scale by luminance, preserving chroma.
                 const bl = dot(bounce, vec3(0.2126, 0.7152, 0.0722));
-                const roll = U.radianceClamp.div(tslMax(U.radianceClamp, bl));
+                // 1e-6 floor: clamp=0 with a black bounce is otherwise 0/0 = NaN → poisons history.
+                const roll = U.radianceClamp.div(tslMax(tslMax(U.radianceClamp, bl), float(1e-6)));
                 radiance.addAssign(bounce.mul(roll));
                 outRgb.assign(radiance);
             });
@@ -1645,7 +1646,14 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             }
             touchGiUniforms();
         },
-        setRadianceClamp: (v) => { if (Number.isFinite(v)) U.radianceClamp.value = Math.max(0, v); },   // cap multibounce feedback (anti-runaway)
+        setRadianceClamp: (v) => {
+            if (!Number.isFinite(v)) return;
+            U.radianceClamp.value = Math.max(0, v);   // cap multibounce feedback (anti-runaway)
+            // Trace-side knob: it only affects NEWLY traced rays, and at hysteresis 0.95
+            // the converged field absorbs them so slowly it reads as "needs a rebuild".
+            // Kick the reactive burst so the new clamp fades in over ~1-2 s instead.
+            reactiveTicks = REACTIVE_TICKS;
+        },
         setDepthSharpness: (v) => { if (Number.isFinite(v)) U.depthSharpness.value = THREE.MathUtils.clamp(v, 1, 200); }, // depth-moment cosine power (Chebyshev crispness)
         // ── adaptive-blend tuning (live; no recompile). Tune "stable continuous" by feel. ──
         setChangeThreshold: (v) => { if (Number.isFinite(v)) U.tempChangeSigma1.value = THREE.MathUtils.clamp(v, 0.5, 8); },   // σ delta to treat a change as REAL — lower = snappier

@@ -79,6 +79,7 @@ import { FirstPersonControls } from 'three/addons/controls/FirstPersonControls.j
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { Inspector } from 'three/addons/inspector/Inspector.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
+import { positionWorld, normalWorld } from 'three/tsl';
 import { createProbeField, giLights } from './js/index.js';
 import { CityGenerator, createBuildingMaterial, createRoadMaterial } from 'three/addons/generators/CityGenerator.js';
 
@@ -160,6 +161,9 @@ const parameters = {
 let gi = null, cityGroup = null;
 const city = new CityGenerator({ seed: parameters.seed });
 const materials = { building: createBuildingMaterial(city.layout, parameters.seed) };
+// The building/road looks are node-driven (colorNode), so the GI trace can't read
+// them — give the packer representative albedos (visual untouched, colorNode wins).
+materials.building.userData.giColor = 0xb0a99a;   // limestone average of the tower palette
 
 // SPEEDBALL GI traces packed scalar PBR; the procedural buildings import metallic, which
 // kills diffuse bounce (metals don't bounce Lambert) — the Sponza trap. Normalise the
@@ -307,6 +311,7 @@ function generateCity() {
 const floorW = city.layout.cityW + 2 * city.layout.street;
 const floorD = city.layout.cityD + 2 * city.layout.street;
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(floorW, floorD).rotateX(-Math.PI / 2), createRoadMaterial(city.layout));
+ground.material.userData.giColor = 0x30343a;      // wet-asphalt average (road look is node-driven too)
 ground.receiveShadow = true;
 prepMaterials(ground);
 scene.add(ground);
@@ -452,6 +457,17 @@ window.speedballResetView = () => { try { localStorage.removeItem(STORE_KEY); } 
 // ── Probe helper spheres (diagnostic) ──────────────────────────────────────────
 let probeHelperMesh = null, probeHelperSig = '';
 const _pgVec = new THREE.Vector3(), _pgMat = new THREE.Matrix4();
+// Probe spheres show their REAL captured color: each fragment samples the GI field
+// at the sphere surface along its own normal. Falls back to a neutral tint until the
+// atlas is bound.
+function makeProbeHelperMaterial(lit) {
+  if (!lit) return new THREE.MeshBasicMaterial({ color: 0x808080, depthWrite: false, transparent: true, opacity: 0.85, toneMapped: false });
+  const n = gi.node;
+  const P = positionWorld.add(normalWorld.mul(n.normalBiasNode[0]));
+  const mat = new THREE.MeshBasicNodeMaterial({ depthWrite: false, transparent: true, opacity: 0.95 });
+  mat.colorNode = n.sampleIrradiance(P, normalWorld).max(0.0);
+  return mat;
+}
 function updateProbeHelpers() {
   if (!parameters.showProbes) { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
   if (!gi || gi.hasData?.() === false || typeof gi.getResolution !== 'function') { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
@@ -460,15 +476,17 @@ function updateProbeHelpers() {
   const rx = Math.max(1, Math.round(res.x)), ry = Math.max(1, Math.round(res.y)), rz = Math.max(1, Math.round(res.z));
   const total = rx * ry * rz;
   const min = bounds.min, size = _pgVec.subVectors(bounds.max, bounds.min);
-  const sig = `${rx},${ry},${rz}|${min.x.toFixed(1)},${min.y.toFixed(1)},${min.z.toFixed(1)}|${size.x.toFixed(1)},${size.y.toFixed(1)},${size.z.toFixed(1)}`;
+  const lit = gi.node?.active === true;   // atlas bound → can show each probe's real captured color
+  const sig = `${rx},${ry},${rz}|${min.x.toFixed(1)},${min.y.toFixed(1)},${min.z.toFixed(1)}|${size.x.toFixed(1)},${size.y.toFixed(1)},${size.z.toFixed(1)}|${lit ? 1 : 0}`;
   if (sig === probeHelperSig && probeHelperMesh) { probeHelperMesh.visible = true; return; }
   probeHelperSig = sig;
-  if (!probeHelperMesh || probeHelperMesh.count !== total) {
+  if (!probeHelperMesh || probeHelperMesh.count !== total || probeHelperMesh._lit !== lit) {
     if (probeHelperMesh) { scene.remove(probeHelperMesh); probeHelperMesh.geometry.dispose(); probeHelperMesh.material.dispose(); }
     const cell = Math.max(size.x / Math.max(1, rx - 1), size.y / Math.max(1, ry - 1), size.z / Math.max(1, rz - 1));
     const geo = new THREE.SphereGeometry(cell * 0.06 + 1e-3, 8, 6);
-    const mat = new THREE.MeshBasicMaterial({ color: 0x33ddff, depthWrite: false, transparent: true, opacity: 0.85, toneMapped: false });
+    const mat = makeProbeHelperMaterial(lit);
     probeHelperMesh = new THREE.InstancedMesh(geo, mat, total);
+    probeHelperMesh._lit = lit;
     probeHelperMesh.frustumCulled = false; probeHelperMesh.renderOrder = 9999;
     probeHelperMesh.userData.maxjsVisible = false;
     scene.add(probeHelperMesh);

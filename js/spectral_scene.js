@@ -124,7 +124,24 @@ function buildTriangleMaterialMap(geometry, materials, triCount, internMaterial,
 // metalness, transmission, ior, emissive*intensity, opacity, dispersionB.
 // Reads linear-space color components directly (Three stores working-space).
 
+// userData.giColor / userData.giEmissive hint → [r,g,b] linear, or null. Accepts a
+// THREE.Color (working-space components used as-is) or a 0xRRGGBB hex (sRGB → linear).
+function giColorHint(v) {
+    if (v == null) return null;
+    if (v.isColor) return [v.r, v.g, v.b];
+    if (Number.isFinite(v)) {
+        const s = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+        return [s((v >> 16) & 255), s((v >> 8) & 255), s(v & 255)];
+    }
+    return null;
+}
+
 function emissiveScaled(material, out) {
+    // Node-driven emissive (emissiveNode) is invisible to the packer; an explicit
+    // userData.giEmissive hint (absolute linear energy, NOT scaled by
+    // emissiveIntensity) is the only way to feed it to the trace.
+    const hint = giColorHint(material.userData?.giEmissive);
+    if (hint) { out[0] = hint[0]; out[1] = hint[1]; out[2] = hint[2]; return out; }
     const e = material.emissive;
     const k = Number.isFinite(material.emissiveIntensity) ? material.emissiveIntensity : 1;
     if (e?.isColor) { out[0] = e.r * k; out[1] = e.g * k; out[2] = e.b * k; }
@@ -134,9 +151,18 @@ function emissiveScaled(material, out) {
 
 function materialToUber(material) {
     const color = material.color;
-    const r = color?.isColor ? color.r : 1;
-    const g = color?.isColor ? color.g : 1;
-    const b = color?.isColor ? color.b : 1;
+    let r = color?.isColor ? color.r : 1;
+    let g = color?.isColor ? color.g : 1;
+    let b = color?.isColor ? color.b : 1;
+    // Node-driven materials (colorNode) render via TSL, so the scalar color the packer
+    // reads is usually the untouched DEFAULT WHITE — the trace then bounces at the
+    // 0.95-albedo cap while the screen shows dark stone (a closed street canyon turns
+    // into an integrating sphere: broad energy wash on unlit surfaces). Honor a
+    // userData.giColor hint first; otherwise a colorNode material whose scalar is
+    // still pure white falls back to mid-grey. A deliberately-set scalar is kept.
+    const hint = giColorHint(material.userData?.giColor);
+    if (hint) { [r, g, b] = hint; }
+    else if (material.colorNode && r === 1 && g === 1 && b === 1) { r = g = b = 0.5; }
 
     // Roughness/metalness exist on Standard/Physical; derive sane values for
     // the rest. Phong shininess → roughness; Basic/Lambert → fully diffuse.

@@ -80,6 +80,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
+import { positionWorld, normalWorld } from 'three/tsl';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { createBenchmark } from './js/bench.js';
 
@@ -330,6 +331,17 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
 // ── Diagnostics: draw the probe field as a grid of spheres ────────────────────
 let probeHelperMesh = null, probeHelperSig = '';
 const _pgVec = new THREE.Vector3(), _pgMat = new THREE.Matrix4();
+// Probe spheres show their REAL captured color: each fragment samples the GI field
+// at the sphere surface along its own normal, so a probe reads red near a red wall,
+// sky-blue up top, etc. Falls back to a neutral tint until the atlas is bound.
+function makeProbeHelperMaterial(lit) {
+  if (!lit) return new THREE.MeshBasicMaterial({ color: 0x808080, depthWrite: false, transparent: true, opacity: 0.85, toneMapped: false });
+  const n = gi.node;
+  const P = positionWorld.add(normalWorld.mul(n.normalBiasNode[0]));
+  const mat = new THREE.MeshBasicNodeMaterial({ depthWrite: false, transparent: true, opacity: 0.95 });
+  mat.colorNode = n.sampleIrradiance(P, normalWorld).max(0.0);
+  return mat;
+}
 function updateProbeHelpers() {
   if (!params.showProbes) { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
   if (!gi || gi.hasData?.() === false || typeof gi.getResolution !== 'function') {
@@ -341,15 +353,17 @@ function updateProbeHelpers() {
   const total = rx * ry * rz;
   const min = bounds.min, size = _pgVec.subVectors(bounds.max, bounds.min);
   const sx = size.x, sy = size.y, sz = size.z;
-  const sig = `${rx},${ry},${rz}|${min.x.toFixed(2)},${min.y.toFixed(2)},${min.z.toFixed(2)}|${sx.toFixed(2)},${sy.toFixed(2)},${sz.toFixed(2)}`;
+  const lit = gi.node?.active === true;   // atlas bound → can show each probe's real captured color
+  const sig = `${rx},${ry},${rz}|${min.x.toFixed(2)},${min.y.toFixed(2)},${min.z.toFixed(2)}|${sx.toFixed(2)},${sy.toFixed(2)},${sz.toFixed(2)}|${lit ? 1 : 0}`;
   if (sig === probeHelperSig && probeHelperMesh) { probeHelperMesh.visible = true; return; }
   probeHelperSig = sig;
-  if (!probeHelperMesh || probeHelperMesh.count !== total) {
+  if (!probeHelperMesh || probeHelperMesh.count !== total || probeHelperMesh._lit !== lit) {
     if (probeHelperMesh) { scene.remove(probeHelperMesh); probeHelperMesh.geometry.dispose(); probeHelperMesh.material.dispose(); }
     const cell = Math.max(sx / Math.max(1, rx - 1), sy / Math.max(1, ry - 1), sz / Math.max(1, rz - 1));
     const geo = new THREE.SphereGeometry(cell * 0.08 + 1e-3, 8, 6);
-    const mat = new THREE.MeshBasicMaterial({ color: 0x33ddff, depthWrite: false, transparent: true, opacity: 0.85, toneMapped: false });
+    const mat = makeProbeHelperMaterial(lit);
     probeHelperMesh = new THREE.InstancedMesh(geo, mat, total);
+    probeHelperMesh._lit = lit;
     probeHelperMesh.frustumCulled = false;
     probeHelperMesh.renderOrder = 9999;
     probeHelperMesh.userData.maxjsVisible = false; // keep probe spheres OUT of the GI BVH
