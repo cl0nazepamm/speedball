@@ -166,10 +166,10 @@ const materials = { building: createBuildingMaterial(city.layout, parameters.see
 // them — give the packer representative albedos (visual untouched, colorNode wins).
 materials.building.userData.giColor = 0xb0a99a;   // limestone average of the tower palette
 // Lit interior windows feed GI: the visible glow is emissiveNode (interior-mapped
-// rooms — invisible to the trace packer), so hint the facade's AVERAGE emission
-// (windows ≈ 10% of facade area at ~4× warm room light). Negligible under the sun,
-// it takes over at dusk — the streets glow from the windows.
-materials.building.userData.giEmissive = new THREE.Color(0.22, 0.15, 0.07);
+// rooms — invisible to the trace packer), so hint the facade's AVERAGE emission.
+// Deliberately subtle: the average smears the windows' light over ALL facade area,
+// so anything stronger reads as "the whole city is lit" instead of local spill.
+materials.building.userData.giEmissive = new THREE.Color(0.05, 0.034, 0.016);
 
 // SPEEDBALL GI traces packed scalar PBR; the procedural buildings import metallic, which
 // kills diffuse bounce (metals don't bounce Lambert) — the Sponza trap. Normalise the
