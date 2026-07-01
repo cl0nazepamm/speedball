@@ -96,6 +96,15 @@ const GI_FILTER_REL = 0.0225;      // spatial filter RELATIVE floor (~15% luma)�
                                    // converged texel gets a mild edge-PRESERVING bilateral smooth of
                                    // sub-threshold (noise-scale) neighbours, while strong directional
                                    // edges (red↔green) stay sharp. Steady-state splotch reduction.
+// ── temporal stabilization: per-texel variance-aware hysteresis ──
+const GI_TEMPORAL_NOISE_H_BOOST = 0.25; // steady/noisy samples borrow a little extra history, not a hard floor
+const GI_TEMPORAL_CHANGE_H_DROP = 0.30; // significant per-texel changes converge faster than the base slider
+const GI_TEMPORAL_MIN_CHANGE_H = 0.55;
+const GI_TEMPORAL_VAR_EPS = 0.000025;  // absolute luma variance floor
+const GI_TEMPORAL_VAR_REL = 0.0025;    // relative floor: lum^2 * this
+const GI_TEMPORAL_CHANGE_SIGMA0 = 0.75;
+const GI_TEMPORAL_CHANGE_SIGMA1 = 2.5;
+const GI_TEMPORAL_CLAMP_SIGMA = 6.0;
 
 let _node = null;
 
@@ -417,6 +426,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     }
     const casc = [makeCascade(), makeCascade()];
 
+    let continuous = false;   // false = idle-gated (default). true = keep the bounded GPU solve
+                              // running while the camera moves; heavy build steps still wait for rest.
     let dirty = true;
     // Cached CPU build (BVH soup + material textures). The BVH depends ONLY on geometry,
     // so a divisions/rays change must NOT rebuild it — that ~200ms synchronous MeshBVH +
@@ -457,6 +468,11 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         classifyStrength: uniform(0.0), // gates relocation APPLY (mirrors node.classifyStrengthNode)
         filterStrength: uniform(1.0),   // CORE denoise: 0 = filter off (harness baseline), 1 = full intra-tile spatial filter
         filterSmooth: uniform(0.5),     // UI "Smoothness": widens the bilateral edge-stop (0 = baseline detail, 1 = very smooth)
+        // ── live temporal-blend tuning (adaptive hysteresis). Defaults == the old constants
+        // → byte-identical until a slider moves. See blendKernel for how each is used.
+        tempChangeSigma1: uniform(GI_TEMPORAL_CHANGE_SIGMA1), // delta (in σ) above which a change counts as REAL → snaps. lower = snappier
+        tempChangeHDrop: uniform(GI_TEMPORAL_CHANGE_H_DROP),  // how much hysteresis drops on a real change. higher = harder snap
+        tempClampSigma: uniform(GI_TEMPORAL_CLAMP_SIGMA),     // firefly clamp band (in σ). lower = tighter/steadier, more lag
     };
     // Fold the shared uniforms into every cascade's U by REFERENCE so buildKernels closes
     // over C.U and reads both shared + per-cascade uniforms uniformly.
@@ -811,6 +827,9 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const dAcc = float(0.0).toVar();   // Σ w·dist  (sharp cosine weight)
             const dAcc2 = float(0.0).toVar();  // Σ w·dist²
             const dwsum = float(0.0).toVar();
+            const lAcc = float(0.0).toVar();
+            const lAcc2 = float(0.0).toVar();
+            const LUMA = vec3(0.2126, 0.7152, 0.0722);
             Loop({ start: uint(0), end: uint(raysPerProbe), type: 'uint', condition: '<' }, ({ i: k }) => {
                 const rb = slot.mul(uint(raysPerProbe)).add(k).mul(uint(4));
                 const rrgb = vec3(rayData.element(rb), rayData.element(rb.add(uint(1))), rayData.element(rb.add(uint(2))));
@@ -819,6 +838,9 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const cw = tslMax(dot(dir, rdir), float(0.0));
                 acc.addAssign(rrgb.mul(cw));
                 wsum.addAssign(cw);
+                const rl = dot(rrgb, LUMA);
+                lAcc.addAssign(rl.mul(cw));
+                lAcc2.addAssign(rl.mul(rl).mul(cw));
                 // depth moments: miss → "far" so the probe stays visible that way.
                 const rdist = select(hitT.lessThan(float(0.0)), U.maxDist, hitT);
                 const dw = pow(cw, U.depthSharpness);
@@ -827,6 +849,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 dwsum.addAssign(dw);
             });
             const meanRad = acc.div(wsum.max(float(1e-4)));
+            const curL = lAcc.div(wsum.max(float(1e-4)));
+            const curM2 = lAcc2.div(wsum.max(float(1e-4)));
             const meanR = dAcc.div(dwsum.max(float(1e-4)));
             const meanR2 = dAcc2.div(dwsum.max(float(1e-4)));
 
@@ -835,23 +859,38 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const ib = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(4)).toVar();
             const prev = vec3(irr.element(ib), irr.element(ib.add(uint(1))), irr.element(ib.add(uint(2))));
             const wasBlack = dot(prev, vec3(1.0)).lessThan(float(1e-6));
-            // Stable temporal accumulation: SPEEDBALL intentionally jitters rays every
-            // tick, so luminance disagreement is expected on steady walls. Treating
-            // that as disocclusion collapses history and causes visible flicker.
-            // Real light/geometry edits are handled by temporarily lowering
-            // U.hysteresis from tick(), not by per-texel history rejection here.
-            const LUMA = vec3(0.2126, 0.7152, 0.0722);
-            const curL = dot(meanRad, LUMA);
+            // Variance-aware temporal accumulation: SPEEDBALL intentionally jitters rays every
+            // tick. Keep steady texels slightly steadier, but lower hysteresis for significant
+            // luma changes so the probe field does not feel frozen.
+            const prevL = dot(prev, LUMA);
             const prevM2 = irr.element(ib.add(uint(3)));
-            const h = select(wasBlack, float(0.0), U.hysteresis);
-            const blended = mix(meanRad, prev, h);
+            const prevVar = tslMax(prevM2.sub(prevL.mul(prevL)), float(0.0));
+            const curVar = tslMax(curM2.sub(curL.mul(curL)), float(0.0));
+            const lumRef = tslMax(tslMax(curL, prevL), float(0.0));
+            const varFloor = float(GI_TEMPORAL_VAR_EPS).add(lumRef.mul(lumRef).mul(float(GI_TEMPORAL_VAR_REL)));
+            const sigma = sqrt(prevVar.add(curVar).add(varFloor));
+            const deltaL = curL.sub(prevL);
+            const absDelta = tslAbs(deltaL);
+            const s0 = sigma.mul(float(GI_TEMPORAL_CHANGE_SIGMA0));
+            const s1 = sigma.mul(U.tempChangeSigma1.max(float(GI_TEMPORAL_CHANGE_SIGMA0 + 0.01)));
+            const changeW = clamp(absDelta.sub(s0).div(s1.sub(s0).max(float(1e-6))), float(0.0), float(1.0));
+            const noiseH = U.hysteresis.add(float(1.0).sub(U.hysteresis).mul(float(GI_TEMPORAL_NOISE_H_BOOST)));
+            const changeH = tslMax(U.hysteresis.sub(U.tempChangeHDrop), float(GI_TEMPORAL_MIN_CHANGE_H));
+            const hEff = mix(noiseH, changeH, changeW);
+            const h = select(wasBlack, float(0.0), hEff);
+            const band = sigma.mul(U.tempClampSigma);
+            const clampScale = tslMin(float(1.0), band.div(absDelta.max(float(1e-6))));
+            const clipped = prev.add(meanRad.sub(prev).mul(clampScale));
+            const candidate0 = mix(clipped, meanRad, changeW);
+            const candidate = select(wasBlack, meanRad, candidate0);
+            const blended = mix(candidate, prev, h);
             irr.element(ib).assign(blended.x);
             irr.element(ib.add(uint(1))).assign(blended.y);
             irr.element(ib.add(uint(2))).assign(blended.z);
             // luminance 2nd moment E[L²] in the FREE 4th slot (buffer-only; the upload
             // keeps atlas.w=1.0 so the fragment sampler never sees it). luma is linear
             // → E[luma]=luma(E[rgb]), so variance = max(0, M2 − luma(rgb)²) anywhere.
-            const m2 = mix(curL.mul(curL), prevM2, h);
+            const m2 = mix(curM2, prevM2, h);
             irr.element(ib.add(uint(3))).assign(m2);
 
             // depth moments: same hysteresis; fill instantly when unseeded.
@@ -1319,47 +1358,59 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         // freeze can never land during interaction.
         const idleMs = Number.isFinite(opts.idleMs) ? opts.idleMs : Infinity;
         const playing = opts.playing === true;
-        if (idleMs < GI_IDLE_MS || playing) return;
+        const moving = idleMs < GI_IDLE_MS || playing;
+        // Default: fully idle-gated (moving → return). Continuous mode: keep the bounded GPU
+        // SOLVE running while moving, but STILL hold every synchronous/compiling step — the
+        // ~200ms MeshBVH rebuild, the staggered cascade build, and the per-tick scene-signature
+        // scans — for rest. Those are the only real hitch sources; the capped round-robin solve
+        // is the same GPU cost that already runs smooth at rest, so it's safe every frame.
+        if (moving && !continuous) return;
+        const restOnly = !moving;   // gates the heavy paths; the solve runs in both modes
 
         // (A7) Back off after a failed/empty rebuild instead of re-entering the
         // synchronous build every tick.
         if (rebuildBackoff > 0) rebuildBackoff--;
 
         if (dirty || !casc[0].gpu) {
+            if (!restOnly) return;   // never (re)build the soup/kernels mid-motion (hitch source)
             if (rebuildBackoff > 0) return;
             inFlight = true; let ok = false;
             try { ok = await rebuild(); } finally { inFlight = false; }
             if (!ok) { dirty = false; rebuildBackoff = REBUILD_BACKOFF_TICKS; return; }
-            return;   // stage 0 done this tick; the solve waits for the next idle tick
+            return;   // stage 0 done this tick; the solve waits for the next tick
         }
         if (!casc[0].gpu) return;
 
         // (A2/#2) Staggered build: advance exactly ONE build stage per idle tick so no
-        // single frame does 2× the build. C1 comes online one idle tick after C0.
+        // single frame does 2× the build. C1 comes online one idle tick after C0. Held for rest.
         if (buildStage < 2) {
+            if (!restOnly) return;
             inFlight = true;
             try { advanceBuildStageC1(); } finally { inFlight = false; }
             return;
         }
 
         // reactivity: detect live light/geometry edits (throttled). Light change →
-        // cheap in-place buffer refresh; geometry change → debounced rebuild.
-        checkCounter++;
-        if (checkCounter % LIGHT_CHECK_INTERVAL === 0) {
-            const ls = lightSignature();
-            if (lastLightSig !== null && ls !== lastLightSig) refreshLights();
-            lastLightSig = ls;
-        }
-        if (checkCounter % GEO_CHECK_INTERVAL === 0) {
-            const gs = geoSignature();
-            // (A1) Debounce: rebuild only after the geometry has been STABLE for
-            // GEO_SETTLE_INTERVALS consecutive checks, so a continuous drag never
-            // thrashes. geoStable: -1 = no pending change; >=0 = stable-checks counted.
-            if (lastGeoSig === null) lastGeoSig = gs;
-            else if (gs !== lastGeoSig) { lastGeoSig = gs; geoStable = 0; }
-            else if (geoStable >= 0) {
-                geoStable++;
-                if (geoStable >= GEO_SETTLE_INTERVALS) { geoStable = -1; reactiveTicks = REACTIVE_TICKS; requestRebuild(); }
+        // cheap in-place buffer refresh; geometry change → debounced rebuild. These walk the
+        // scene graph (CPU), so in continuous mode they run ONLY at rest — never per orbit frame.
+        if (restOnly) {
+            checkCounter++;
+            if (checkCounter % LIGHT_CHECK_INTERVAL === 0) {
+                const ls = lightSignature();
+                if (lastLightSig !== null && ls !== lastLightSig) refreshLights();
+                lastLightSig = ls;
+            }
+            if (checkCounter % GEO_CHECK_INTERVAL === 0) {
+                const gs = geoSignature();
+                // (A1) Debounce: rebuild only after the geometry has been STABLE for
+                // GEO_SETTLE_INTERVALS consecutive checks, so a continuous drag never
+                // thrashes. geoStable: -1 = no pending change; >=0 = stable-checks counted.
+                if (lastGeoSig === null) lastGeoSig = gs;
+                else if (gs !== lastGeoSig) { lastGeoSig = gs; geoStable = 0; }
+                else if (geoStable >= 0) {
+                    geoStable++;
+                    if (geoStable >= GEO_SETTLE_INTERVALS) { geoStable = -1; reactiveTicks = REACTIVE_TICKS; requestRebuild(); }
+                }
             }
         }
         // Reactive re-converge: EASE the temporal blend from a faster (lower-hysteresis) start
@@ -1570,6 +1621,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         },
         setRadianceClamp: (v) => { if (Number.isFinite(v)) U.radianceClamp.value = Math.max(0, v); },   // cap multibounce feedback (anti-runaway)
         setDepthSharpness: (v) => { if (Number.isFinite(v)) U.depthSharpness.value = THREE.MathUtils.clamp(v, 1, 200); }, // depth-moment cosine power (Chebyshev crispness)
+        // ── adaptive-blend tuning (live; no recompile). Tune "stable continuous" by feel. ──
+        setChangeThreshold: (v) => { if (Number.isFinite(v)) U.tempChangeSigma1.value = THREE.MathUtils.clamp(v, 0.5, 8); },   // σ delta to treat a change as REAL — lower = snappier
+        setSnapAmount: (v) => { if (Number.isFinite(v)) U.tempChangeHDrop.value = THREE.MathUtils.clamp(v, 0, 0.9); },         // hysteresis drop on a real change — higher = harder snap
+        setFireflyClamp: (v) => { if (Number.isFinite(v)) U.tempClampSigma.value = THREE.MathUtils.clamp(v, 1, 20); },         // clamp band in σ — lower = steadier, more lag
+        getChangeThreshold: () => U.tempChangeSigma1.value,
+        getSnapAmount: () => U.tempChangeHDrop.value,
+        getFireflyClamp: () => U.tempClampSigma.value,
         // ── STRUCTURAL knob: cascade count (single grid vs cascaded). 1↔2 never changes
         // geometry, so requestRebuild(false) reuses the ~200ms BVH soup (invariant #3); the
         // change flows through the idle gate + staggered build. 1 → wFine≡0 (byte-identical).
@@ -1581,6 +1639,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             requestRebuild(false);                             // re-fit/alloc/free C1 via the idle-gated staggered build
         },
         getCascades: () => cascades,
+        // ── Continuous solve: keep updating GI while the camera moves (bounded GPU solve only;
+        // heavy rebuilds still wait for rest, so the no-hitch guarantee holds). false = idle-gated.
+        setContinuous: (on) => { continuous = on === true; },
+        getContinuous: () => continuous,
         requestRebuild,
         setBounds,
         setVolumes,
