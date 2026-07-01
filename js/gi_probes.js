@@ -20,7 +20,7 @@
 import * as THREE from 'three';
 import { LightingNode } from 'three/webgpu';
 import {
-    Fn, If, Loop, Return, instanceIndex, storage, uniform, texture,
+    Fn, If, Loop, Return, instanceIndex, storage, uniform, texture, sharedUniformGroup,
     float, int, uint, vec2, vec3, vec4, uvec2,
     max as tslMax, min as tslMin, mix, clamp, floor, normalize, dot, cross, length,
     abs as tslAbs, sqrt, cos, sin, pow, exp, textureStore, positionWorld, normalWorld, select,
@@ -108,6 +108,18 @@ const GI_TEMPORAL_CLAMP_SIGMA = 6.0;
 
 let _node = null;
 
+// ── fragment-uniform liveness ──
+// The GI term is injected by the LIGHTS node, not the material, so GI-lit materials
+// have no custom material nodes → NodeMaterialObserver.needsRefresh() sees a plain
+// material and SKIPS binding updates while nothing it tracks (matrices/material
+// props/lights) changes. Plain per-object uniforms therefore go stale at rest —
+// setIntensity/setEnabled "did nothing" until a recompile or camera move. A SHARED
+// uniform group is the designed escape hatch: one bind group cached across all
+// render objects (same mechanism as three's renderGroup), re-uploaded when its
+// version bumps. Every fragment-side setter bumps it via touchGiUniforms().
+const GI_UNIFORM_GROUP = sharedUniformGroup('speedballGi');
+const touchGiUniforms = () => { GI_UNIFORM_GROUP.needsUpdate = true; };
+
 // ── cascaded probe grid ──
 // C0 = coarse full-bounds grid (byte-identical to the old single grid when cascades=1);
 // C1 = fine sub-box at ~2× spacing, placed by a CPU triangle-density histogram over the
@@ -165,6 +177,16 @@ export class GiProbeNode extends LightingNode {
         // 0 → classification IGNORED (default — safe for thin 2-sided walls, which
         // a backface test misreads); 1 → drop probes buried in SOLID geometry.
         this.classifyStrengthNode = uniform(0.0);
+
+        // ALL fragment-side uniforms live in the shared GI group (see GI_UNIFORM_GROUP):
+        // per-object uniforms go stale at rest because the material observer skips
+        // binding updates for plain (non-node) materials.
+        for (const u of [
+            ...this.gridMinNode, ...this.gridSizeNode, ...this.resNode, ...this.atlasDimNode,
+            ...this.normalBiasNode, ...this.chebyBiasNode,
+            this.intensityNode, this.enabledNode, this.cascadeCountNode, this.borderBandNode,
+            this.chebyStrengthNode, this.classifyStrengthNode,
+        ]) u.setGroup(GI_UNIFORM_GROUP);
     }
 
     // computed readiness: every cascade in [0..count) has a non-null atlas triplet.
@@ -189,18 +211,20 @@ export class GiProbeNode extends LightingNode {
     // materials never recompile on a probe tick — only on resize / first data.
     get cacheToken() { return `gi-speedball-probes:${this._structGen}`; }
 
-    setEnabled(on) { this._enabled = on === true; this.enabledNode.value = this._enabled ? 1.0 : 0.0; }
+    setEnabled(on) { this._enabled = on === true; this.enabledNode.value = this._enabled ? 1.0 : 0.0; touchGiUniforms(); }
     setIntensity(v) {
         this.intensity = Number.isFinite(v) ? Math.max(0, v) : 0;
         this.intensityNode.value = this.intensity;
+        touchGiUniforms();
     }
-    setChebyStrength(v) { if (Number.isFinite(v)) this.chebyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); }
-    setClassifyStrength(v) { if (Number.isFinite(v)) this.classifyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); }
+    setChebyStrength(v) { if (Number.isFinite(v)) { this.chebyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); touchGiUniforms(); } }
+    setClassifyStrength(v) { if (Number.isFinite(v)) { this.classifyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); touchGiUniforms(); } }
     // Active-cascade count (fragment-visible): 1 → wFine≡0 (byte-identical), 2 → blend.
     setCascadeCount(n) {
         const v = (Math.round(Number(n)) === 2) ? 2 : 1;
         if (this.cascadeCountNode.value === v) return;
         this.cascadeCountNode.value = v;
+        touchGiUniforms();
         this._structGen++;   // shader tap count changes → one recompile
     }
     setAtlases(c, atlas, depthAtlas, stateAtlas) {
@@ -219,6 +243,7 @@ export class GiProbeNode extends LightingNode {
         this.atlasDimNode[c].value.set(atlasW, atlasH);
         if (Number.isFinite(normalBias)) this.normalBiasNode[c].value = Math.max(1e-4, normalBias);
         if (Number.isFinite(chebyBias)) this.chebyBiasNode[c].value = Math.max(0, chebyBias);
+        touchGiUniforms();
     }
     setGrid(c, gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias) {
         this.updateGridUniforms(c, gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias);
@@ -1618,6 +1643,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             for (let c = 0; c < NUM_CASC; c++) {
                 node.normalBiasNode[c].value = Math.max(1e-4, casc[c].minCell * SURFACE_NORMAL_BIAS_CELL * normalBiasScale);
             }
+            touchGiUniforms();
         },
         setRadianceClamp: (v) => { if (Number.isFinite(v)) U.radianceClamp.value = Math.max(0, v); },   // cap multibounce feedback (anti-runaway)
         setDepthSharpness: (v) => { if (Number.isFinite(v)) U.depthSharpness.value = THREE.MathUtils.clamp(v, 1, 200); }, // depth-moment cosine power (Chebyshev crispness)
