@@ -137,7 +137,7 @@ const params = {
   sunIntensity: 8.2, exposure: 0.7,
   giEnabled: true, giIntensity: 6, giDivisions: 12, showProbes: false,
   // quality knobs (defaults mirror gi_probes.js). smoothness is pinned to 1 (no slider).
-  giRays: 64, giDenoise: 1, giHysteresis: 0.95, giNormalBias: 1,
+  giRays: 64, giHysteresis: 0.95, giNormalBias: 1,
   giRadianceClamp: 8, giDepthSharpness: 50, giLeak: 0, giSolid: 0,
   camX: 1.1982, camY: 4.5833, camZ: -3.463,
   targetX: -3.2952, targetY: 4.4996, targetZ: -3.2815,
@@ -206,7 +206,6 @@ fGI.add(params, 'showProbes').name('show probes').onChange(updateProbeHelpers);
 // Quality subfolder — UNIFORM-backed, apply instantly (no recompile/rebuild).
 // smoothness is intentionally NOT exposed: pinned to 1 at init.
 const fQ = fGI.addFolder('Quality');
-giCtrls.push(fQ.add(params, 'giDenoise', 0, 1, 0.05).name('denoise').onChange((v) => { gi?.setFilterStrength(v); markInteraction(); }));
 giCtrls.push(fQ.add(params, 'giHysteresis', 0.5, 0.99, 0.01).name('hysteresis').onChange((v) => { gi?.setHysteresis(v); markInteraction(); }));
 giCtrls.push(fQ.add(params, 'giNormalBias', 0, 4, 0.05).name('normal bias').onChange((v) => { gi?.setNormalBias(v); markInteraction(); }));
 giCtrls.push(fQ.add(params, 'giRadianceClamp', 0, 32, 0.5).name('radiance clamp').onChange((v) => { gi?.setRadianceClamp(v); markInteraction(); }));
@@ -254,7 +253,7 @@ const gi = installSpeedballGI({
 if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', true);
 // Push the quality defaults so the GUI and the GI uniforms agree on first paint.
 gi.setSmoothness(1);                       // pinned (no slider)
-gi.setFilterStrength(params.giDenoise);
+gi.setFilterStrength(1);   // denoise pinned on (no slider): redundant at these defaults, but harmless
 gi.setHysteresis(params.giHysteresis);
 gi.setNormalBias(params.giNormalBias);
 gi.setRadianceClamp(params.giRadianceClamp);
