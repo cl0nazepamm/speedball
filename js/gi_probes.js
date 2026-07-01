@@ -44,10 +44,12 @@ const TILE = OCT_RES + 2 * BORDER; // 8×8 atlas tile
 const RAYS_PER_PROBE_DEFAULT = 64; // MVP ray budget (doc target 144). LOCKED baseline:
                                    // divisions=12 → 624 probes is tuned at 64 rays. Live via setRays().
 const RAYS_MIN = 32, RAYS_MAX = 256;
-// DIAGNOSTIC: gate the in-trace albedo/emissive TEXTURE sampling. false → packed-color
-// baseline (the proven-working path); true → Lumen-style textured bounce. Flipped to
-// isolate whether the texture path is what's blacking out the field.
-const GI_SAMPLE_TEXTURES = false;
+// In-trace albedo/emissive TEXTURE sampling for the bounce (Lumen-style textured GI).
+// Near-free: the BVH traversal already samples the albedo atlas per hit-candidate for
+// alpha-testing, so this only adds one RGB fetch at the final hit — the 64-ray walk
+// dominates. Skipped entirely when a scene has no albedo/emissive maps. Textured albedo
+// reads darker than a flat factor, so compensate with GI intensity/exposure.
+const GI_SAMPLE_TEXTURES = true;
 const CLASSIFY_RAYS = 32;          // fixed full-sphere rays for classification
 const BACKFACE_FRACTION = 0.25;    // > this fraction backface hits → probe is buried → INACTIVE
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
