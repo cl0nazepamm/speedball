@@ -165,11 +165,41 @@ const materials = { building: createBuildingMaterial(city.layout, parameters.see
 // The building/road looks are node-driven (colorNode), so the GI trace can't read
 // them — give the packer representative albedos (visual untouched, colorNode wins).
 materials.building.userData.giColor = 0xb0a99a;   // limestone average of the tower palette
-// Lit interior windows feed GI: the visible glow is emissiveNode (interior-mapped
-// rooms — invisible to the trace packer), so hint the facade's AVERAGE emission.
-// Deliberately subtle: the average smears the windows' light over ALL facade area,
-// so anything stronger reads as "the whole city is lit" instead of local spill.
-materials.building.userData.giEmissive = new THREE.Color(0.05, 0.034, 0.016);
+
+// NOTE: mrdoob's webgpu city example ships each building set as ONE merged mesh with a
+// partId vertex attribute switching the look per zone. For THIS demo the emissive
+// meshes (GLASS panes, partId 4) are separated into their own geometry group + material
+// instance below (separateEmissiveGlass), so the GI trace sees the actual window panes
+// as area lights — local warm spill with real falloff, instead of a facade-wide
+// average that lit the whole city. Identical construction → identical on-screen look.
+const GLASS_PART_ID = 4;
+materials.buildingGlass = createBuildingMaterial(city.layout, parameters.seed);
+materials.buildingGlass.userData.giColor = 0x22282e;                        // dark glass albedo
+materials.buildingGlass.userData.giEmissive = new THREE.Color(0.5, 0.34, 0.16); // avg pane emission (lit × curtains)
+
+function separateEmissiveGlass(group) {
+  group.traverse((o) => {
+    if (!o.isMesh || !o.geometry?.attributes?.partId || o.userData.glassSeparated) return;
+    o.userData.glassSeparated = true;
+    const g = o.geometry;
+    const part = g.attributes.partId.array;
+    const src = g.index ? g.index.array : null;
+    const triCount = ((src ? src.length : g.attributes.position.count) / 3) | 0;
+    const wall = [], glass = [];
+    for (let t = 0; t < triCount; t++) {
+      const i0 = t * 3;
+      const a = src ? src[i0] : i0;
+      const dst = part[a] === GLASS_PART_ID ? glass : wall;
+      if (src) dst.push(src[i0], src[i0 + 1], src[i0 + 2]);
+      else dst.push(i0, i0 + 1, i0 + 2);
+    }
+    g.setIndex(new THREE.BufferAttribute(new Uint32Array([...wall, ...glass]), 1));
+    g.clearGroups();
+    g.addGroup(0, wall.length, 0);
+    g.addGroup(wall.length, glass.length, 1);
+    o.material = [materials.building, materials.buildingGlass];
+  });
+}
 
 // SPEEDBALL GI traces packed scalar PBR; the procedural buildings import metallic, which
 // kills diffuse bounce (metals don't bounce Lambert) — the Sponza trap. Normalise the
@@ -307,6 +337,7 @@ function generateCity() {
   if (cityGroup) scene.remove(cityGroup);
   city.parameters.seed = parameters.seed;
   cityGroup = city.build(materials);
+  separateEmissiveGlass(cityGroup);   // demo-only: glass panes → own group/material so GI sees them as area lights
   cityGroup.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; prepMaterials(o); } });
   scene.add(cityGroup);
   generateProps();
