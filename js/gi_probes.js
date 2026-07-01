@@ -56,7 +56,13 @@ const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
 const TARGET_PROBES_LONG_AXIS = 12;   // default probes along the longest grid axis (live via setDivisions)
 const MAX_PROBES_PER_AXIS = 32;
 const ATLAS_DIM_FALLBACK = 8192;      // assumed GPU maxTextureDimension2D when the device limit is unreadable
-const MAX_PROBES_PER_TICK = 128;    // cap compute bursts on room-scale grids
+const RAYS_PER_TICK = 98_304;       // MAX per-tick trace budget (÷ rays/probe → probes/tick).
+                                    // ≈1.5k probes at 64 rays — covers the whole Sponza/city
+                                    // union every tick; huge grids fall back to round-robin.
+                                    // AUTO-THROTTLED down when the frame cadence slips (see
+                                    // tick()) so the solve never drags the browser below 60.
+const RAYS_PER_TICK_MIN = 16_384;   // throttle floor (≈256 probes @64 — still 2× the old cap)
+const MAX_PROBES_PER_TICK = 2048;   // absolute ceiling (bounds dispatch + ray scratch)
 const SURFACE_NORMAL_BIAS_CELL = 0.03; // sample 3% of a cell off the shaded wall, not half a cell
 const TRACE_SURFACE_BIAS_CELL = 0.005; // shadow/NEE ray origin bias, scaled to scene units
 const GI_CHEBY_BIAS_CELL = 0.08;       // Chebyshev SELF-OCCLUSION tolerance as a fraction of the
@@ -107,6 +113,8 @@ const GI_TEMPORAL_CHANGE_SIGMA1 = 2.5;
 const GI_TEMPORAL_CLAMP_SIGMA = 6.0;
 
 let _node = null;
+
+const _nowMs = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 
 // ── fragment-uniform liveness ──
 // The GI term is injected by the LIGHTS node, not the material, so GI-lit materials
@@ -466,6 +474,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     // are now PER-CASCADE (see makeCascade); frameCounter is SHARED (one ray-set rotation
     // advanced only on C0's pass boundary — both cascades read the same U.frameJitter).
     let rebuildBackoff = 0;   // ticks remaining before retrying after a failed/empty rebuild (A7)
+    // ── auto-throttle (the hard rule: never lag the browser). The per-tick ray budget
+    // adapts to the observed tick cadence: halve when frames slip, creep back up when
+    // they're comfortably fast. Measures GPU pressure on THIS machine — no tuning knob.
+    let tickBudgetRays = RAYS_PER_TICK;
+    let lastTickAt = 0;
+    let tickDtEma = 0;
+    let budgetCooldown = 0;   // ticks to hold after a shrink before growing again (damps sawtooth)
     let inFlight = false;
     let disposed = false;
     let frameCounter = 0;
@@ -1081,11 +1096,21 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         return casc[0].probeTotal + (cascades > 1 ? casc[1].probeTotal : 0);
     }
     function updatedCap() {
-        // ONE shared per-tick budget over the UNION of both cascades, still ceilinged at
-        // MAX_PROBES_PER_TICK. Because only ONE cascade dispatches per tick (round-robin),
-        // total probes solved/tick == the single-grid count — never both cascades, never
-        // over the cap. Also sizes the per-cascade ray scratch (safe upper bound).
-        return Math.max(1, Math.min(MAX_PROBES_PER_TICK, Math.ceil(Math.max(1, totalUnionProbes()) / 4)));
+        // RAY-budget-based per-tick probe count: a fixed trace budget (RAYS_PER_TICK)
+        // divided by the live ray count, ceilinged at MAX_PROBES_PER_TICK. GPU cost per
+        // tick is ~constant regardless of rays/probe, and the ray scratch stays bounded
+        // (≈ RAYS_PER_TICK × 16 B). Small/medium grids fit whole → every probe updates
+        // EVERY tick, so the field converges in ~1 s at the same hysteresis (steady-state
+        // stability depends only on h per update, not on update rate — the old
+        // union/4-with-128-ceiling cap made each texel wait ~10 frames per update, which
+        // is why re-convergence took ~10 s and low hysteresis was the only way to speed
+        // it up... at the price of flicker). Also sizes the per-cascade ray scratch —
+        // this is the BUILD-TIME ceiling; the live per-tick count is tickCap() below.
+        return Math.max(1, Math.min(MAX_PROBES_PER_TICK, Math.floor(RAYS_PER_TICK / Math.max(1, raysPerProbe))));
+    }
+    // Live per-tick probe count under the AUTO-THROTTLED ray budget (≤ updatedCap()).
+    function tickCap() {
+        return Math.max(1, Math.min(updatedCap(), Math.floor(tickBudgetRays / Math.max(1, raysPerProbe))));
     }
 
     // DETAIL-DRIVEN C1 placement: a cheap CPU triangle-centroid density histogram over the
@@ -1317,6 +1342,14 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 // ~2× the coarse long-axis density over the (smaller) fine box.
                 C1.res.copy(computeGridResolution(C1.gridSize, Math.min(MAX_PROBES_PER_AXIS, Math.round(targetLongAxis * C1_RES_SCALE))));
                 fitAtlas(C1.res);
+                // Bound the fine cascade's SIZE relative to the coarse grid. On a big boxy
+                // scene the fine box hits its 60%-per-axis cap at 2× density and C1 blows up
+                // to many times C0 (city: 7k fine vs 1k coarse) — starving the per-tick ray
+                // budget and freezing C1's convergence. Shrink uniformly (cells stay ~cubic).
+                const c1Cap = Math.max(64, 2 * C0.probeTotal);
+                for (let g = 0; g < 12 && C1.res.x * C1.res.y * C1.res.z > c1Cap; g++) {
+                    C1.res.set(Math.max(2, Math.floor(C1.res.x * 0.85)), Math.max(2, Math.floor(C1.res.y * 0.85)), Math.max(2, Math.floor(C1.res.z * 0.85)));
+                }
                 C1.probeTotal = C1.res.x * C1.res.y * C1.res.z;
                 C1.atlasW = C1.res.x * TILE;
                 C1.atlasH = C1.res.y * C1.res.z * TILE;
@@ -1452,56 +1485,97 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             U.hysteresis.value = baseHysteresis;
         }
 
-        // (#1) ALTERNATE exactly ONE cascade per tick (round-robin C0→C1). Only one
-        // cascade dispatches, so total probes solved/tick == the single-grid count — the
-        // per-tick GPU budget is UNCHANGED. cascades==1 always picks C0.
-        const c = (cascades > 1 && casc[1].gpu) ? (solveTurn % 2) : 0;
-        solveTurn = (solveTurn + 1) >>> 0;
-        const C = casc[c];
-        const gpu = C.gpu;
-        if (!gpu) return;
-
-        const updated = Math.min(updatedCap(), C.probeTotal);
-        C.U.probeOffset.value = C.probeCursor >>> 0;
-        C.U.updatedCount.value = updated >>> 0;
-        // (B1) Ray-set rotation shares ONE frameJitter, advanced ONLY on C0's pass boundary
-        // (and no more often than ROT_MIN_TICKS apart). Both cascades read the same
-        // U.frameJitter, so rayDir(k,jitter) stays byte-identical between trace and blend
-        // for whichever cascade runs. Per-cascade ticksSinceRot/refreshStarted are tracked
-        // but frameCounter++ happens only at C0's boundary.
-        C.ticksSinceRot++;
-        if (c === 0 && C.probeCursor === 0 && C.ticksSinceRot >= ROT_MIN_TICKS) {
-            if (C.refreshStarted) { frameCounter = (frameCounter + 1) >>> 0; U.frameJitter.value = (frameCounter * 0.61803398875) % 1; }
-            C.refreshStarted = true;
-            C.ticksSinceRot = 0;
+        // Auto-throttle: compare CONSECUTIVE tick timestamps (gaps from idle-gating or
+        // motion are discarded, so this reads GPU pressure, not pauses). Sustained
+        // frames slower than ~54 fps shrink the ray budget ×0.7 (multiplicative —
+        // recovers headroom fast); frames at/above 60 fps creep it back up (additive;
+        // the grow threshold sits ABOVE a 60 Hz vsync dt of 16.7 ms so a throttled
+        // budget recovers on locked-60 displays instead of sticking low forever).
+        const tNow = _nowMs();
+        if (lastTickAt > 0) {
+            const dt = tNow - lastTickAt;
+            if (dt < 100) {
+                tickDtEma = tickDtEma > 0 ? tickDtEma * 0.8 + dt * 0.2 : dt;
+                if (budgetCooldown > 0) budgetCooldown--;
+                if (tickDtEma > 18.5 && tickBudgetRays > RAYS_PER_TICK_MIN) {
+                    tickBudgetRays = Math.max(RAYS_PER_TICK_MIN, Math.floor(tickBudgetRays * 0.7));
+                    tickDtEma = 0;        // re-measure at the new budget
+                    budgetCooldown = 120; // hold ~2 s before growing again — a render-bound
+                                          // scene that misses 60 fps at ANY budget otherwise
+                                          // saw-tooths between floor and max
+                } else if (budgetCooldown === 0 && tickDtEma < 17.2 && tickBudgetRays < RAYS_PER_TICK) {
+                    tickBudgetRays = Math.min(RAYS_PER_TICK, tickBudgetRays + 2048);
+                }
+            } else {
+                tickDtEma = 0;
+            }
         }
-        C.probeCursor = C.probeTotal > 0 ? (C.probeCursor + updated) % C.probeTotal : 0;
+        lastTickAt = tNow;
+
+        // (#1) Cascade scheduling. When the per-tick ray budget covers the WHOLE union
+        // (the common small/medium-grid case) solve BOTH cascades every tick — every
+        // probe refreshes every tick, so the field re-converges in ~1 s at unchanged
+        // hysteresis. Only when the union exceeds the budget fall back to the old
+        // round-robin (one cascade per tick) so the per-tick GPU cost stays bounded.
+        const haveC1 = cascades > 1 && !!casc[1].gpu;
+        const fullPassPerTick = tickCap() >= totalUnionProbes();
+        let solveList;
+        if (!haveC1) solveList = [0];
+        else if (fullPassPerTick) solveList = [0, 1];
+        else { solveList = [solveTurn % 2]; solveTurn = (solveTurn + 1) >>> 0; }
 
         inFlight = true;
         try {
-            // (A5) One-time-per-rebuild prep for cascade C ONLY. clear (full rebuild only)
-            // + the cheap uploadState (ALWAYS — sole writer of stateAtlas; skipping it
-            // leaves the relocation sample reading uninitialised texels → NaN). classify
-            // (the 32-ray BVH walk) runs ONLY in Solid-scene mode. These WRITE buffers the
-            // trace then READS, so let them finish before tracing.
-            if (C.needsClear || C.needsClassify) {
-                const prep = [];
-                if (C.needsClear) { prep.push(renderer.computeAsync(gpu.clearAtlasKernel)); C.needsClear = false; }
-                if (C.needsClassify) {
-                    if (U.classifyStrength.value > 0) prep.push(renderer.computeAsync(gpu.classifyKernel));
-                    prep.push(renderer.computeAsync(gpu.uploadStateKernel));
-                    C.needsClassify = false;
+            for (const ci of solveList) {
+                const C = casc[ci];
+                const gpu = C.gpu;
+                if (!gpu) continue;
+
+                const updated = Math.min(tickCap(), C.probeTotal);
+                C.U.probeOffset.value = C.probeCursor >>> 0;
+                C.U.updatedCount.value = updated >>> 0;
+                // (B1) Ray-set rotation shares ONE frameJitter, advanced ONLY on C0's pass
+                // boundary. Both cascades read the same U.frameJitter, so rayDir(k,jitter)
+                // stays byte-identical between trace and blend for whichever cascade runs
+                // this tick (rotation happens BEFORE any dispatch). When the WHOLE union
+                // solves every tick, rotate EVERY tick: re-blending the same deterministic
+                // ray set for ROT_MIN_TICKS pulls each texel ~26% toward that one estimate
+                // and then steps to the next — a visible ~10 Hz pulse, worst on the fine
+                // cascade (near-wall probes swing hard between ray sets). A fresh set per
+                // tick is a proper 5%-per-update Monte-Carlo accumulation instead. Multi-
+                // tick (round-robin) passes keep the ROT_MIN_TICKS spacing as before.
+                C.ticksSinceRot++;
+                if (ci === 0 && C.probeCursor === 0 && (fullPassPerTick || C.ticksSinceRot >= ROT_MIN_TICKS)) {
+                    if (C.refreshStarted) { frameCounter = (frameCounter + 1) >>> 0; U.frameJitter.value = (frameCounter * 0.61803398875) % 1; }
+                    C.refreshStarted = true;
+                    C.ticksSinceRot = 0;
                 }
-                await Promise.all(prep);
+                C.probeCursor = C.probeTotal > 0 ? (C.probeCursor + updated) % C.probeTotal : 0;
+
+                // (A5) One-time-per-rebuild prep for cascade C ONLY. clear (full rebuild only)
+                // + the cheap uploadState (ALWAYS — sole writer of stateAtlas; skipping it
+                // leaves the relocation sample reading uninitialised texels → NaN). classify
+                // (the 32-ray BVH walk) runs ONLY in Solid-scene mode. These WRITE buffers the
+                // trace then READS, so let them finish before tracing.
+                if (C.needsClear || C.needsClassify) {
+                    const prep = [];
+                    if (C.needsClear) { prep.push(renderer.computeAsync(gpu.clearAtlasKernel)); C.needsClear = false; }
+                    if (C.needsClassify) {
+                        if (U.classifyStrength.value > 0) prep.push(renderer.computeAsync(gpu.classifyKernel));
+                        prep.push(renderer.computeAsync(gpu.uploadStateKernel));
+                        C.needsClassify = false;
+                    }
+                    await Promise.all(prep);
+                }
+                // (A6/#1) Submit trace→blend→upload for cascade C in order WITHOUT awaiting
+                // between them — same-queue order preserves the data dependency, so one
+                // trailing await suffices. Cascades run in order, never interleaved.
+                await Promise.all([
+                    renderer.computeAsync(gpu.traceKernel),
+                    renderer.computeAsync(gpu.blendKernel),
+                    renderer.computeAsync(gpu.uploadKernel),
+                ]);
             }
-            // (A6/#1) Submit trace→blend→upload for cascade C in order WITHOUT awaiting
-            // between them — same-queue order preserves the data dependency, so one trailing
-            // await suffices. Per-tick dispatch count == today (single cascade).
-            await Promise.all([
-                renderer.computeAsync(gpu.traceKernel),
-                renderer.computeAsync(gpu.blendKernel),
-                renderer.computeAsync(gpu.uploadKernel),
-            ]);
         } catch (e) {
             console.warn('max.js SPEEDBALL GI probe tick failed:', e);
             dirty = true;
@@ -1684,7 +1758,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         hasData: () => node._ready === true,
         // getStats/getResolution/getBounds/_debug* take an optional cascade index
         // (default 0 = coarse, preserving current callers).
-        getStats: (ci = 0) => { const C = casc[ci] || casc[0]; return { probes: C.probeTotal, res: C.res.clone(), atlas: [C.atlasW, C.atlasH], rays: raysPerProbe, oct: OCT_RES, tile: TILE, active: node.active, cascades, cascade: ci }; },
+        getStats: (ci = 0) => { const C = casc[ci] || casc[0]; return { probes: C.probeTotal, res: C.res.clone(), atlas: [C.atlasW, C.atlasH], rays: raysPerProbe, oct: OCT_RES, tile: TILE, active: node.active, cascades, cascade: ci, budgetRays: tickBudgetRays }; },
         getResolution: (ci = 0) => (casc[ci] || casc[0]).res.clone(),
         getBounds: (ci = 0) => { const C = casc[ci] || casc[0]; return new THREE.Box3(C.gridMin.clone(), C.gridMin.clone().add(C.gridSize)); },
         _debugUpload: async (ci = 0) => { const g = casc[ci]?.gpu; if (g && !disposed) { try { await renderer.computeAsync(g.uploadKernel); } catch (e) { /* harness-only */ } } },
