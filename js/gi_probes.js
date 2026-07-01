@@ -99,6 +99,18 @@ const GI_FILTER_REL = 0.0225;      // spatial filter RELATIVE floor (~15% luma)�
 
 let _node = null;
 
+// ── cascaded probe grid ──
+// C0 = coarse full-bounds grid (byte-identical to the old single grid when cascades=1);
+// C1 = fine sub-box at ~2× spacing, placed by a CPU triangle-density histogram over the
+// SHARED BVH soup. Only ONE cascade is solved per tick (round-robin), so the per-tick GPU
+// budget is unchanged. cascades=1 is the byte-identical fallback (C1 never allocated).
+const NUM_CASC = 2;
+const C1_RES_SCALE = 2.0;             // fine cascade target ≈ 2× the coarse long-axis density
+const C1_MIN_AXIS_FRAC = 0.25;        // fine box ≥ 25% of the coarse box per axis (not degenerate)
+const C1_MAX_AXIS_FRAC = 0.60;        // fine box ≤ 60% of the coarse box per axis (not the whole scene)
+const C1_HIST_G = 16;                 // 16³ = 4096 fixed density bins (constant, cheap)
+const C1_HIST_THRESHOLD = 0.4;        // union bins ≥ 0.4·peak into the detail cluster
+
 // ── injection node: samples the atlas at the shaded surface and adds the
 // probe irradiance into builder.context.irradiance (mirrors the GiVolumeNode /
 // hemisphere addAssign pattern at max_lights_node.js:224). Stable atlas binding
@@ -108,35 +120,51 @@ export class GiProbeNode extends LightingNode {
 
     constructor() {
         super();
-        this._atlas = null;
-        this._depthAtlas = null;
-        this._stateAtlas = null;
+        // Per-cascade atlas triplets (index 0 = C0 coarse, 1 = C1 fine). SEPARATE atlases
+        // per cascade (not a shared pack): each runs the existing atlas-fit math verbatim.
+        this._atlas = [null, null];
+        this._depthAtlas = [null, null];
+        this._stateAtlas = [null, null];
         this._enabled = false;
-        this._hasData = false;
-        this._structGen = 0;     // bumps on grid resize / atlas realloc ONLY
+        this._structGen = 0;     // bumps on grid resize / atlas realloc / cascade-count change ONLY
         this.intensity = 1.0;
 
-        this.gridMinNode = uniform(new THREE.Vector3());
-        this.gridSizeNode = uniform(new THREE.Vector3(1, 1, 1));
-        this.resNode = uniform(new THREE.Vector3(2, 2, 2));
-        this.atlasDimNode = uniform(new THREE.Vector2(1, 1));
+        // Per-cascade grid uniforms (2-slot arrays).
+        this.gridMinNode = [uniform(new THREE.Vector3()), uniform(new THREE.Vector3())];
+        this.gridSizeNode = [uniform(new THREE.Vector3(1, 1, 1)), uniform(new THREE.Vector3(1, 1, 1))];
+        this.resNode = [uniform(new THREE.Vector3(2, 2, 2)), uniform(new THREE.Vector3(2, 2, 2))];
+        this.atlasDimNode = [uniform(new THREE.Vector2(1, 1)), uniform(new THREE.Vector2(1, 1))];
+        // Per-cascade biases: coarse cells are larger → its own normal/cheby bias.
+        this.normalBiasNode = [uniform(0.04), uniform(0.04)];
+        this.chebyBiasNode = [uniform(0.0), uniform(0.0)];
+
+        // Cascade-invariant look uniforms (single instance).
         this.intensityNode = uniform(1.0);
         // Runtime enable gate. The graph membership below is still the authoritative
         // on/off switch; this uniform remains as a cheap extra guard for compiled graphs.
         this.enabledNode = uniform(1.0);
-        this.normalBiasNode = uniform(0.04);
+        // Active cascade count. Defaults to 1 so the very first fold is the single-grid
+        // shader (byte-identical fallback); set to `cascades` after the first full build.
+        this.cascadeCountNode = uniform(1.0);
+        // Fraction of the C1 extent used as the fine→coarse blend band (hides the seam).
+        this.borderBandNode = uniform(0.15);
         // 0 → no visibility test = pure trilinear "radiosity" look (THE DEFAULT, by user pref:
         // smoother, no per-triangle self-occlusion); 1 → full Chebyshev leak-free visibility.
         // The Chebyshev term self-occludes on dense/thick geometry and hurt the look more than
         // leaks helped, so it's off by default and has no UI toggle. Reachable via setCheby(1).
         this.chebyStrengthNode = uniform(0.0);
-        // Chebyshev self-occlusion tolerance (WORLD units). Surface stays "visible" to its
-        // own probes within this depth → stops the leak-free term erroring on triangles.
-        // Set per rebuild to minCell * GI_CHEBY_BIAS_CELL; tweak live via this uniform.
-        this.chebyBiasNode = uniform(0.0);
         // 0 → classification IGNORED (default — safe for thin 2-sided walls, which
         // a backface test misreads); 1 → drop probes buried in SOLID geometry.
         this.classifyStrengthNode = uniform(0.0);
+    }
+
+    // computed readiness: every cascade in [0..count) has a non-null atlas triplet.
+    get _ready() {
+        const count = Math.round(this.cascadeCountNode.value) || 1;
+        for (let c = 0; c < count; c++) {
+            if (!this._atlas[c] || !this._depthAtlas[c] || !this._stateAtlas[c]) return false;
+        }
+        return true;
     }
 
     // Graph membership is the authoritative GI switch. WebGPU node uniforms can stay
@@ -147,7 +175,7 @@ export class GiProbeNode extends LightingNode {
     // so the node is folded into the shader ONCE (when data appears) and stays put.
     // Gating active on _enabled/intensity reintroduces the original bug — toggling them
     // only flips the cacheToken, which never forces a recompile, so GI silently drops out.
-    get active() { return this._hasData; }
+    get active() { return this._ready; }
     // structure-only token: data writes (textureStore) do NOT change this, so
     // materials never recompile on a probe tick — only on resize / first data.
     get cacheToken() { return `gi-speedball-probes:${this._structGen}`; }
@@ -159,52 +187,60 @@ export class GiProbeNode extends LightingNode {
     }
     setChebyStrength(v) { if (Number.isFinite(v)) this.chebyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); }
     setClassifyStrength(v) { if (Number.isFinite(v)) this.classifyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); }
-    setAtlases(atlas, depthAtlas, stateAtlas) {
-        this._atlas = atlas || null;
-        this._depthAtlas = depthAtlas || null;
-        this._stateAtlas = stateAtlas || null;
-        this._hasData = !!atlas;
+    // Active-cascade count (fragment-visible): 1 → wFine≡0 (byte-identical), 2 → blend.
+    setCascadeCount(n) {
+        const v = (Math.round(Number(n)) === 2) ? 2 : 1;
+        if (this.cascadeCountNode.value === v) return;
+        this.cascadeCountNode.value = v;
+        this._structGen++;   // shader tap count changes → one recompile
+    }
+    setAtlases(c, atlas, depthAtlas, stateAtlas) {
+        this._atlas[c] = atlas || null;
+        this._depthAtlas[c] = depthAtlas || null;
+        this._stateAtlas[c] = stateAtlas || null;
         this._structGen++;
     }
     // Update the grid placement uniforms only. Uniform .value writes do NOT change
     // a material cache key, so this is churn-free — the same-dim rebuild path uses
     // it to re-place probes after a geometry edit WITHOUT a TSL recompile.
-    updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias) {
-        this.gridMinNode.value.copy(gridMin);
-        this.gridSizeNode.value.copy(gridSize);
-        this.resNode.value.copy(res);
-        this.atlasDimNode.value.set(atlasW, atlasH);
-        if (Number.isFinite(normalBias)) this.normalBiasNode.value = Math.max(1e-4, normalBias);
-        if (Number.isFinite(chebyBias)) this.chebyBiasNode.value = Math.max(0, chebyBias);
+    updateGridUniforms(c, gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias) {
+        this.gridMinNode[c].value.copy(gridMin);
+        this.gridSizeNode[c].value.copy(gridSize);
+        this.resNode[c].value.copy(res);
+        this.atlasDimNode[c].value.set(atlasW, atlasH);
+        if (Number.isFinite(normalBias)) this.normalBiasNode[c].value = Math.max(1e-4, normalBias);
+        if (Number.isFinite(chebyBias)) this.chebyBiasNode[c].value = Math.max(0, chebyBias);
     }
-    setGrid(gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias) {
-        this.updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias);
+    setGrid(c, gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias) {
+        this.updateGridUniforms(c, gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias);
         this._structGen++;   // resize/first-enable ONLY → cacheToken moves → one recompile
     }
 
-    // world position of grid probe (px,py,pz).
-    _probePos(px, py, pz) {
-        const f = vec3(px, py, pz).div(this.resNode.sub(1.0).max(vec3(1.0)));
-        return this.gridMinNode.add(f.mul(this.gridSizeNode));
+    // world position of grid probe (px,py,pz) in cascade c.
+    _probePos(px, py, pz, c) {
+        const f = vec3(px, py, pz).div(this.resNode[c].sub(1.0).max(vec3(1.0)));
+        return this.gridMinNode[c].add(f.mul(this.gridSizeNode[c]));
     }
 
-    // tile-local atlas uv for probe (col,row) at octahedral coord octUV.
-    _tileUV(col, row, octUV) {
+    // tile-local atlas uv for probe (col,row) at octahedral coord octUV in cascade c.
+    _tileUV(col, row, octUV, c) {
         const ox = col.mul(float(TILE)).add(float(BORDER)).add(octUV.x.mul(float(OCT_RES))).add(0.5);
         const oy = row.mul(float(TILE)).add(float(BORDER)).add(octUV.y.mul(float(OCT_RES))).add(0.5);
-        return vec2(ox.div(this.atlasDimNode.x), oy.div(this.atlasDimNode.y));
+        return vec2(ox.div(this.atlasDimNode[c].x), oy.div(this.atlasDimNode[c].y));
     }
 
     // sample the probe field at world (P, N): trilinear over the 8 cage probes,
     // each fetched octahedrally in the shading-normal direction and weighted by
     // a depth-moment Chebyshev visibility test (leak-free through thin walls).
-    sampleIrradiance(P, N) {
-        const atlas = this._atlas;
-        const depthAtlas = this._depthAtlas;
-        const res = this.resNode;
+    // Sample ONE cascade c (0=coarse, 1=fine) — the original 8-tap trilinear gather,
+    // parameterized per cascade. PURE-EXPRESSION (no toVar/addAssign): fragment colorNode.
+    _sampleCascade(P, N, c) {
+        const atlas = this._atlas[c];
+        const depthAtlas = this._depthAtlas[c];
+        const res = this.resNode[c];
         const ry = res.y;
-        const cell = this.gridSizeNode.div(res.sub(1.0).max(vec3(1.0)));
-        const gridF = P.sub(this.gridMinNode).div(cell.max(vec3(1e-6)));
+        const cell = this.gridSizeNode[c].div(res.sub(1.0).max(vec3(1.0)));
+        const gridF = P.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
         const baseF = gridF.floor().clamp(vec3(0.0), res.sub(2.0).max(vec3(0.0)));
         const frac = gridF.sub(baseF).clamp(0.0, 1.0);
         const Nn = N.normalize();
@@ -232,17 +268,17 @@ export class GiProbeNode extends LightingNode {
             // per-probe meta (NEAREST): R=state, GBA=relocation offset. Gated by
             // classifyStrength (default 0 = ignored) — relocation/classification by a
             // backface test misreads thin 2-sided walls, so it's opt-in for solid scenes.
-            const metaUV = vec2(col.add(0.5).div(this.resNode.x), row.add(0.5).div(this.resNode.y.mul(this.resNode.z)));
-            const meta = texture(this._stateAtlas, metaUV);
+            const metaUV = vec2(col.add(0.5).div(this.resNode[c].x), row.add(0.5).div(this.resNode[c].y.mul(this.resNode[c].z)));
+            const meta = texture(this._stateAtlas[c], metaUV);
             const stateV = meta.x;
             const reloc = vec3(meta.y, meta.z, meta.w).mul(this.classifyStrengthNode);
 
             // Chebyshev visibility: relocated probe → surface direction vs stored depth.
-            const probePos = this._probePos(px, py, pz).add(reloc);
+            const probePos = this._probePos(px, py, pz, c).add(reloc);
             const toSurf = P.sub(probePos);
             const dist = length(toSurf);
             const octD = octEncodeNode(toSurf.div(dist.max(float(1e-6))), TSL);
-            const m = texture(depthAtlas, this._tileUV(col, row, octD));
+            const m = texture(depthAtlas, this._tileUV(col, row, octD, c));
             const m1 = m.x; const m2 = m.y;
             const variance = m2.sub(m1.mul(m1)).abs();
             // Self-occlusion tolerance: a lit surface must not shadow ITSELF against its own
@@ -251,7 +287,7 @@ export class GiProbeNode extends LightingNode {
             // m1 per triangle → the leak-free term "errors on triangles". A depth bias (db, <
             // wall thickness) treats the surface as visible within tolerance, so real walls
             // still occlude (no leak) but a surface stops fighting its own shadow.
-            const db = this.chebyBiasNode;
+            const db = this.chebyBiasNode[c];
             const dm = dist.sub(m1).sub(db).max(float(0.0));
             const chebyRaw = variance.div(variance.add(dm.mul(dm)).max(float(1e-6)));
             const cheby = select(dist.lessThanEqual(m1.add(db)), float(1.0), chebyRaw);
@@ -267,16 +303,42 @@ export class GiProbeNode extends LightingNode {
 
             const stateEff = mix(float(1.0), stateV, this.classifyStrengthNode);
             const w = wTri.mul(wrapW).mul(visW).mul(stateEff);
-            const e = texture(atlas, this._tileUV(col, row, octN)).xyz;
+            const e = texture(atlas, this._tileUV(col, row, octN, c)).xyz;
             acc = acc.add(e.mul(w));
             wsum = wsum.add(w);
         }
         return acc.div(wsum.max(float(1e-4)));
     }
 
+    // Cascaded sample: always the coarse cascade; blend toward the fine cascade across a
+    // narrow inner border when P is inside C1 and cascades>=2. Fixed tap count (8 or 16),
+    // no data-dependent branch → bounded fragment cost. cascades==1 → E0 exactly.
+    //
+    // COMPILE-TIME cascade selection (invariants #5/#6): a TSL fragment cannot reference a
+    // null StorageTexture, and the material RECOMPILES whenever _structGen changes (which
+    // includes every cascade-count change). So the E1 (fine) 8-tap subtree is emitted ONLY
+    // when the fine cascade is actually bound at setup() time — otherwise the shader is the
+    // exact original 8-tap single grid (byte-identical) and never touches _atlas[1]=null.
+    sampleIrradiance(P, N) {
+        const E0 = this._sampleCascade(P, N, 0); // coarse: valid over full bounds, ALWAYS
+        const useFine = Math.round(this.cascadeCountNode.value) >= 2 && !!this._atlas[1] && !!this._depthAtlas[1] && !!this._stateAtlas[1];
+        if (!useFine) return E0;                 // single-grid fallback — byte-identical to today
+        // Fine inside-test in normalized C1 coords.
+        const f = P.sub(this.gridMinNode[1]).div(this.gridSizeNode[1].max(vec3(1e-6))); // 0..1 inside the fine box
+        const fLo = tslMin(tslMin(f.x, f.y), f.z);
+        const fHi = tslMin(tslMin(float(1.0).sub(f.x), float(1.0).sub(f.y)), float(1.0).sub(f.z));
+        const edge = tslMin(fLo, fHi); // dist to nearest face; <0 outside
+        const inBand = this.borderBandNode;
+        const wIn = clamp(edge.div(inBand.max(float(1e-4))), float(0.0), float(1.0)); // 1 deep inside, ramps to 0 at the border, 0 outside
+        const gate = this.cascadeCountNode.sub(1.0).clamp(float(0.0), float(1.0)); // 0 when cascades==1, 1 when 2 (live extra guard)
+        const wFine = wIn.mul(gate);
+        const E1 = this._sampleCascade(P, N, 1);
+        return mix(E0, E1, wFine);
+    }
+
     setup(builder) {
-        if (!this._hasData || !this._atlas || !this._depthAtlas || !this._stateAtlas) return;
-        const P = positionWorld.add(normalWorld.mul(this.normalBiasNode));
+        if (!this._ready) return;
+        const P = positionWorld.add(normalWorld.mul(this.normalBiasNode[0]));
         const N = normalWorld;
         const E = this.sampleIrradiance(P, N).max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
         builder.context.irradiance.addAssign(E);
@@ -311,13 +373,50 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     let normalBiasScale = 1.0;
     let curMinCell = 0.1;
 
-    const gridMin = new THREE.Vector3();
-    const gridSize = new THREE.Vector3(1, 1, 1);
-    const res = new THREE.Vector3(2, 2, 2);
-    let probeTotal = 0;
-    let atlasW = 1, atlasH = 1;
+    // Active cascade count. 1 = byte-identical single-grid fallback (C1 never allocated);
+    // 2 = coarse + fine detail cascade. cascadeCountNode defaults to 1 and is set to
+    // `cascades` after the first full build so the first fold is the single-grid shader.
+    let cascades = 2;
+    let solveTurn = 0;        // round-robin cascade index across ticks (C0 even, C1 odd)
+    let buildStage = 0;       // staggered build phase machine (0 = build C0, 1 = build C1, 2 = done)
+    let buildCascadeCount = 1; // effective cascade count for the CURRENT build (fitFineBox may drop to 1)
 
-    let gpu = null;           // { buffers, kernels, atlases, buffers... }
+    // Per-cascade state (index 0 = C0 coarse full-bounds, 1 = C1 fine sub-box). The BVH
+    // soup (cachedBuilt) stays a single shared driver var — never duplicated per cascade.
+    function makeCascadeU() {
+        return {
+            gridMin: uniform(new THREE.Vector3()),
+            gridSize: uniform(new THREE.Vector3(1, 1, 1)),
+            resX: uniform(2, 'uint'), resY: uniform(2, 'uint'), resZ: uniform(2, 'uint'),
+            probeTotal: uniform(1, 'uint'),
+            probeOffset: uniform(0, 'uint'),
+            updatedCount: uniform(1, 'uint'),
+            atlasDim: uniform(new THREE.Vector2(1, 1)),
+            maxDist: uniform(100.0),
+            cellMin: uniform(0.1),
+            relocClamp: uniform(0.045),
+        };
+    }
+    function makeCascade() {
+        return {
+            gridMin: new THREE.Vector3(),
+            gridSize: new THREE.Vector3(1, 1, 1),
+            res: new THREE.Vector3(2, 2, 2),
+            probeTotal: 0,
+            atlasW: 1, atlasH: 1,
+            minCell: 0.1,
+            gpu: null,
+            U: makeCascadeU(),
+            probeCursor: 0,
+            refreshStarted: false,
+            ticksSinceRot: 0,
+            prevAtlasW: 0, prevAtlasH: 0, prevProbeTotal: 0,
+            needsClear: true, needsClassify: true,
+            normalBias: 0.04, chebyBias: 0.0,
+        };
+    }
+    const casc = [makeCascade(), makeCascade()];
+
     let dirty = true;
     // Cached CPU build (BVH soup + material textures). The BVH depends ONLY on geometry,
     // so a divisions/rays change must NOT rebuild it — that ~200ms synchronous MeshBVH +
@@ -327,21 +426,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     let cachedBuilt = null;
     let buildDirty = true;
     let manualVolumes = null; // explicit probe volumes (Probe Origin boxes); null = auto-fit scene
-    let needsClassify = true; // one-shot probe classification after a rebuild
-    let needsClear = true;    // zero the atlas+depthAtlas ONCE on a FULL rebuild (fresh textures
-                              //   aren't guaranteed zeroed); the same-dim path reuses live history,
-                              //   so it must NOT clear (clearing would black-flash the field).
+    // needsClassify / needsClear / probeCursor / refreshStarted / ticksSinceRot / prev*
+    // are now PER-CASCADE (see makeCascade); frameCounter is SHARED (one ray-set rotation
+    // advanced only on C0's pass boundary — both cascades read the same U.frameJitter).
     let rebuildBackoff = 0;   // ticks remaining before retrying after a failed/empty rebuild (A7)
     let inFlight = false;
     let disposed = false;
-    let probeCursor = 0;
     let frameCounter = 0;
-    let updatedPerTick = 1;
-    let refreshStarted = false; // B1: false until the first full-field pass begins; gates ray-rotation advance
-    let ticksSinceRot = 0;      // B1: ticks since the last ray-set rotation (throttles small-grid rotation)
-    // same-dim detection: a geometry edit that doesn't resize the grid reuses the
-    // existing atlases/buffers and skips the recompile (A4).
-    let prevAtlasW = 0, prevAtlasH = 0, prevProbeTotal = 0;
     let quantStep = 1;        // translation deadband (~quarter cell) for the geo signature (A1)
     let lightQuant = 1;       // scene-relative position deadband for the light signature (B4)
     // reactivity: self-detect live light/geometry edits and re-converge fast.
@@ -353,26 +444,23 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     let reactiveTicks = 0;
     const _sigVec = new THREE.Vector3();
 
+    // SHARED compute uniforms — a single instance, folded into BOTH cascade U blocks by
+    // reference (see below), so one GUI knob writes both cascades. Per-cascade uniforms
+    // (gridMin/gridSize/res*/probeTotal/probeOffset/updatedCount/atlasDim/maxDist/cellMin/
+    // relocClamp) live in each C.U (makeCascadeU).
     const U = {
-        gridMin: uniform(new THREE.Vector3()),
-        gridSize: uniform(new THREE.Vector3(1, 1, 1)),
-        resX: uniform(2, 'uint'), resY: uniform(2, 'uint'), resZ: uniform(2, 'uint'),
-        probeTotal: uniform(1, 'uint'),
-        probeOffset: uniform(0, 'uint'),
-        updatedCount: uniform(1, 'uint'),
-        atlasDim: uniform(new THREE.Vector2(1, 1)),
         lightCount: uniform(0, 'uint'),
         frameJitter: uniform(0.0),
         hysteresis: uniform(THREE.MathUtils.clamp(hysteresis, 0, 0.99)),
-        maxDist: uniform(100.0),        // miss-ray depth (probe sees "far") = grid diagonal
         depthSharpness: uniform(50.0),  // cosine power → depth tracks nearest occluder crisply
         radianceClamp: uniform(8.0),    // cap the multibounce feedback term (anti-runaway)
-        cellMin: uniform(0.1),          // min grid cell spacing (relocation margin)
-        relocClamp: uniform(0.045),     // max relocation offset (< 0.45·cell → probe stays in cell)
         classifyStrength: uniform(0.0), // gates relocation APPLY (mirrors node.classifyStrengthNode)
         filterStrength: uniform(1.0),   // CORE denoise: 0 = filter off (harness baseline), 1 = full intra-tile spatial filter
         filterSmooth: uniform(0.5),     // UI "Smoothness": widens the bilateral edge-stop (0 = baseline detail, 1 = very smooth)
     };
+    // Fold the shared uniforms into every cascade's U by REFERENCE so buildKernels closes
+    // over C.U and reads both shared + per-cascade uniforms uniformly.
+    for (const C of casc) Object.assign(C.U, U);
 
     function isSupported() {
         return renderer?.backend?.isWebGPUBackend === true
@@ -392,20 +480,29 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         if (g.maps) for (const t of Object.values(g.maps)) t?.dispose?.();
     }
 
+    // Free ONE cascade's GPU resources (buffers + its own atlas triplet) and reset its
+    // prev-dim trackers. Clears the node's atlas binding for that cascade slot.
+    function disposeCascadeGPU(c) {
+        const C = casc[c];
+        const g = C.gpu;
+        if (g) {
+            for (const k of ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights']) g.buffers[k]?.dispose?.();
+            g.irrBuffer?.dispose?.();
+            g.depthBuffer?.dispose?.();
+            g.stateBuffer?.dispose?.();
+            g.rayBuffer?.dispose?.();
+            g.atlas?.dispose?.();
+            g.depthAtlas?.dispose?.();
+            g.stateAtlas?.dispose?.();
+            if (g.maps) for (const t of Object.values(g.maps)) t?.dispose?.();
+        }
+        C.gpu = null;
+        C.prevAtlasW = C.prevAtlasH = C.prevProbeTotal = 0; // next rebuild takes the full (resize) path
+        node.setAtlases(c, null, null, null);
+    }
+
     function disposeGPU() {
-        if (!gpu) return;
-        for (const k of ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights']) gpu.buffers[k]?.dispose?.();
-        gpu.irrBuffer?.dispose?.();
-        gpu.depthBuffer?.dispose?.();
-        gpu.stateBuffer?.dispose?.();
-        gpu.rayBuffer?.dispose?.();
-        gpu.atlas?.dispose?.();
-        gpu.depthAtlas?.dispose?.();
-        gpu.stateAtlas?.dispose?.();
-        if (gpu.maps) for (const t of Object.values(gpu.maps)) t?.dispose?.();
-        gpu = null;
-        prevAtlasW = prevAtlasH = prevProbeTotal = 0; // next rebuild takes the full (resize) path
-        node.setAtlases(null, null, null);
+        for (let c = 0; c < NUM_CASC; c++) disposeCascadeGPU(c);
     }
 
     // spherical-Fibonacci ray k of N, with a per-frame jitter to decorrelate
@@ -432,7 +529,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         return vec3(r.mul(cos(phi)), r.mul(sin(phi)), z);
     }
 
-    function probeWorldPos(pIndexNode) {
+    function probeWorldPos(pIndexNode, U) {
         const ix = pIndexNode.mod(U.resX);
         const iy = pIndexNode.div(U.resX).mod(U.resY);
         const iz = pIndexNode.div(U.resX.mul(U.resY));
@@ -446,7 +543,15 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         );
     }
 
-    function buildKernels(built, reuse = null) {
+    // Build ONE cascade's GPU kernels+resources, closing over the cascade object C
+    // (C.U, C.probeTotal, C.atlasW/H, C.res). The BVH soup (built) is SHARED across
+    // cascades — never rebuilt per cascade. reuse carries C's live buffers/atlases on a
+    // same-dim rebuild. Returns the gpu object; the caller stores it in C.gpu.
+    function buildKernels(built, C, reuse = null) {
+        const U = C.U;                       // per-cascade + shared uniforms (folded by reference)
+        const probeTotal = C.probeTotal;     // shadow the old flat name → per-cascade
+        const atlasW = C.atlasW, atlasH = C.atlasH;
+        const res = C.res;
         const buffers = {
             bvhNodes: new THREE.StorageBufferAttribute(built.bvhNodes, 1),
             triIndex: new THREE.StorageBufferAttribute(built.triIndex, 1),
@@ -564,7 +669,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             If(slot.greaterThanEqual(U.updatedCount), () => { Return(); });
             const k = gid.mod(uint(raysPerProbe)).toVar();
             const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
-            const ro = probeWorldPos(probeIndex).toVar();
+            const ro = probeWorldPos(probeIndex, U).toVar();
             // apply relocation offset (gated by classifyStrength; 0 = no relocation).
             const mbT = probeIndex.mul(uint(4));
             ro.addAssign(vec3(stateRead.element(mbT.add(uint(1))), stateRead.element(mbT.add(uint(2))), stateRead.element(mbT.add(uint(3)))).mul(U.classifyStrength));
@@ -844,7 +949,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const classifyKernel = Fn(() => {
             const p = instanceIndex.toVar();
             If(p.greaterThanEqual(U.probeTotal), () => { Return(); });
-            const ro = probeWorldPos(p).toVar();
+            const ro = probeWorldPos(p, U).toVar();
             const back = float(0.0).toVar();
             const hits = float(0.0).toVar();
             const closeBackDist = float(1e30).toVar();
@@ -907,10 +1012,83 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         return { buffers, traceKernel, blendKernel, uploadKernel, clearAtlasKernel, classifyKernel, uploadStateKernel, atlas, depthAtlas, stateAtlas, irrBuffer, depthBuffer, stateBuffer, rayBuffer, maps: built.maps, lightCount: built.lightCount };
     }
 
+    function totalUnionProbes() {
+        return casc[0].probeTotal + (cascades > 1 ? casc[1].probeTotal : 0);
+    }
     function updatedCap() {
-        // Round-robin: update ~1/4 of small fields, but cap the batch so large
-        // rooms do not hitch the viewport with a huge compute burst.
-        return Math.max(1, Math.min(MAX_PROBES_PER_TICK, Math.ceil(Math.max(1, probeTotal) / 4)));
+        // ONE shared per-tick budget over the UNION of both cascades, still ceilinged at
+        // MAX_PROBES_PER_TICK. Because only ONE cascade dispatches per tick (round-robin),
+        // total probes solved/tick == the single-grid count — never both cascades, never
+        // over the cap. Also sizes the per-cascade ray scratch (safe upper bound).
+        return Math.max(1, Math.min(MAX_PROBES_PER_TICK, Math.ceil(Math.max(1, totalUnionProbes()) / 4)));
+    }
+
+    // DETAIL-DRIVEN C1 placement: a cheap CPU triangle-centroid density histogram over the
+    // SHARED built soup. Run INSIDE the idle-gated rebuild (never during motion), alongside
+    // the ~200ms MeshBVH build → cannot hitch. Deterministic geometry → stable box across
+    // rebuilds → same-dim reuse keeps working. Returns {min, size} for C1, or null (fallback
+    // to cascades=1 placement) on a flat/degenerate histogram or an all-scene cluster.
+    function fitFineBox(built, box0) {
+        if (!built || !built.vertexData || !built.triIndex || !(built.triCount > 0)) return null;
+        const G = C1_HIST_G;                             // 16³ = 4096 fixed bins (constant, cheap)
+        const hist = new Uint32Array(G * G * G);
+        const min = box0.min;
+        const size = new THREE.Vector3(); box0.getSize(size);
+        const inv = [G / Math.max(1e-6, size.x), G / Math.max(1e-6, size.y), G / Math.max(1e-6, size.z)];
+        const vd = built.vertexData, ti = built.triIndex, S = 8; // VERTEX_DATA_STRIDE, pos at 0-2
+        const triCount = built.triCount;
+        for (let t = 0; t < triCount; t++) {             // one linear pass: centroid binning
+            let cx = 0, cy = 0, cz = 0;
+            for (let k = 0; k < 3; k++) { const v = ti[t * 3 + k] * S; cx += vd[v]; cy += vd[v + 1]; cz += vd[v + 2]; }
+            cx /= 3; cy /= 3; cz /= 3;
+            const gx = THREE.MathUtils.clamp((cx - min.x) * inv[0] | 0, 0, G - 1);
+            const gy = THREE.MathUtils.clamp((cy - min.y) * inv[1] | 0, 0, G - 1);
+            const gz = THREE.MathUtils.clamp((cz - min.z) * inv[2] | 0, 0, G - 1);
+            hist[(gz * G + gy) * G + gx]++;
+        }
+        // Peak bin, then union the AABB (in bin coords) of all bins ≥ threshold·peak.
+        let peak = 0;
+        for (let i = 0; i < hist.length; i++) if (hist[i] > peak) peak = hist[i];
+        if (peak === 0) return null;                     // no geometry → fallback
+        const thr = peak * C1_HIST_THRESHOLD;
+        let bx0 = G, by0 = G, bz0 = G, bx1 = -1, by1 = -1, bz1 = -1, count = 0;
+        for (let z = 0; z < G; z++) for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) {
+            if (hist[(z * G + y) * G + x] >= thr) {
+                if (x < bx0) bx0 = x; if (x > bx1) bx1 = x;
+                if (y < by0) by0 = y; if (y > by1) by1 = y;
+                if (z < bz0) bz0 = z; if (z > bz1) bz1 = z;
+                count++;
+            }
+        }
+        if (count === 0 || bx1 < 0) return null;
+        // Flat/degenerate: cluster spans essentially the whole box → no detail region → fallback.
+        if (bx0 === 0 && by0 === 0 && bz0 === 0 && bx1 === G - 1 && by1 === G - 1 && bz1 === G - 1) return null;
+
+        const cell = [size.x / G, size.y / G, size.z / G];
+        // bin range → world AABB, padded by one coarse cell (box0.minCell approximated by bin cell).
+        const fmin = new THREE.Vector3(min.x + bx0 * cell[0], min.y + by0 * cell[1], min.z + bz0 * cell[2]);
+        const fmax = new THREE.Vector3(min.x + (bx1 + 1) * cell[0], min.y + (by1 + 1) * cell[1], min.z + (bz1 + 1) * cell[2]);
+        const pad = Math.min(cell[0], cell[1], cell[2]);
+        fmin.subScalar(pad); fmax.addScalar(pad);
+        const fsize = fmax.clone().sub(fmin);
+        // Enforce MIN (≥ C1_MIN_AXIS_FRAC of box0) and MAX (≤ C1_MAX_AXIS_FRAC) per axis; re-center
+        // and clip to box0 so C1 is neither degenerate nor the whole scene.
+        const box0max = min.clone().add(size);
+        const axes = ['x', 'y', 'z'];
+        for (const a of axes) {
+            const lo = C1_MIN_AXIS_FRAC * size[a];
+            const hi = C1_MAX_AXIS_FRAC * size[a];
+            let s = THREE.MathUtils.clamp(fsize[a], lo, hi);
+            let center = (fmin[a] + fmax[a]) * 0.5;
+            let mn = center - s * 0.5;
+            let mx = center + s * 0.5;
+            // clip to box0 (shift the window back inside if it overhangs).
+            if (mn < min[a]) { mx += (min[a] - mn); mn = min[a]; }
+            if (mx > box0max[a]) { mn -= (mx - box0max[a]); mx = box0max[a]; }
+            mn = Math.max(mn, min[a]); mx = Math.min(mx, box0max[a]);
+            fmin[a] = mn; fsize[a] = Math.max(1e-4, mx - mn);
+        }
+        return { min: fmin, size: fsize };
     }
 
     async function ensureSceneBuilder() {
@@ -948,122 +1126,187 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         });
     }
 
+    // Fit an atlas within the GPU 2D texture limit by uniformly shrinking res. Mutates
+    // resVec; returns the same vector. (The proven single-grid clamp loop, per cascade.)
+    const _maxDim = () => (renderer?.backend?.device?.limits?.maxTextureDimension2D || ATLAS_DIM_FALLBACK);
+    function fitAtlas(resVec) {
+        const maxDim = _maxDim();
+        for (let g = 0; g < 12 && (resVec.x * TILE > maxDim || resVec.y * resVec.z * TILE > maxDim); g++) {
+            resVec.set(Math.max(2, Math.floor(resVec.x * 0.85)), Math.max(2, Math.floor(resVec.y * 0.85)), Math.max(2, Math.floor(resVec.z * 0.85)));
+        }
+        return resVec;
+    }
+
+    // Build (or same-dim-reuse) ONE cascade's kernels+resources and wire its uniforms +
+    // node bindings. Handles both the reuse (churn-free) path and the full recompile path
+    // for that cascade independently. Does NOT fire onRebuilt (the caller sequences that).
+    function buildOneCascade(built, c) {
+        const C = casc[c];
+        const gridMin = C.gridMin, gridSize = C.gridSize, res = C.res;
+        const minCell = C.minCell;
+        const atlasW = C.atlasW, atlasH = C.atlasH, probeTotal = C.probeTotal;
+        const normalBias = minCell * SURFACE_NORMAL_BIAS_CELL * normalBiasScale;
+        const chebyBias = minCell * GI_CHEBY_BIAS_CELL;
+
+        // Per-cascade same-dim reuse: reuse this cascade's live atlases + buffers if its
+        // dims are unchanged → NO recompile for this cascade, NO black flash.
+        const sameDim = !!C.gpu && atlasW === C.prevAtlasW && atlasH === C.prevAtlasH && probeTotal === C.prevProbeTotal;
+        if (sameDim) {
+            const prev = C.gpu;
+            const reuse = {
+                atlas: prev.atlas, depthAtlas: prev.depthAtlas, stateAtlas: prev.stateAtlas,
+                irrBuffer: prev.irrBuffer, depthBuffer: prev.depthBuffer, stateBuffer: prev.stateBuffer,
+            };
+            C.gpu = buildKernels(built, C, reuse);
+            disposeBVHOnly(prev);   // free ONLY the old BVH storages + ray scratch + maps
+            C.U.gridMin.value.copy(gridMin);
+            C.U.gridSize.value.copy(gridSize);
+            C.U.lightCount.value = Math.min(MAX_LIGHTS, C.gpu.lightCount) >>> 0;
+            C.U.maxDist.value = gridSize.length();
+            C.U.cellMin.value = Math.max(1e-4, minCell);
+            C.U.relocClamp.value = 0.45 * minCell;
+            // Churn-free: update the NODE's placement uniforms WITHOUT bumping _structGen.
+            node.updateGridUniforms(c, gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias);
+            C.probeCursor = 0;
+            C.refreshStarted = false;
+            C.needsClear = false;             // reuse the live atlas history (no black flash)
+            C.needsClassify = true;           // refresh per-probe state for the new geometry
+            return false;                     // no recompile occurred
+        }
+
+        // Resize / first-enable path for this cascade: fresh resources + one recompile.
+        disposeCascadeGPU(c);
+        C.gpu = buildKernels(built, C);
+        C.U.gridMin.value.copy(gridMin);
+        C.U.gridSize.value.copy(gridSize);
+        C.U.resX.value = res.x >>> 0; C.U.resY.value = res.y >>> 0; C.U.resZ.value = res.z >>> 0;
+        C.U.probeTotal.value = probeTotal >>> 0;
+        C.U.atlasDim.value.set(atlasW, atlasH);
+        C.U.lightCount.value = Math.min(MAX_LIGHTS, C.gpu.lightCount) >>> 0;
+        C.U.maxDist.value = gridSize.length();
+        C.U.cellMin.value = Math.max(1e-4, minCell);
+        C.U.relocClamp.value = 0.45 * minCell;
+        node.setAtlases(c, C.gpu.atlas, C.gpu.depthAtlas, C.gpu.stateAtlas);
+        node.setGrid(c, gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias);
+        C.prevAtlasW = atlasW; C.prevAtlasH = atlasH; C.prevProbeTotal = probeTotal;
+        C.probeCursor = 0;
+        C.refreshStarted = false;
+        C.needsClear = true;      // fresh StorageTextures aren't guaranteed zeroed
+        C.needsClassify = true;
+        return true;              // recompile occurred
+    }
+
+    // STAGE 0 of the staggered build: (re)compute BOTH cascades' dims off the SHARED soup
+    // (C0 = today's path exactly; C1 = fitFineBox when cascades>=2, res ~2× finer), then
+    // build C0 only. Sets cascadeCountNode=1 so the fold is the single-grid shader until C1
+    // comes online (stage 1). Returns false on a failed/empty build.
     async function rebuild() {
         // Reuse the cached BVH+texture soup unless geometry actually changed. A
-        // divisions/rays change (buildDirty=false) skips the synchronous MeshBVH build
-        // entirely → no main-thread hitch; it only resizes the grid/atlas/kernels below.
+        // divisions/rays change (buildDirty=false) skips the synchronous MeshBVH build.
         let built = cachedBuilt;
         if (!built || buildDirty) {
             const buildSpectralScene = await ensureSceneBuilder();
             built = await buildSpectralScene({ THREE, scene, maxTriangles: MAX_TRIANGLES });
-            // On a failed/empty build, keep the EXISTING field as history (don't tear it
-            // down) — tick() arms a backoff so we don't re-enter the synchronous build
-            // every frame. (A7)
-            if (!built || built.error) return false;
+            if (!built || built.error) return false;   // keep existing field; tick() arms a backoff (A7)
             cachedBuilt = built;
             buildDirty = false;
         }
 
         const box = new THREE.Box3();
         scene.updateMatrixWorld(true);
-        // Explicit "Probe Origin" volumes override the whole-scene auto-fit: fewer
-        // probes, denser where it matters, faster. Multiple boxes are unioned into
-        // one grid for now (perf win = tighter than the whole scene); far-apart
-        // boxes will later get separate grids. Auto-fit only when no volume is set.
         const hasVolumes = Array.isArray(manualVolumes) && manualVolumes.length > 0;
         if (hasVolumes) { box.makeEmpty(); for (const v of manualVolumes) if (v.box && !v.box.isEmpty()) box.union(v.box); }
         else if (built.bounds && !built.bounds.isEmpty()) box.copy(built.bounds);  // exact traced-soup AABB (preferred)
         else autoFitTracedBounds(box);  // fallback: scene walk honouring the BVH visibility gate
         if (box.isEmpty()) return false;
-        box.getSize(gridSize);
-        gridMin.copy(box.min);
+
+        // ── C0: coarse full-bounds grid (EXACTLY the old single-grid path). ──
+        const C0 = casc[0];
+        box.getSize(C0.gridSize);
+        C0.gridMin.copy(box.min);
         if (!hasVolumes) {
-            // pad the AUTO-FIT grid so surfaces sit inside the cage. Explicit boxes
-            // are used as drawn (the author owns their extent).
-            const pad = gridSize.clone().multiplyScalar(0.06);
-            gridMin.sub(pad); gridSize.add(pad.clone().multiplyScalar(2));
+            const pad = C0.gridSize.clone().multiplyScalar(0.06);
+            C0.gridMin.sub(pad); C0.gridSize.add(pad.clone().multiplyScalar(2));
         }
-        // Manual divisions: a single explicit volume with a res override sets grid
-        // resolution directly; otherwise derive from box size.
         const resOverride = (hasVolumes && manualVolumes.length === 1 && manualVolumes[0].res) ? manualVolumes[0].res : null;
-        res.copy(resOverride ? resOverride : computeGridResolution(gridSize, targetLongAxis));
-        // Keep the octahedral atlas within the GPU's 2D texture limit. atlasH = resY·resZ·TILE
-        // is the tall axis, so a dense grid on a cubic scene can blow past 8192. Shrink res
-        // uniformly until both atlas dims fit (bounded loop; each step trims ~15%).
-        const maxDim = renderer?.backend?.device?.limits?.maxTextureDimension2D || ATLAS_DIM_FALLBACK;
-        for (let g = 0; g < 12 && (res.x * TILE > maxDim || res.y * res.z * TILE > maxDim); g++) {
-            res.set(Math.max(2, Math.floor(res.x * 0.85)), Math.max(2, Math.floor(res.y * 0.85)), Math.max(2, Math.floor(res.z * 0.85)));
+        C0.res.copy(resOverride ? resOverride : computeGridResolution(C0.gridSize, targetLongAxis));
+        fitAtlas(C0.res);
+        C0.probeTotal = C0.res.x * C0.res.y * C0.res.z;
+        C0.atlasW = C0.res.x * TILE;
+        C0.atlasH = C0.res.y * C0.res.z * TILE;
+        C0.minCell = Math.max(1e-4, Math.min(C0.gridSize.x / Math.max(1, C0.res.x - 1), C0.gridSize.y / Math.max(1, C0.res.y - 1), C0.gridSize.z / Math.max(1, C0.res.z - 1)));
+        curMinCell = C0.minCell;                                 // setNormalBias() lives off C0's cell
+        quantStep = Math.max(1e-4, C0.minCell * 0.25);          // A1: geo-signature translation deadband
+        lightQuant = Math.max(1e-3, C0.gridSize.length() * 0.003); // B4: light-signature position deadband
+
+        // ── C1 dims: fine sub-box via the CPU triangle-density histogram (idle-gated). ──
+        // A flat/degenerate histogram → treat as cascades=1 for placement (safe fallback).
+        let wantC1 = cascades >= 2;
+        if (wantC1) {
+            const fine = fitFineBox(built, new THREE.Box3(C0.gridMin.clone(), C0.gridMin.clone().add(C0.gridSize)));
+            if (!fine) { wantC1 = false; }
+            else {
+                const C1 = casc[1];
+                C1.gridMin.copy(fine.min);
+                C1.gridSize.copy(fine.size);
+                // ~2× the coarse long-axis density over the (smaller) fine box.
+                C1.res.copy(computeGridResolution(C1.gridSize, Math.min(MAX_PROBES_PER_AXIS, Math.round(targetLongAxis * C1_RES_SCALE))));
+                fitAtlas(C1.res);
+                C1.probeTotal = C1.res.x * C1.res.y * C1.res.z;
+                C1.atlasW = C1.res.x * TILE;
+                C1.atlasH = C1.res.y * C1.res.z * TILE;
+                C1.minCell = Math.max(1e-4, Math.min(C1.gridSize.x / Math.max(1, C1.res.x - 1), C1.gridSize.y / Math.max(1, C1.res.y - 1), C1.gridSize.z / Math.max(1, C1.res.z - 1)));
+            }
         }
-        probeTotal = res.x * res.y * res.z;
-        atlasW = res.x * TILE;
-        atlasH = res.y * res.z * TILE;
+        // effective cascade count for THIS build (may drop to 1 on a uniform scene).
+        buildCascadeCount = wantC1 ? 2 : 1;
 
-        const minCell = Math.min(gridSize.x / Math.max(1, res.x - 1), gridSize.y / Math.max(1, res.y - 1), gridSize.z / Math.max(1, res.z - 1));
-        curMinCell = Math.max(1e-4, minCell);                   // remembered so setNormalBias() can rewrite the node uniform live
-        quantStep = Math.max(1e-4, minCell * 0.25);             // A1: geo-signature translation deadband (~¼ cell)
-        lightQuant = Math.max(1e-3, gridSize.length() * 0.003); // B4: light-signature position deadband (~0.3% of scene)
-
-        // (A4) Same-dim path: a geometry/light edit that does NOT resize the grid reuses
-        // the live atlases + irr/depth/state buffers, rebuilds ONLY the BVH-bound kernels,
-        // and updates grid uniforms WITHOUT bumping the cache token → NO full-scene TSL
-        // recompile (the per-rebuild half of the freeze) and NO black flash. The reused
-        // history re-converges to the new geometry over a reactivity burst.
-        const sameDim = !!gpu && atlasW === prevAtlasW && atlasH === prevAtlasH && probeTotal === prevProbeTotal;
-        if (sameDim) {
-            const prev = gpu;
-            const reuse = {
-                atlas: prev.atlas, depthAtlas: prev.depthAtlas, stateAtlas: prev.stateAtlas,
-                irrBuffer: prev.irrBuffer, depthBuffer: prev.depthBuffer, stateBuffer: prev.stateBuffer,
-            };
-            gpu = buildKernels(built, reuse);
-            disposeBVHOnly(prev);   // free ONLY the old BVH storages + ray scratch + maps
-            U.gridMin.value.copy(gridMin);
-            U.gridSize.value.copy(gridSize);
-            U.lightCount.value = Math.min(MAX_LIGHTS, gpu.lightCount) >>> 0;
-            U.maxDist.value = gridSize.length();
-            U.cellMin.value = Math.max(1e-4, minCell);
-            U.relocClamp.value = 0.45 * minCell;
-            // res / probeTotal / atlasDim are unchanged by definition → leave those uniforms.
-            // Churn-free: update the NODE's placement uniforms WITHOUT bumping _structGen.
-            node.updateGridUniforms(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL * normalBiasScale, minCell * GI_CHEBY_BIAS_CELL);
-            probeCursor = 0;
-            refreshStarted = false;
-            needsClear = false;             // reuse the live atlas history (no black flash)
-            needsClassify = true;           // refresh per-probe state for the new geometry
-            reactiveTicks = REACTIVE_TICKS; // re-converge the reused history to the edit
-            dirty = false;
-            return true;
+        // Build C0 only in stage 0. If C1 is NOT already online (first build / resize / a C1
+        // dim change), force the shader single-grid (cascadeCountNode=1) so sampleIrradiance
+        // never dereferences a null/stale C1 atlas until C1 comes online in stage 1
+        // (invariant #6). If C1 IS already live and will be reused SAME-DIM this build, keep
+        // count at 2 — dropping it would force a needless 2→1→2 recompile pair (churn) on a
+        // same-dim geometry rebuild.
+        const genBefore = node._structGen;
+        const c1WasReady = !!casc[1].gpu;
+        const c1SameDim = c1WasReady && buildCascadeCount >= 2
+            && casc[1].atlasW === casc[1].prevAtlasW && casc[1].atlasH === casc[1].prevAtlasH && casc[1].probeTotal === casc[1].prevProbeTotal;
+        const recompiled = buildOneCascade(built, 0);
+        if (buildCascadeCount < 2) {
+            // No fine cascade this build → single-grid shader + dispose C1, finish now.
+            node.setCascadeCount(1);
+            disposeCascadeGPU(1);
+            buildStage = 2;
+        } else if (c1SameDim) {
+            // C1 stays live at its current dims → keep it bound (no recompile), rebuild its
+            // BVH-bound kernels next idle tick without dropping the blend.
+            buildStage = 1;
+        } else {
+            // C1 will be (re)allocated at new dims → hide it (single-grid) until stage 1.
+            node.setCascadeCount(1);
+            buildStage = 1;   // C1 built next idle tick (staggered — never 2× the build/frame)
         }
-
-        // Resize / first-enable path: full teardown + fresh resources + exactly ONE recompile.
-        disposeGPU();
-        gpu = buildKernels(built);
-
-        U.gridMin.value.copy(gridMin);
-        U.gridSize.value.copy(gridSize);
-        U.resX.value = res.x >>> 0; U.resY.value = res.y >>> 0; U.resZ.value = res.z >>> 0;
-        U.probeTotal.value = probeTotal >>> 0;
-        U.atlasDim.value.set(atlasW, atlasH);
-        U.lightCount.value = Math.min(MAX_LIGHTS, gpu.lightCount) >>> 0;
-        U.maxDist.value = gridSize.length();
-        U.cellMin.value = Math.max(1e-4, minCell);
-        U.relocClamp.value = 0.45 * minCell;
-        node.setAtlases(gpu.atlas, gpu.depthAtlas, gpu.stateAtlas);
-        node.setGrid(gridMin, gridSize, res, atlasW, atlasH, minCell * SURFACE_NORMAL_BIAS_CELL * normalBiasScale, minCell * GI_CHEBY_BIAS_CELL);
-        prevAtlasW = atlasW; prevAtlasH = atlasH; prevProbeTotal = probeTotal;
-        probeCursor = 0;
-        refreshStarted = false;
+        reactiveTicks = REACTIVE_TICKS;
         dirty = false;
-        needsClear = true;      // fresh StorageTextures aren't guaranteed zeroed
-        needsClassify = true;
-        // The setGrid/setAtlases calls above bumped _structGen → the lights-node
-        // cacheToken changed. Force the one-shot material recompile NOW, the frame
-        // the probe data first exists, so the field folds into the lights graph
-        // immediately on enable / after a resize — not a rebuild late. Fires only on
-        // this (resize/first-enable) path, never on the same-dim path or per tick →
-        // cannot reintroduce recompile churn.
-        if (typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
+        // Fire the one-shot recompile the frame C0's data first exists (resize/first-enable
+        // path OR a cascade-count change to 1). The same-dim path with no structGen change
+        // needs no recompile.
+        if ((recompiled || node._structGen !== genBefore) && typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
         return true;
+    }
+
+    // STAGE 1: build C1 only (one idle tick after C0), then flip cascadeCountNode to 2 so
+    // the fragment starts blending the fine cascade. Runs behind the SAME idle gate as C0.
+    function advanceBuildStageC1() {
+        const built = cachedBuilt;
+        if (!built) { buildStage = 2; return; }
+        const genBefore = node._structGen;
+        const recompiled = buildOneCascade(built, 1);
+        node.setCascadeCount(2);  // C1 online → fragment blends fine cascade
+        buildStage = 2;
+        // C1's setGrid/setAtlases + setCascadeCount bump _structGen only on the full path;
+        // a same-dim C1 reuse changes nothing → no recompile needed (churn-free).
+        if ((recompiled || node._structGen !== genBefore) && typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
     }
 
     async function tick(opts = {}) {
@@ -1082,13 +1325,22 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         // synchronous build every tick.
         if (rebuildBackoff > 0) rebuildBackoff--;
 
-        if (dirty || !gpu) {
+        if (dirty || !casc[0].gpu) {
             if (rebuildBackoff > 0) return;
             inFlight = true; let ok = false;
             try { ok = await rebuild(); } finally { inFlight = false; }
             if (!ok) { dirty = false; rebuildBackoff = REBUILD_BACKOFF_TICKS; return; }
+            return;   // stage 0 done this tick; the solve waits for the next idle tick
         }
-        if (!gpu) return;
+        if (!casc[0].gpu) return;
+
+        // (A2/#2) Staggered build: advance exactly ONE build stage per idle tick so no
+        // single frame does 2× the build. C1 comes online one idle tick after C0.
+        if (buildStage < 2) {
+            inFlight = true;
+            try { advanceBuildStageC1(); } finally { inFlight = false; }
+            return;
+        }
 
         // reactivity: detect live light/geometry edits (throttled). Light change →
         // cheap in-place buffer refresh; geometry change → debounced rebuild.
@@ -1123,46 +1375,51 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             U.hysteresis.value = baseHysteresis;
         }
 
-        const updated = Math.min(updatedCap(), probeTotal);
-        U.probeOffset.value = probeCursor >>> 0;
-        U.updatedCount.value = updated >>> 0;
-        // (B1) Advance the ray-set rotation only at a full-field pass boundary AND no more
-        // often than ROT_MIN_TICKS apart. Within a held rotation every probe is solved with the
-        // SAME rays, so re-solving a static probe yields an identical estimate → the temporal
-        // blend is a no-op → ZERO per-tick boil (the flicker). The original pass-only gate held
-        // for LARGE grids (multi-tick passes) but small grids finish a full pass EVERY tick, so
-        // they rotated every tick → fresh 64-ray noise each tick. The tick floor keeps slow
-        // multi-rotation averaging (SH-volume smoothness) at any grid size.
-        ticksSinceRot++;
-        if (probeCursor === 0 && ticksSinceRot >= ROT_MIN_TICKS) {
-            if (refreshStarted) { frameCounter = (frameCounter + 1) >>> 0; U.frameJitter.value = (frameCounter * 0.61803398875) % 1; }
-            refreshStarted = true;
-            ticksSinceRot = 0;
+        // (#1) ALTERNATE exactly ONE cascade per tick (round-robin C0→C1). Only one
+        // cascade dispatches, so total probes solved/tick == the single-grid count — the
+        // per-tick GPU budget is UNCHANGED. cascades==1 always picks C0.
+        const c = (cascades > 1 && casc[1].gpu) ? (solveTurn % 2) : 0;
+        solveTurn = (solveTurn + 1) >>> 0;
+        const C = casc[c];
+        const gpu = C.gpu;
+        if (!gpu) return;
+
+        const updated = Math.min(updatedCap(), C.probeTotal);
+        C.U.probeOffset.value = C.probeCursor >>> 0;
+        C.U.updatedCount.value = updated >>> 0;
+        // (B1) Ray-set rotation shares ONE frameJitter, advanced ONLY on C0's pass boundary
+        // (and no more often than ROT_MIN_TICKS apart). Both cascades read the same
+        // U.frameJitter, so rayDir(k,jitter) stays byte-identical between trace and blend
+        // for whichever cascade runs. Per-cascade ticksSinceRot/refreshStarted are tracked
+        // but frameCounter++ happens only at C0's boundary.
+        C.ticksSinceRot++;
+        if (c === 0 && C.probeCursor === 0 && C.ticksSinceRot >= ROT_MIN_TICKS) {
+            if (C.refreshStarted) { frameCounter = (frameCounter + 1) >>> 0; U.frameJitter.value = (frameCounter * 0.61803398875) % 1; }
+            C.refreshStarted = true;
+            C.ticksSinceRot = 0;
         }
-        probeCursor = probeTotal > 0 ? (probeCursor + updated) % probeTotal : 0;
+        C.probeCursor = C.probeTotal > 0 ? (C.probeCursor + updated) % C.probeTotal : 0;
 
         inFlight = true;
         try {
-            // (A5) One-time-per-rebuild prep. clear (full rebuild only) + the cheap
-            // uploadState (ALWAYS — it's the sole writer of stateAtlas; a zero-init
-            // stateBuffer yields a neutral state, and skipping it would leave the
-            // relocation sample reading uninitialised texels → NaN). classify (the
-            // 32-ray BVH walk) runs ONLY when Solid-scene mode is on. These WRITE
-            // buffers the trace then READS, so let them finish before tracing.
-            if (needsClear || needsClassify) {
+            // (A5) One-time-per-rebuild prep for cascade C ONLY. clear (full rebuild only)
+            // + the cheap uploadState (ALWAYS — sole writer of stateAtlas; skipping it
+            // leaves the relocation sample reading uninitialised texels → NaN). classify
+            // (the 32-ray BVH walk) runs ONLY in Solid-scene mode. These WRITE buffers the
+            // trace then READS, so let them finish before tracing.
+            if (C.needsClear || C.needsClassify) {
                 const prep = [];
-                if (needsClear) { prep.push(renderer.computeAsync(gpu.clearAtlasKernel)); needsClear = false; }
-                if (needsClassify) {
+                if (C.needsClear) { prep.push(renderer.computeAsync(gpu.clearAtlasKernel)); C.needsClear = false; }
+                if (C.needsClassify) {
                     if (U.classifyStrength.value > 0) prep.push(renderer.computeAsync(gpu.classifyKernel));
                     prep.push(renderer.computeAsync(gpu.uploadStateKernel));
-                    needsClassify = false;
+                    C.needsClassify = false;
                 }
                 await Promise.all(prep);
             }
-            // (A6) Submit trace→blend→upload in order WITHOUT awaiting between them:
-            // same-queue submission order preserves the data dependency, so a single
-            // trailing await suffices. This removes the per-kernel CPU↔GPU round-trip
-            // that serialized GI against the frame (the steady-state "slow").
+            // (A6/#1) Submit trace→blend→upload for cascade C in order WITHOUT awaiting
+            // between them — same-queue order preserves the data dependency, so one trailing
+            // await suffices. Per-tick dispatch count == today (single cascade).
             await Promise.all([
                 renderer.computeAsync(gpu.traceKernel),
                 renderer.computeAsync(gpu.blendKernel),
@@ -1176,7 +1433,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         }
     }
 
-    function setEnabled(on) { node.setEnabled(on === true); if (on && (!gpu || !node._hasData)) requestRebuild(); }
+    function setEnabled(on) { node.setEnabled(on === true); if (on && (!casc[0].gpu || !node._ready)) requestRebuild(); }
     // freshBuild=true (default) invalidates the cached BVH+texture soup so rebuild()
     // rebuilds it (geometry/light-count/volume change, or first build). Grid-only callers
     // (setDivisions/setRays) pass false → the cached soup is reused, no MeshBVH hitch.
@@ -1243,16 +1500,20 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         });
         return `${meshes}:${prims}:${Math.round(hash)}`;
     }
-    // re-collect lights into the existing buffer (no BVH rebuild). Count change → full rebuild.
+    // re-collect lights into EACH cascade's light buffer (no BVH rebuild). Count change →
+    // full rebuild. Both cascades bind their own copy of the light soup, so update both.
     function refreshLights() {
-        if (!gpu || !_collectLights) return;
+        if (!casc[0].gpu || !_collectLights) return;
         let records;
         try { records = _collectLights(THREE, scene); } catch { return; }
-        if (records.length !== gpu.lightCount) { requestRebuild(); return; }
-        const arr = gpu.buffers.lights.array;
-        arr.fill(0);
-        for (let i = 0; i < records.length; i++) arr.set(records[i], i * _LIGHT_STRIDE);
-        gpu.buffers.lights.needsUpdate = true;
+        if (records.length !== casc[0].gpu.lightCount) { requestRebuild(); return; }
+        for (const C of casc) {
+            const g = C.gpu; if (!g) continue;
+            const arr = g.buffers.lights.array;
+            arr.fill(0);
+            for (let i = 0; i < records.length; i++) arr.set(records[i], i * _LIGHT_STRIDE);
+            g.buffers.lights.needsUpdate = true;
+        }
         reactiveTicks = REACTIVE_TICKS;
     }
 
@@ -1272,7 +1533,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 // is zero-init (= "buried"). So turning solid-scene on AFTER load read every
                 // probe as buried and killed GI. (Re)run classification now so the state atlas
                 // actually reflects which probes are buried vs free.
-                if (U.classifyStrength.value > 0) needsClassify = true;
+                if (U.classifyStrength.value > 0) for (const C of casc) C.needsClassify = true;
             }
         },
         setDivisions: (n) => {
@@ -1302,32 +1563,49 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         setNormalBias: (v) => {
             if (!Number.isFinite(v)) return;
             normalBiasScale = THREE.MathUtils.clamp(v, 0, 8);   // × the auto minCell·SURFACE_NORMAL_BIAS_CELL offset
-            node.normalBiasNode.value = Math.max(1e-4, curMinCell * SURFACE_NORMAL_BIAS_CELL * normalBiasScale);
+            // per-cascade: each cascade scales the offset by ITS OWN minCell (coarse cells larger).
+            for (let c = 0; c < NUM_CASC; c++) {
+                node.normalBiasNode[c].value = Math.max(1e-4, casc[c].minCell * SURFACE_NORMAL_BIAS_CELL * normalBiasScale);
+            }
         },
         setRadianceClamp: (v) => { if (Number.isFinite(v)) U.radianceClamp.value = Math.max(0, v); },   // cap multibounce feedback (anti-runaway)
         setDepthSharpness: (v) => { if (Number.isFinite(v)) U.depthSharpness.value = THREE.MathUtils.clamp(v, 1, 200); }, // depth-moment cosine power (Chebyshev crispness)
+        // ── STRUCTURAL knob: cascade count (single grid vs cascaded). 1↔2 never changes
+        // geometry, so requestRebuild(false) reuses the ~200ms BVH soup (invariant #3); the
+        // change flows through the idle gate + staggered build. 1 → wFine≡0 (byte-identical).
+        setCascades: (n) => {
+            const v = (Math.round(Number(n)) === 1) ? 1 : 2;   // default 2
+            if (v === cascades) return;
+            cascades = v;
+            if (v === 1) node.setCascadeCount(1);              // stop blending fine immediately
+            requestRebuild(false);                             // re-fit/alloc/free C1 via the idle-gated staggered build
+        },
+        getCascades: () => cascades,
         requestRebuild,
         setBounds,
         setVolumes,
         isSupported,
-        hasData: () => node._hasData === true,
-        getStats: () => ({ probes: probeTotal, res: res.clone(), atlas: [atlasW, atlasH], rays: raysPerProbe, oct: OCT_RES, tile: TILE, active: node.active }),
-        getResolution: () => res.clone(),
-        getBounds: () => new THREE.Box3(gridMin.clone(), gridMin.clone().add(gridSize)),
-        _debugUpload: async () => { if (gpu && !disposed) { try { await renderer.computeAsync(gpu.uploadKernel); } catch (e) { /* harness-only */ } } },
-        _debugAtlas: () => gpu?.atlas || null,
-        _debugDepthAtlas: () => gpu?.depthAtlas || null,
-        _debugStateAtlas: () => gpu?.stateAtlas || null,
-        _debugStateBuffer: () => gpu?.stateBuffer || null,
-        _debugRead: async (which) => {
-            const buf = which === 'irr' ? gpu?.irrBuffer
-                : which === 'mat' ? gpu?.buffers?.materials
-                : which === 'lights' ? gpu?.buffers?.lights
-                : which === 'state' ? gpu?.stateBuffer : null;
+        hasData: () => node._ready === true,
+        // getStats/getResolution/getBounds/_debug* take an optional cascade index
+        // (default 0 = coarse, preserving current callers).
+        getStats: (ci = 0) => { const C = casc[ci] || casc[0]; return { probes: C.probeTotal, res: C.res.clone(), atlas: [C.atlasW, C.atlasH], rays: raysPerProbe, oct: OCT_RES, tile: TILE, active: node.active, cascades, cascade: ci }; },
+        getResolution: (ci = 0) => (casc[ci] || casc[0]).res.clone(),
+        getBounds: (ci = 0) => { const C = casc[ci] || casc[0]; return new THREE.Box3(C.gridMin.clone(), C.gridMin.clone().add(C.gridSize)); },
+        _debugUpload: async (ci = 0) => { const g = casc[ci]?.gpu; if (g && !disposed) { try { await renderer.computeAsync(g.uploadKernel); } catch (e) { /* harness-only */ } } },
+        _debugAtlas: (ci = 0) => casc[ci]?.gpu?.atlas || null,
+        _debugDepthAtlas: (ci = 0) => casc[ci]?.gpu?.depthAtlas || null,
+        _debugStateAtlas: (ci = 0) => casc[ci]?.gpu?.stateAtlas || null,
+        _debugStateBuffer: (ci = 0) => casc[ci]?.gpu?.stateBuffer || null,
+        _debugRead: async (which, ci = 0) => {
+            const g = casc[ci]?.gpu;
+            const buf = which === 'irr' ? g?.irrBuffer
+                : which === 'mat' ? g?.buffers?.materials
+                : which === 'lights' ? g?.buffers?.lights
+                : which === 'state' ? g?.stateBuffer : null;
             if (!buf || typeof renderer.getArrayBufferAsync !== 'function') return null;
             try { return new Float32Array(await renderer.getArrayBufferAsync(buf)); } catch (e) { return { error: String(e) }; }
         },
-        _debugLightCount: () => gpu?.lightCount,
+        _debugLightCount: (ci = 0) => casc[ci]?.gpu?.lightCount,
         dispose,
     };
 }

@@ -135,7 +135,7 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 const params = {
   azimuth: 89, elevation: 65.5, turbidity: 6, rayleigh: 2.2,
   sunIntensity: 8.2, exposure: 0.7,
-  giEnabled: true, giIntensity: 6, giDivisions: 12, showProbes: false,
+  giEnabled: true, giIntensity: 6, giDivisions: 12, giCascades: 2, showProbes: false,
   // quality knobs (defaults mirror gi_probes.js). smoothness is pinned to 1 (no slider).
   giRays: 64, giHysteresis: 0.95, giNormalBias: 1,
   giRadianceClamp: 8, giDepthSharpness: 50, giLeak: 0, giSolid: 0,
@@ -201,6 +201,7 @@ giCtrls.push(fGI.add(params, 'giIntensity').min(0).step(0.05).name('intensity').
 // STRUCTURAL knobs (idle-gated rebuild — never a per-tick recompile).
 fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi?.setDivisions(v); updateProbeHelpers(); markInteraction(); });
 fGI.add(params, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi?.setRays(v); markInteraction(); });
+fGI.add(params, 'giCascades', { 'single grid': 1, 'cascaded (2)': 2 }).name('cascades').onChange((v) => { gi?.setCascades(+v); updateProbeHelpers(); markInteraction(); });
 fGI.add(params, 'showProbes').name('show probes').onChange(updateProbeHelpers);
 
 // Quality subfolder — UNIFORM-backed, apply instantly (no recompile/rebuild).
@@ -261,6 +262,7 @@ gi.setDepthSharpness(params.giDepthSharpness);
 gi.setChebyStrength(params.giLeak);
 gi.setClassifyStrength(params.giSolid);
 gi.setRays(params.giRays);
+gi.setCascades(params.giCascades);
 window.gi = gi; // console handle for poking
 window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = gi.markMaterialsDirty; // diagnostics
 
