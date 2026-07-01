@@ -49,8 +49,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { createProbeField } from './js/gi_probes.js?v=speedball4';
-import { giLights } from './js/gi_lights_node.js?v=speedball4';
+import { installSpeedballGI, excludeFromGI } from './js/index.js';
 
 const statusEl = document.getElementById('status');
 const setStatus = (msg, err = false) => { statusEl.textContent = msg; statusEl.classList.toggle('err', err); statusEl.classList.remove('hide'); };
@@ -71,13 +70,8 @@ if (renderer.backend?.isWebGPUBackend !== true) {
   throw new Error('WebGPU unavailable');
 }
 
-// ── Non-Studio SPEEDBALL GI lighting node ─────────────────────────────────────────
-// GiLightsNode = stock batched DynamicLightsNode + opt-in probe-irradiance
-// injection. Installing it as the renderer's lights factory is all that's needed
-// for SPEEDBALL GI to fold into every PBR material — no per-material wiring.
-renderer.lighting.createNode = (lights = []) => giLights({
-  maxDirectionalLights: 4, maxPointLights: 16, maxSpotLights: 16, maxHemisphereLights: 2,
-}).setLights(lights);
+// SPEEDBALL GI is installed in one call further down (installSpeedballGI), which
+// wires the lights factory, the material-dirty pass, and idle-gated solving.
 
 // ── Scene & camera ────────────────────────────────────────────────────────────
 const scene = new THREE.Scene();
@@ -89,7 +83,7 @@ controls.dampingFactor = 0.08;
 // ── Sky (Preetham, WebGPU) + sun ──────────────────────────────────────────────
 const sky = new SkyMesh();
 sky.scale.setScalar(1500);                 // within the camera far plane (no z-precision hit)
-sky.userData.maxjsVisible = false;          // keep the sky OUT of the GI BVH (spectral_scene gate)
+excludeFromGI(sky);                         // keep the sky OUT of the GI BVH / auto-fit
 scene.add(sky);
 
 const sun = new THREE.DirectionalLight(0xffffff, 3.2);
@@ -187,40 +181,15 @@ giCtrls.push(fQ.add(params, 'giHysteresis', 0.5, 0.99, 0.01).name('hysteresis').
 giCtrls.push(fQ.add(params, 'giNormalBias', 0, 4, 0.05).name('normal bias').onChange((v) => { gi?.setNormalBias(v); markInteraction(); }));
 giCtrls.push(fQ.add(params, 'giRadianceClamp', 0, 32, 0.5).name('radiance clamp').onChange((v) => { gi?.setRadianceClamp(v); markInteraction(); }));
 giCtrls.push(fQ.add(params, 'giDepthSharpness', 1, 200, 1).name('depth sharpness').onChange((v) => { gi?.setDepthSharpness(v); markInteraction(); }));
-giCtrls.push(fQ.add(params, 'giLeak', 0, 1, 0.05).name('leak control').onChange((v) => { gi?.setChebyStrength(v); markInteraction(); }));
-giCtrls.push(fQ.add(params, 'giSolid', 0, 1, 0.05).name('solid-scene').onChange((v) => { gi?.setClassifyStrength(v); markInteraction(); }));
+giCtrls.push(fQ.add(params, 'giLeak', 0, 1, 0.05).name('chebyshev strength').onChange((v) => { gi?.setChebyStrength(v); markInteraction(); }));
+// solid-scene (classify) stays hidden + pinned to 0 — a backface test misreads Sponza's
+// thin two-sided curtains, so it's an opt-in for enclosed solids only (matches city.html).
 gui.add(params, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => { renderer.toneMappingExposure = v; });   // uncapped
 
 updateSun();
 
-// Force PBR materials to recompile so the probe node folds into the lights graph
-// the MOMENT the field first produces data (mirrors max.js markLightProbeMaterialsDirty).
-// Without this, materials compiled before the field was active never include the GI
-// term — the field builds, but intensity/smoothness do nothing. Fires once per rebuild.
-function markGiMaterialsDirty() {
-  const seen = new WeakSet();
-  const mark = (m) => {
-    if (!m || seen.has(m)) return; seen.add(m);
-    if (m.isMeshBasicMaterial || m.isLineBasicMaterial) return;
-    if (m.visible === false) return;
-    // In this three.js WebGPU build, material.needsUpdate alone does NOT rebuild the node
-    // graph, so the just-activated GI lighting node never folds into the program (the GI
-    // field has energy but never injects → "GI lost"). Disposing the compiled program
-    // forces a true rebuild on the next draw, re-running the lights graph so GI folds in.
-    // Only fires on an idle-gated rebuild (first data / grid resize), never per frame.
-    m.dispose?.();
-    m.needsUpdate = true;
-  };
-  scene.traverse((o) => {
-    if (!o.material) return;
-    if (Array.isArray(o.material)) o.material.forEach(mark); else mark(o.material);
-  });
-  // NOTE: do NOT call renderer.compileAsync() here. It compiles+caches the materials
-  // and consumes the needsUpdate flag, baking a variant that can omit the just-activated
-  // GI lighting node — the render then reuses that non-GI program and GI is silently lost.
-  // The lazy recompile on the next draw folds GI in correctly (proven baseline). Pipeline
-  // warm-up is not worth dropping GI.
-}
+// The post-rebuild material-recompile pass (the "GI silently missing" footgun) is now
+// handled inside installSpeedballGI — no per-app boilerplate needed.
 
 function prepareSponzaMaterialForGi(material) {
   if (!material || material.userData?.powerlightGiPrepared) return;
@@ -240,8 +209,33 @@ function prepareSponzaMaterialForGi(material) {
   }
 }
 
-// ── Load Sponza, then start SPEEDBALL GI ───────────────────────────────────────────
-let gi = null;
+// ── SPEEDBALL GI — install at SETUP, before the first render ────────────────────
+// The lights factory MUST be in place before any lit material compiles. Installing
+// it after the render loop has started leaves a cached non-GI lights node, and GI
+// never folds in (even a later recompile can't swap it). The probe field auto-fits
+// and builds once Sponza is in the scene (idle-gated); requestRebuild() nudges it.
+const gi = installSpeedballGI({
+  renderer, scene, camera,
+  enabled: params.giEnabled,
+  intensity: params.giIntensity,
+  divisions: params.giDivisions,
+  hysteresis: 0.95,
+});
+if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', true);
+// Push the quality defaults so the GUI and the GI uniforms agree on first paint.
+gi.setSmoothness(1);                       // pinned (no slider)
+gi.setFilterStrength(params.giDenoise);
+gi.setHysteresis(params.giHysteresis);
+gi.setNormalBias(params.giNormalBias);
+gi.setRadianceClamp(params.giRadianceClamp);
+gi.setDepthSharpness(params.giDepthSharpness);
+gi.setChebyStrength(params.giLeak);
+gi.setClassifyStrength(params.giSolid);
+gi.setRays(params.giRays);
+window.gi = gi; // console handle for poking
+window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = gi.markMaterialsDirty; // diagnostics
+
+// ── Load Sponza ────────────────────────────────────────────────────────────────
 setStatus('loading Sponza…');
 new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
   const sponza = gltf.scene;
@@ -265,24 +259,8 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
   sc.near = 0.1; sc.far = radius * 8; sc.updateProjectionMatrix();
   sky.scale.setScalar(camera.far * 0.5);
 
-  // SPEEDBALL GI: build the probe field over the model (sky already excluded). Auto-fit
-  // bounds the grid to the visible geometry; opt-in, idle-gated tick in the loop.
-  gi = createProbeField({ renderer, scene, intensity: params.giIntensity, hysteresis: 0.95, divisions: params.giDivisions, onRebuilt: markGiMaterialsDirty });
-  if (!gi.isSupported()) { setStatus('SPEEDBALL GI needs WebGPU storage features.', true); return; }
-  gi.setEnabled(params.giEnabled);
-  // Push the quality defaults so the GUI and the GI uniforms agree on first paint.
-  gi.setSmoothness(1);                       // pinned (no slider)
-  gi.setFilterStrength(params.giDenoise);
-  gi.setHysteresis(params.giHysteresis);
-  gi.setNormalBias(params.giNormalBias);
-  gi.setRadianceClamp(params.giRadianceClamp);
-  gi.setDepthSharpness(params.giDepthSharpness);
-  gi.setChebyStrength(params.giLeak);
-  gi.setClassifyStrength(params.giSolid);
-  gi.setRays(params.giRays);
-  window.gi = gi; // console handle for poking
-  window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = markGiMaterialsDirty; // diagnostics
-
+  // model is in the scene now → build the probe field over it.
+  gi.requestRebuild();
   hideStatus();
   markInteraction();
 }, (xhr) => {
@@ -337,7 +315,7 @@ renderer.setAnimationLoop((nowMs) => {
   // SPEEDBALL GI self-gates on idle: the BVH build + GPU solve are held while orbiting
   // or dragging a slider (world-space GI is lossless held static), then converge
   // once the view rests — so a frame hitch can never land mid-interaction.
-  gi?.tick({ idleMs: nowMs - lastInteractionMs, playing: false });
+  gi?.update({ playing: false });   // idle-gated solve (camera-rest detection is built in)
   updateProbeHelpers();
   renderer.render(scene, camera);
   if (gi && nowMs - statMs > 250) {
