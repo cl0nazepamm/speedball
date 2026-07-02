@@ -1520,13 +1520,25 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         // smoothly into its new solution over a couple seconds — instead of snapping or boiling.
         // (Was a flat REACTIVE_HYSTERESIS for the whole burst → big per-tick jumps = the
         // "calculating buncha shit, flickers left/right" pop the user reported.)
+        let hTickBase;
         if (reactiveTicks > 0) {
             const t = 1 - (reactiveTicks / REACTIVE_TICKS); // 0 at burst start → 1 at burst end
-            U.hysteresis.value = REACTIVE_HYSTERESIS + (baseHysteresis - REACTIVE_HYSTERESIS) * t;
+            hTickBase = REACTIVE_HYSTERESIS + (baseHysteresis - REACTIVE_HYSTERESIS) * t;
             reactiveTicks--;
         } else {
-            U.hysteresis.value = baseHysteresis;
+            hTickBase = baseHysteresis;
         }
+        // Frame-rate normalize: the blend `mix(candidate, prev, h)` is applied ONCE PER TICK,
+        // so a fixed per-tick h smooths LESS on slower browsers (fewer ticks/sec) — the same
+        // slider reads noisier on Firefox/Safari than on Chrome. Treat h as a time constant by
+        // raising it to (dt / 60fps-reference), reusing the same gap-filtered tick-dt EMA the
+        // auto-throttle reads (0 until warm → exponent 1 → no correction). Unchanged at 60 fps;
+        // auto-lowers when frames are slow, auto-raises when fast → same feel on every browser.
+        const H_DT_REF = 1000 / 60;
+        // clamp the measured dt to [240fps, 10fps]; 100ms upper bound matches the auto-throttle's
+        // dt<100 gate below (slow GPUs like an M-series Mac Mini can dip to ~14fps on heavy solves).
+        const hDtN = tickDtEma > 0 ? Math.min(Math.max(tickDtEma, 1000 / 240), 100) : H_DT_REF;
+        U.hysteresis.value = Math.pow(hTickBase, hDtN / H_DT_REF);
 
         // Auto-throttle: compare CONSECUTIVE tick timestamps (gaps from idle-gating or
         // motion are discarded, so this reads GPU pressure, not pauses). Sustained

@@ -93,9 +93,9 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @param {THREE.Scene} opts.scene
  * @param {THREE.Camera} [opts.camera]         used for idle detection; pass per-frame to update() to override
  * @param {boolean} [opts.enabled=true]
- * @param {number}  [opts.intensity=1]
- * @param {number}  [opts.divisions=12]        probes along the longest grid axis
- * @param {number}  [opts.hysteresis=0.95]     temporal stability (higher = steadier / slower)
+ * @param {number}  [opts.intensity=10]        canonical demo tuning (Sponza)
+ * @param {number}  [opts.divisions=16]        probes along the longest grid axis
+ * @param {number}  [opts.hysteresis=0.9]      temporal stability (higher = steadier / slower)
  * @param {object}  [opts.lights]              max light counts for the batched lights node
  * @param {boolean} [opts.installLightsNode=true]  set false if you install your own GI-aware lights node
  * @param {boolean} [opts.prepareMaterials=false]  run prepareMaterialsForGI(scene) on install
@@ -107,9 +107,9 @@ export function installSpeedballGI({
     scene,
     camera,
     enabled = true,
-    intensity = 1.0,
-    divisions = 12,
-    hysteresis = 0.95,
+    intensity = 10,
+    divisions = 16,
+    hysteresis = 0.9,
     lights = { maxDirectionalLights: 4, maxPointLights: 16, maxSpotLights: 16, maxHemisphereLights: 2 },
     installLightsNode = true,
     prepareMaterials = false,
