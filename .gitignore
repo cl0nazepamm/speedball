@@ -9,6 +9,10 @@
 !Sponza/README.md
 /docs/
 
+# Local debug/WIP pages — the public repo and GitHub Pages ship only the
+# Sponza demo (index.html).
+/debug/
+
 node_modules/
 
 *.log

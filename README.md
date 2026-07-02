@@ -7,8 +7,9 @@ Best for medium scale scenes.
 
 ## Launch live Sponza demo
 
-// placeholder for github pages host
+**[▶ cl0nazepamm.github.io/speedball](https://cl0nazepamm.github.io/speedball/)**
 
+Requires a WebGPU-capable browser (Chrome/Edge stable; Safari 26+).
 
 # Installation
 
@@ -36,7 +37,7 @@ has already run, three has cached a non-GI lights node and GI will fail.
 
 - **`excludeFromGI(object)`** — keep an object (and its subtree) out of the GI
   trace and the auto-fit bounds. Use it for sky domes, gizmos, and probe
-  helpers anything that shouldn't bounce light or inflate the grid.
+  helpers — anything that shouldn't bounce light or inflate the grid.
 - **`prepareMaterialsForGI(scene)`** — normalize materials so metals actually
   bounce diffuse GI. The trace path kills Lambert bounce on metals, so an
   all-metal import reads as black GI. Opt-in; mutates materials in place. You can
@@ -53,7 +54,7 @@ has already run, three has cached a non-GI lights node and GI will fail.
 - **Best for small to medium scale scenes** — very large worlds or many separated islands
   can waste probes unless bounds and cascades are curated.
 - **Convergence is temporal** — loads, light edits, and geometry changes fade in
-  over a few frames instead of snapping instantly. Similiar to Lumen.
+  over a few frames instead of snapping instantly. Similar to Lumen.
 
 ## License
 
