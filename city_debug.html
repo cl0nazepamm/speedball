@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>SPEEDBALL GI — Procedural City (WebGPU DDGI + Sky)</title>
+<title>SPEEDBALL GI — City Math Debug</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet">
@@ -20,7 +20,8 @@
     color: #f2f2f2; text-shadow: 0 1px 2px #000, 0 0 2px #000c; }
   #hud .title { font: 800 13px/1.5 Verdana, system-ui, sans-serif; letter-spacing: 0.12em; text-transform: uppercase; }
   #hud .sub { color: #d6d6d6; }
-  #hud #gi-stat { display: inline-block; margin-top: 6px; color: #9fd2ff; }
+	  #hud #gi-stat { display: inline-block; margin-top: 6px; color: #9fd2ff; }
+	  #hud #gi-debug { display: inline-block; margin-top: 2px; color: #d7efb5; }
 
   /* ── status / loading overlay ───────────────────────────────────────────── */
   #status { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
@@ -66,10 +67,11 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">
-  <div class="title">SPEEDBALL GI · City</div>
-  <span class="sub">procedural city · BVH-traced DDGI · WebGPU</span><br>
-  <span class="sub">WASD + drag to look · sun = time of day</span><br>
-  <span class="sub" id="gi-stat">GI: starting…</span>
+  <div class="title">SPEEDBALL GI · City Debug</div>
+  <span class="sub">math isolation page · no saved settings</span><br>
+  <span class="sub">WASD + drag to look · all knobs are disposable</span><br>
+	  <span class="sub" id="gi-stat">GI: starting…</span><br>
+	  <span class="sub" id="gi-debug">debug state: waiting…</span>
 </div>
 <div id="status">initializing WebGPU…</div>
 
@@ -81,7 +83,7 @@ import { Inspector } from 'three/addons/inspector/Inspector.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
 import { positionWorld, normalWorld } from 'three/tsl';
 import { createProbeField, giLights } from './js/index.js';
-import { loadGiSettings, saveGiSettings, applyGiSettings, addGiPanel } from './js/gi_settings.js';
+import { GI_DEFAULTS, applyGiSettings, addGiPanel } from './js/gi_settings.js';
 import { CityGenerator, createBuildingMaterial, createRoadMaterial } from 'three/addons/generators/CityGenerator.js';
 
 const statusEl = document.getElementById('status');
@@ -89,7 +91,7 @@ const setStatus = (msg, err = false) => { statusEl.textContent = msg; statusEl.c
 const hideStatus = () => statusEl.classList.add('hide');
 window.addEventListener('error', (e) => setStatus('Error:\n' + (e.error?.stack || e.message), true));
 window.addEventListener('unhandledrejection', (e) => setStatus('Error:\n' + (e.reason?.stack || e.reason), true));
-const DIAG = new URLSearchParams(location.search).has('diag');
+const DIAG = true;
 
 // ── Renderer (matches webgpu_generator_city) ──────────────────────────────────
 const canvas = document.getElementById('c');
@@ -117,6 +119,15 @@ const pmremGenerator = new THREE.PMREMGenerator(renderer);
 const scene = new THREE.Scene();
 scene.environmentIntensity = 0.2;            // matches the example (sky IBL strength)
 
+const BASE_CAMERA_NEAR = 1;
+const BASE_CAMERA_FAR = 20000;
+const BASE_CAMERA_POS = new THREE.Vector3(-35, 55, -100);
+const BASE_CAMERA_LOOK = new THREE.Vector3(35, 55, 0);
+const BASE_MOVE_SPEED = 15;
+const BASE_SUN_DISTANCE = 600;
+const BASE_SHADOW = { left: -280, right: 280, top: 360, bottom: -40, far: 2400 };
+let gi = null;
+
 // ── Sky (matches the example exactly) ─────────────────────────────────────────
 const sky = new SkyMesh();
 sky.scale.setScalar(10000);
@@ -131,12 +142,12 @@ let cityEnvironment = null;
 let diag = null;
 
 // ── Camera + controls (matches the example) ───────────────────────────────────
-const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 1, 20000);
-camera.position.set(-35, 55, -100);
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, BASE_CAMERA_NEAR, BASE_CAMERA_FAR);
+camera.position.copy(BASE_CAMERA_POS);
 const controls = new FirstPersonControls(camera, renderer.domElement);
-controls.movementSpeed = 15;
+controls.movementSpeed = BASE_MOVE_SPEED;
 controls.lookSpeed = 0.25;
-controls.lookAt(35, 55, 0);
+controls.lookAt(BASE_CAMERA_LOOK);
 const timer = new THREE.Timer();
 
 // GI idle tracking (defined early — generateCity/updateSun call markInteraction).
@@ -146,9 +157,9 @@ const markInteraction = () => { lastInteractionMs = performance.now(); };
 // ── Sun light + shadows (matches the example) ─────────────────────────────────
 const sunLight = new THREE.DirectionalLight();
 sunLight.castShadow = true;
-sunLight.shadow.camera.left = -280; sunLight.shadow.camera.right = 280;
-sunLight.shadow.camera.top = 360; sunLight.shadow.camera.bottom = -40;
-sunLight.shadow.camera.far = 2400;
+sunLight.shadow.camera.left = BASE_SHADOW.left; sunLight.shadow.camera.right = BASE_SHADOW.right;
+sunLight.shadow.camera.top = BASE_SHADOW.top; sunLight.shadow.camera.bottom = BASE_SHADOW.bottom;
+sunLight.shadow.camera.far = BASE_SHADOW.far;
 sunLight.shadow.mapSize.set(4096, 4096);
 sunLight.shadow.bias = -0.0004;
 scene.add(sunLight);
@@ -157,12 +168,12 @@ scene.add(sunLight);
 const parameters = {
   seed: 94, timeOfDay: 12, exposure: 0.45,   // noon = bright (was dawn/dim); overridden by saved state
   showTrees: true, showCars: true,
-  // GI settings come from the SHARED store (Sponza is the canonical scene) — one set
-  // of values across every demo page. Scene state above stays city-only.
-  ...loadGiSettings(),
+  // Debug page: start from canonical defaults only. Do not read or write the
+  // shared GI settings store while chasing a transient artifact.
+  ...GI_DEFAULTS,
 };
 
-let gi = null, cityGroup = null;
+let cityGroup = null;
 const city = new CityGenerator({ seed: parameters.seed });
 // DEBUG: flat untextured materials (flicker isolation) — set false to restore the
 // procedural building/road looks.
@@ -380,7 +391,7 @@ function updateSun() {
   const transmittance = Math.sqrt(Math.max(sinE, 0));
   sunLight.color.copy(_warm).lerp(_cool, transmittance);
   sunLight.intensity = 6 * transmittance;
-  sunLight.position.copy(sun).multiplyScalar(600);
+  sunLight.position.copy(sun).multiplyScalar(BASE_SUN_DISTANCE);
 
   sky.showSunDisc.value = false;
   envScene.add(sky);
@@ -411,7 +422,8 @@ window.addEventListener('resize', () => {
 });
 
 // ── SPEEDBALL GI probe field over the runtime city (NO post-processing — only GI) ───
-function markGiMaterialsDirty() {
+function markGiMaterialsDirty({ forceLightingRefresh = false } = {}) {
+  if (forceLightingRefresh) gi?.forceLightingRefresh?.();
   const seen = new WeakSet();
   const mark = (m) => {
     if (!m || seen.has(m)) return; seen.add(m);
@@ -431,7 +443,7 @@ hideStatus();
 markInteraction();
 
 // ── GUI ────────────────────────────────────────────────────────────────────────
-const gui = new GUI({ title: 'SPEEDBALL GI · City' });
+const gui = new GUI({ title: 'SPEEDBALL GI · Math Debug' });
 const fCity = gui.addFolder('City / Sun');
 fCity.add(parameters, 'seed', 0, 100, 1).onChange(generateCity);
 fCity.add(parameters, 'timeOfDay', 6, 18, 0.1).name('time of day').onChange(updateSun);
@@ -441,44 +453,13 @@ fCity.add(parameters, 'showCars').name('cars').onChange(() => { generateProps();
 addGiPanel(gui, gi, parameters, { onInteract: markInteraction, onStructure: () => updateProbeHelpers() });
 gui.add(parameters, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => { renderer.toneMappingExposure = v; });
 if (DIAG) addDiagnosticPanel(gui);
+addMathDebugPanel(gui);
+attachDebugDirtyOnFinish(gui);
 window.gui = gui;
 
-// ── Persist camera + all settings to localStorage, restore on load ──────────────
-// This is what stops every reload (mine included) from resetting your view/time/GI.
-const STORE_KEY = 'speedball-city-state-v1';
-const _fwd = new THREE.Vector3();
-function saveState() {
-  try {
-    camera.getWorldDirection(_fwd);
-    const look = camera.position.clone().add(_fwd.multiplyScalar(80));
-    localStorage.setItem(STORE_KEY, JSON.stringify({
-      cam: camera.position.toArray(), look: look.toArray(), exposure: renderer.toneMappingExposure,
-      // scene-only state — GI settings live in the SHARED store (js/gi_settings.js)
-      p: {
-        seed: parameters.seed, timeOfDay: parameters.timeOfDay,
-        showTrees: parameters.showTrees, showCars: parameters.showCars,
-      },
-    }));
-  } catch (e) { /* storage disabled */ }
-}
-let _saveTimer = 0;
-function scheduleSave() { clearTimeout(_saveTimer); _saveTimer = setTimeout(saveState, 500); }
-function loadState() {
-  let s; try { s = JSON.parse(localStorage.getItem(STORE_KEY)); } catch (e) { return; }
-  if (!s) return;
-  // scene-only keys — GI settings were already merged from the shared store and
-  // applied via applyGiSettings (old city stores may still carry gi* keys; ignore them).
-  if (s.p) for (const k of ['seed', 'timeOfDay', 'showTrees', 'showCars']) if (k in s.p) parameters[k] = s.p[k];
-  if (Number.isFinite(s.exposure)) renderer.toneMappingExposure = s.exposure;
-  if (parameters.seed !== city.parameters.seed) generateCity();
-  generateProps(); gi.requestRebuild();   // apply restored tree/car toggles (same-seed path skips generateCity)
-  if (Array.isArray(s.cam)) camera.position.fromArray(s.cam);
-  if (Array.isArray(s.look)) controls.lookAt(s.look[0], s.look[1], s.look[2]);
-  updateSun();
-  gui.controllersRecursive().forEach((c) => c.updateDisplay());
-  markInteraction();
-}
-gui.onChange(() => { scheduleSave(); saveGiSettings(parameters); });   // scene state + shared GI settings (debounced)
+// Debug page only: never read or write the normal city/shared settings.
+function scheduleSave() {}
+gui.onChange(() => {});
 
 // ── Pass isolation diagnostics (URL-gated: city.html?diag=1) ────────────────
 const diagFlatMaterial = new THREE.MeshBasicMaterial({ color: 0xb0a99a, toneMapped: false });
@@ -556,9 +537,153 @@ function addDiagnosticPanel(gui) {
   window.speedballDiag = diag;
   window.applySpeedballDiag = applyDiagnostics;
 }
-loadState();                          // restore last session (camera, time, GI, exposure)
+
+let debugDirtyPending = false;
+let debugDirtyReadyAt = 0;
+let debugDirtyAttempts = 0;
+function markDebugDirtyAfterFinish() {
+  debugDirtyPending = true;
+  debugDirtyReadyAt = performance.now() + 300;
+  debugDirtyAttempts = 0;
+  markInteraction();
+}
+function flushDebugDirty(nowMs) {
+  if (!debugDirtyPending || nowMs < debugDirtyReadyAt) return;
+  if (gi?.hasData?.() === false || gi?.node?.active !== true) {
+    debugDirtyAttempts++;
+    debugDirtyReadyAt = nowMs + Math.min(1000, 120 + debugDirtyAttempts * 80);
+    return;
+  }
+  debugDirtyPending = false;
+  markGiMaterialsDirty({ forceLightingRefresh: true });
+  markInteraction();
+}
+function attachDebugDirtyOnFinish(gui) {
+  for (const c of gui.controllersRecursive()) {
+    if (typeof c.onFinishChange === 'function') c.onFinishChange(markDebugDirtyAfterFinish);
+  }
+}
+
+function addMathDebugPanel(gui) {
+  const mathDefaults = {
+    continuous: parameters.giContinuous,
+    cascades: parameters.giCascades,
+    rays: parameters.giRays,
+    divisions: parameters.giDivisions,
+    hysteresis: parameters.giHysteresis,
+    freezeRayJitter: false,
+    frameJitter: -1,
+    sampleNormalMix: 1,
+    sampleBiasScale: 1,
+    sampleObjectNormal: 1,
+    borderBand: 0.15,
+    chebyStrength: parameters.giLeak,
+    chebyBiasScale: 1,
+    classifyStrength: parameters.giSolid,
+    traceBiasScale: 1,
+    rayEpsScale: 1,
+    directScale: 1,
+    emissiveScale: 1,
+    albedoScale: 1,
+    bounceScale: 1,
+    radianceClamp: parameters.giRadianceClamp,
+    cosinePower: 1,
+    depthSharpness: parameters.giDepthSharpness,
+    depthHistoryScale: 1,
+    filterStrength: 1,
+    filterSmooth: 1,
+    filterKScale: 1,
+    filterRelScale: 1,
+    filterEpsScale: 1,
+    tempNoiseHBoost: 0.25,
+    tempChangeSigma0: 0.75,
+    tempChangeSigma1: parameters.giChangeThreshold,
+    tempChangeHDrop: parameters.giSnapAmount,
+    tempMinChangeH: 0.55,
+    tempVarEps: 0.000025,
+    tempVarRel: 0.0025,
+    tempClampSigma: parameters.giFireflyClamp,
+  };
+  const math = { ...mathDefaults };
+  const applyMath = () => {
+    gi.setContinuous(math.continuous);
+    gi.setCascades(math.cascades);
+    gi.setRays(math.rays);
+    gi.setDivisions(math.divisions);
+    gi.setHysteresis(math.hysteresis);
+    gi.setChebyStrength(math.chebyStrength);
+    gi.setClassifyStrength(math.classifyStrength);
+    gi.setRadianceClamp(math.radianceClamp);
+    gi.setDepthSharpness(math.depthSharpness);
+    gi.setFilterStrength(math.filterStrength);
+    gi.setSmoothness(math.filterSmooth);
+    gi.setChangeThreshold(math.tempChangeSigma1);
+    gi.setSnapAmount(math.tempChangeHDrop);
+    gi.setFireflyClamp(math.tempClampSigma);
+    gi.setDebugKnobs?.(math);
+    markInteraction();
+  };
+  const resetMath = () => {
+    Object.assign(math, mathDefaults);
+    applyMath();
+    gui.controllersRecursive().forEach((c) => c.updateDisplay());
+  };
+
+  const f = gui.addFolder('Math Debug (no save)');
+  f.add(math, 'continuous').name('continuous solve').onChange(applyMath);
+  f.add(math, 'cascades', { 'single grid': 1, 'cascaded (2)': 2 }).name('cascades').onChange(applyMath);
+  f.add(math, 'rays', 32, 256, 16).name('rays / probe').onChange(applyMath);
+  f.add(math, 'divisions', 2, 32, 1).name('divisions').onChange(applyMath);
+  f.add(math, 'hysteresis', 0, 0.99, 0.01).name('hysteresis').onChange(applyMath);
+  f.add(math, 'freezeRayJitter').name('freeze ray jitter').onChange(applyMath);
+  f.add(math, 'frameJitter', -1, 1, 0.01).name('frame jitter (-1 auto)').onChange(applyMath);
+
+  const receiver = f.addFolder('Receiver sample');
+  receiver.add(math, 'sampleNormalMix', 0, 1, 0.01).name('normal mix geo→shade').onChange(applyMath);
+  receiver.add(math, 'sampleBiasScale', -4, 4, 0.01).name('sample bias scale').onChange(applyMath);
+  receiver.add(math, 'sampleObjectNormal', 0, 1, 0.01).name('object-matrix normal').onChange(applyMath);
+  receiver.add(math, 'borderBand', 0.001, 1, 0.001).name('cascade blend band').onChange(applyMath);
+  receiver.add(math, 'chebyStrength', 0, 1, 0.01).name('cheby strength').onChange(applyMath);
+  receiver.add(math, 'chebyBiasScale', 0, 16, 0.05).name('cheby bias scale').onChange(applyMath);
+  receiver.add(math, 'classifyStrength', 0, 1, 0.01).name('classify strength').onChange(applyMath);
+
+  const trace = f.addFolder('Trace / radiance');
+  trace.add(math, 'traceBiasScale', 0, 32, 0.05).name('trace bias scale').onChange(applyMath);
+  trace.add(math, 'rayEpsScale', 0, 32, 0.05).name('ray eps scale').onChange(applyMath);
+  trace.add(math, 'directScale', 0, 8, 0.01).name('direct scale').onChange(applyMath);
+  trace.add(math, 'emissiveScale', 0, 8, 0.01).name('emissive scale').onChange(applyMath);
+  trace.add(math, 'albedoScale', 0, 4, 0.01).name('albedo scale').onChange(applyMath);
+  trace.add(math, 'bounceScale', 0, 8, 0.01).name('bounce scale').onChange(applyMath);
+  trace.add(math, 'radianceClamp', 0, 32, 0.1).name('radiance clamp').onChange(applyMath);
+
+  const atlas = f.addFolder('Atlas blend');
+  atlas.add(math, 'cosinePower', 0.01, 16, 0.01).name('ray cosine power').onChange(applyMath);
+  atlas.add(math, 'depthSharpness', 1, 200, 1).name('depth sharpness').onChange(applyMath);
+  atlas.add(math, 'depthHistoryScale', 0, 4, 0.01).name('depth history scale').onChange(applyMath);
+  atlas.add(math, 'filterStrength', 0, 1, 0.01).name('filter strength').onChange(applyMath);
+  atlas.add(math, 'filterSmooth', 0, 1, 0.01).name('filter smooth').onChange(applyMath);
+  atlas.add(math, 'filterKScale', 0, 16, 0.05).name('filter K scale').onChange(applyMath);
+  atlas.add(math, 'filterRelScale', 0, 16, 0.05).name('filter rel scale').onChange(applyMath);
+  atlas.add(math, 'filterEpsScale', 0, 16, 0.05).name('filter eps scale').onChange(applyMath);
+
+  const temporal = f.addFolder('Temporal thresholds');
+  temporal.add(math, 'tempNoiseHBoost', 0, 1, 0.01).name('noise history boost').onChange(applyMath);
+  temporal.add(math, 'tempChangeSigma0', 0, 8, 0.01).name('change sigma low').onChange(applyMath);
+  temporal.add(math, 'tempChangeSigma1', 0.01, 16, 0.01).name('change sigma high').onChange(applyMath);
+  temporal.add(math, 'tempChangeHDrop', 0, 0.99, 0.01).name('change history drop').onChange(applyMath);
+  temporal.add(math, 'tempMinChangeH', 0, 0.99, 0.01).name('min change history').onChange(applyMath);
+  temporal.add(math, 'tempVarEps', 0, 0.001, 0.000001).name('variance eps').onChange(applyMath);
+  temporal.add(math, 'tempVarRel', 0, 0.1, 0.0001).name('variance rel').onChange(applyMath);
+  temporal.add(math, 'tempClampSigma', 0.01, 64, 0.1).name('clamp sigma').onChange(applyMath);
+
+  f.add({ resetMath }, 'resetMath').name('reset math debug');
+  applyMath();
+  window.speedballMathDebug = math;
+  window.applySpeedballMathDebug = applyMath;
+}
+
 if (DIAG) applyDiagnostics();
-window.speedballResetView = () => { try { localStorage.removeItem(STORE_KEY); } catch (e) {} location.reload(); };
+window.speedballResetView = () => location.reload();
 
 // ── Probe helper spheres (diagnostic) ──────────────────────────────────────────
 let probeHelperMesh = null, probeHelperSig = '';
@@ -609,18 +734,38 @@ function updateProbeHelpers() {
 
 // ── Render loop — direct render (no bloom / no AO / no post-FX), only SPEEDBALL GI ───
 const giStatEl = document.getElementById('gi-stat');
+const giDebugEl = document.getElementById('gi-debug');
 let statMs = 0;
 renderer.setAnimationLoop((nowMs) => {
   timer.update();
   controls.update(timer.getDelta());
-  if (cameraIsMoving()) { lastInteractionMs = nowMs; scheduleSave(); }
+  const camMoving = cameraIsMoving();
+  if (camMoving) { lastInteractionMs = nowMs; scheduleSave(); }
   if (!diag?.freezeGiTick) gi?.tick({ idleMs: nowMs - lastInteractionMs, playing: false });
+  flushDebugDirty(nowMs);
   updateProbeHelpers();
   renderer.render(scene, camera);
   if (gi && nowMs - statMs > 250) {
     statMs = nowMs;
     const s = gi.getStats?.();
     giStatEl.textContent = s ? `GI: probes ${s.probes} (${s.res.x}×${s.res.y}×${s.res.z}) · active ${s.active}` : 'GI: building…';
+    const d = gi._debugState?.();
+    if (d) {
+      const idle = Number.isFinite(d.idleMs) ? Math.round(d.idleMs) : '∞';
+      const c0 = d.cascadeState?.[0], c1 = d.cascadeState?.[1];
+      const flags = [
+        camMoving ? 'cam moving' : 'cam still',
+        d.moving ? 'GI moving' : 'GI idle',
+        d.restOnly ? 'rest paths on' : 'rest paths held',
+        d.inFlight ? 'in flight' : 'ready',
+        d.dirty ? 'dirty' : 'clean',
+      ].join(' · ');
+      giDebugEl.textContent =
+        `idle ${idle}ms · ${flags} · reactive ${d.reactiveTicks} · stage ${d.buildStage}` +
+        ` · jitter ${Number(d.frameJitter || 0).toFixed(3)} · budget ${d.tickBudgetRays}` +
+        ` · solve [${d.solveList || '-'}] · c0 ${c0?.cursor ?? '-'}${c0?.needsClear ? '/clear' : ''}${c0?.needsClassify ? '/classify' : ''}` +
+        ` · c1 ${c1?.cursor ?? '-'}${c1?.needsClear ? '/clear' : ''}${c1?.needsClassify ? '/classify' : ''}`;
+    }
   }
 });
 </script>

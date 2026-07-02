@@ -23,7 +23,8 @@ import {
     Fn, If, Loop, Return, instanceIndex, storage, uniform, texture, sharedUniformGroup,
     float, int, uint, vec2, vec3, vec4, uvec2,
     max as tslMax, min as tslMin, mix, clamp, floor, normalize, dot, cross, length,
-    abs as tslAbs, sqrt, cos, sin, pow, exp, textureStore, positionWorld, normalWorld, select,
+    abs as tslAbs, sqrt, cos, sin, pow, exp, textureStore,
+    positionWorld, normalWorld, normalWorldGeometry, normalLocal, modelNormalMatrix, select,
 } from 'three/tsl';
 
 // buildSpectralScene (pulls three-mesh-bvh) is lazy-loaded in rebuild() so
@@ -166,6 +167,15 @@ export class GiProbeNode extends LightingNode {
         // Per-cascade biases: coarse cells are larger → its own normal/cheby bias.
         this.normalBiasNode = [uniform(0.04), uniform(0.04)];
         this.chebyBiasNode = [uniform(0.0), uniform(0.0)];
+        // Debug receiver sampling. city_debug.html can push these around without
+        // saving user settings or rebuilding the scene.
+        this.samplePositionScaleNode = uniform(1.0);
+        this.sampleNormalMixNode = uniform(1.0); // 0 = geometry normal, 1 = shading normal
+        this.sampleBiasScaleNode = uniform(1.0);
+        // Receiver GI must be camera-invariant. Three's normalWorld/normalWorldGeometry
+        // reconstruct through cameraViewMatrix, which can wobble on rotation and make the
+        // sample bias look like GI/wall z-fighting. Default to modelNormalMatrix instead.
+        this.sampleObjectNormalNode = uniform(1.0); // 1 = object normal matrix, bypass camera-view normal reconstruction
 
         // Cascade-invariant look uniforms (single instance).
         this.intensityNode = uniform(1.0);
@@ -192,6 +202,7 @@ export class GiProbeNode extends LightingNode {
         for (const u of [
             ...this.gridMinNode, ...this.gridSizeNode, ...this.resNode, ...this.atlasDimNode,
             ...this.normalBiasNode, ...this.chebyBiasNode,
+            this.samplePositionScaleNode, this.sampleNormalMixNode, this.sampleBiasScaleNode, this.sampleObjectNormalNode,
             this.intensityNode, this.enabledNode, this.cascadeCountNode, this.borderBandNode,
             this.chebyStrengthNode, this.classifyStrengthNode,
         ]) u.setGroup(GI_UNIFORM_GROUP);
@@ -380,8 +391,10 @@ export class GiProbeNode extends LightingNode {
 
     setup(builder) {
         if (!this._ready) return;
-        const P = positionWorld.add(normalWorld.mul(this.normalBiasNode[0]));
-        const N = normalWorld;
+        const viewDerivedNormal = normalize(mix(normalWorldGeometry, normalWorld, this.sampleNormalMixNode));
+        const objectDerivedNormal = normalize(modelNormalMatrix.mul(normalLocal).toVarying('v_speedballObjectNormal'));
+        const N = normalize(mix(viewDerivedNormal, objectDerivedNormal, this.sampleObjectNormalNode));
+        const P = positionWorld.mul(this.samplePositionScaleNode).add(N.mul(this.normalBiasNode[0]).mul(this.sampleBiasScaleNode));
         const E = this.sampleIrradiance(P, N).max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
         builder.context.irradiance.addAssign(E);
     }
@@ -488,11 +501,19 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     let lightQuant = 1;       // scene-relative position deadband for the light signature (B4)
     // reactivity: self-detect live light/geometry edits and re-converge fast.
     let baseHysteresis = THREE.MathUtils.clamp(hysteresis, 0, 0.99);
+    let chebyBiasScale = 1.0;
+    let debugFreezeRayJitter = false;
+    let debugFrameJitterOverride = null;
     let lastLightSig = null;
     let lastGeoSig = null;
     let geoStable = -1;       // -1 = no pending geo change; >=0 = stable-check count since a change (debounce, A1)
     let checkCounter = 0;
     let reactiveTicks = 0;
+    let lastIdleMs = Infinity;
+    let lastMoving = false;
+    let lastRestOnly = true;
+    let lastSolveList = '';
+    let lastUpdatedCount = 0;
     const _sigVec = new THREE.Vector3();
 
     // SHARED compute uniforms — a single instance, folded into BOTH cascade U blocks by
@@ -513,6 +534,22 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         tempChangeSigma1: uniform(GI_TEMPORAL_CHANGE_SIGMA1), // delta (in σ) above which a change counts as REAL → snaps. lower = snappier
         tempChangeHDrop: uniform(GI_TEMPORAL_CHANGE_H_DROP),  // how much hysteresis drops on a real change. higher = harder snap
         tempClampSigma: uniform(GI_TEMPORAL_CLAMP_SIGMA),     // firefly clamp band (in σ). lower = tighter/steadier, more lag
+        debugTraceBiasScale: uniform(1.0),
+        debugRayEpsScale: uniform(1.0),
+        debugDirectScale: uniform(1.0),
+        debugEmissiveScale: uniform(1.0),
+        debugAlbedoScale: uniform(1.0),
+        debugBounceScale: uniform(1.0),
+        debugCosinePower: uniform(1.0),
+        debugTempNoiseHBoost: uniform(GI_TEMPORAL_NOISE_H_BOOST),
+        debugTempChangeSigma0: uniform(GI_TEMPORAL_CHANGE_SIGMA0),
+        debugTempMinChangeH: uniform(GI_TEMPORAL_MIN_CHANGE_H),
+        debugTempVarEps: uniform(GI_TEMPORAL_VAR_EPS),
+        debugTempVarRel: uniform(GI_TEMPORAL_VAR_REL),
+        debugDepthHistoryScale: uniform(1.0),
+        debugFilterKScale: uniform(1.0),
+        debugFilterRelScale: uniform(1.0),
+        debugFilterEpsScale: uniform(1.0),
     };
     // Fold the shared uniforms into every cascade's U by REFERENCE so buildKernels closes
     // over C.U and reads both shared + per-cascade uniforms uniformly.
@@ -748,7 +785,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const faceFwd = dot(ngRaw, rd).lessThan(float(0.0));
                 const ng = ngRaw.mul(select(faceFwd, float(1.0), float(-1.0))).toVar();
                 const hitPoint = ro.add(rd.mul(bestT));
-                const traceBias = tslMax(U.cellMin.mul(float(TRACE_SURFACE_BIAS_CELL)), float(RAY_EPS));
+                const traceBias = tslMax(
+                    U.cellMin.mul(float(TRACE_SURFACE_BIAS_CELL)).mul(U.debugTraceBiasScale),
+                    float(RAY_EPS).mul(U.debugRayEpsScale)
+                );
                 const hitPos = hitPoint.add(ng.mul(traceBias)).toVar();
 
                 // Recover hit UV via Möller–Trumbore barycentrics (traverseClosest
@@ -779,14 +819,14 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                     const eTex = srgbToLinear(sampleLayer(emissiveTex, uv, eL));
                     emissive.assign(select(eL.greaterThan(float(-0.5)), emissive.mul(eTex), emissive));
                 }
-                const radiance = emissive.toVar();
+                const radiance = emissive.mul(U.debugEmissiveScale).toVar();
 
                 // energy-weighted diffuse albedo: metals (slot 4) and glass (slot 5)
                 // don't bounce Lambert diffuse. Cap ≤0.95 so the temporal multibounce
                 // series E = direct/(1−kd) is provably convergent (no runaway).
                 const metal = matFloat(matId, 4);
                 const transm = matFloat(matId, 5);
-                const kd = clamp(baseColor.mul(float(1.0).sub(metal)).mul(float(1.0).sub(transm)), vec3(0.0), vec3(0.95)).toVar();
+                const kd = clamp(baseColor.mul(U.debugAlbedoScale).mul(float(1.0).sub(metal)).mul(float(1.0).sub(transm)), vec3(0.0), vec3(0.95)).toVar();
 
                 // NEE over ALL lights (count small; loop avoids sampling noise).
                 Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
@@ -819,7 +859,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                             const spotAtten = clamp(angleCos.sub(lcosAngle).div(tslMax(lcosPen.sub(lcosAngle), float(1e-4))), float(0.0), float(1.0));
                             const atten = distAtten.mul(select(isSpot, spotAtten, float(1.0)));
                             const diffuse = kd.mul(float(1.0).div(float(PI)));
-                            radiance.addAssign(diffuse.mul(ndl).mul(lcol).mul(atten));
+                            radiance.addAssign(diffuse.mul(ndl).mul(lcol).mul(atten).mul(U.debugDirectScale));
                         });
                     });
                 });
@@ -833,7 +873,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const bl = dot(bounce, vec3(0.2126, 0.7152, 0.0722));
                 // 1e-6 floor: clamp=0 with a black bounce is otherwise 0/0 = NaN → poisons history.
                 const roll = U.radianceClamp.div(tslMax(tslMax(U.radianceClamp, bl), float(1e-6)));
-                radiance.addAssign(bounce.mul(roll));
+                radiance.addAssign(bounce.mul(roll).mul(U.debugBounceScale));
                 outRgb.assign(radiance);
             });
             // miss → outRgb stays BLACK (CRITICAL: never sample sky here — IBL
@@ -876,7 +916,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const rrgb = vec3(rayData.element(rb), rayData.element(rb.add(uint(1))), rayData.element(rb.add(uint(2))));
                 const hitT = rayData.element(rb.add(uint(3)));
                 const rdir = normalize(rayDir(k, U.frameJitter));
-                const cw = tslMax(dot(dir, rdir), float(0.0));
+                const cw = pow(tslMax(dot(dir, rdir), float(0.0)), U.debugCosinePower.max(float(1e-4)));
                 acc.addAssign(rrgb.mul(cw));
                 wsum.addAssign(cw);
                 const rl = dot(rrgb, LUMA);
@@ -908,15 +948,15 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const prevVar = tslMax(prevM2.sub(prevL.mul(prevL)), float(0.0));
             const curVar = tslMax(curM2.sub(curL.mul(curL)), float(0.0));
             const lumRef = tslMax(tslMax(curL, prevL), float(0.0));
-            const varFloor = float(GI_TEMPORAL_VAR_EPS).add(lumRef.mul(lumRef).mul(float(GI_TEMPORAL_VAR_REL)));
+            const varFloor = U.debugTempVarEps.add(lumRef.mul(lumRef).mul(U.debugTempVarRel));
             const sigma = sqrt(prevVar.add(curVar).add(varFloor));
             const deltaL = curL.sub(prevL);
             const absDelta = tslAbs(deltaL);
-            const s0 = sigma.mul(float(GI_TEMPORAL_CHANGE_SIGMA0));
-            const s1 = sigma.mul(U.tempChangeSigma1.max(float(GI_TEMPORAL_CHANGE_SIGMA0 + 0.01)));
+            const s0 = sigma.mul(U.debugTempChangeSigma0);
+            const s1 = sigma.mul(U.tempChangeSigma1.max(U.debugTempChangeSigma0.add(0.01)));
             const changeW = clamp(absDelta.sub(s0).div(s1.sub(s0).max(float(1e-6))), float(0.0), float(1.0));
-            const noiseH = U.hysteresis.add(float(1.0).sub(U.hysteresis).mul(float(GI_TEMPORAL_NOISE_H_BOOST)));
-            const changeH = tslMax(U.hysteresis.sub(U.tempChangeHDrop), float(GI_TEMPORAL_MIN_CHANGE_H));
+            const noiseH = U.hysteresis.add(float(1.0).sub(U.hysteresis).mul(U.debugTempNoiseHBoost));
+            const changeH = tslMax(U.hysteresis.sub(U.tempChangeHDrop), U.debugTempMinChangeH);
             const hEff = mix(noiseH, changeH, changeW);
             const h = select(wasBlack, float(0.0), hEff);
             const band = sigma.mul(U.tempClampSigma);
@@ -938,7 +978,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const db = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(2)).toVar();
             const dprev = vec2(depthS.element(db), depthS.element(db.add(uint(1))));
             const dWasZero = dprev.x.lessThan(float(1e-6));
-            const dh = select(dWasZero, float(0.0), U.hysteresis);
+            const dh = select(dWasZero, float(0.0), U.hysteresis.mul(U.debugDepthHistoryScale).clamp(0.0, 0.999));
             const dblended = mix(vec2(meanR, meanR2), dprev, dh);
             depthS.element(db).assign(dblended.x);
             depthS.element(db.add(uint(1))).assign(dblended.y);
@@ -996,8 +1036,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             // neighbours are trusted → stronger blur that kills GI splotch. 0 = baseline
             // bandwidth (original directional detail), 1 = ~7× wider (very smooth).
             const smW = float(1.0).add(U.filterSmooth.mul(float(6.0)));
-            const kEff = float(GI_FILTER_K).mul(smW);
-            const relEff = float(GI_FILTER_REL).mul(smW);
+            const kEff = float(GI_FILTER_K).mul(smW).mul(U.debugFilterKScale);
+            const relEff = float(GI_FILTER_REL).mul(smW).mul(U.debugFilterRelScale);
             for (let jy = -1; jy <= 1; jy++) {
                 for (let jx = -1; jx <= 1; jx++) {
                     const gw = Math.exp(-(jx * jx + jy * jy) * 0.5); // separable 3×3 gaussian (JS const)
@@ -1008,7 +1048,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                     const dLum = dot(en, LUMA).sub(lumaC);
                     // variance-adaptive edge stop: noisy texel (high var) → wide trust →
                     // blur; converged texel (var→0) → narrow → preserve directional detail.
-                    const es = exp(dLum.mul(dLum).div(varC.mul(kEff).add(tslMax(float(GI_FILTER_EPS), lumaC.mul(lumaC).mul(relEff))).max(float(1e-8))).mul(-1.0));
+                    const es = exp(dLum.mul(dLum).div(varC.mul(kEff).add(tslMax(float(GI_FILTER_EPS).mul(U.debugFilterEpsScale), lumaC.mul(lumaC).mul(relEff))).max(float(1e-8))).mul(-1.0));
                     const w = float(gw).mul(es);
                     facc.addAssign(en.mul(w));
                     fwsum.addAssign(w);
@@ -1236,7 +1276,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const minCell = C.minCell;
         const atlasW = C.atlasW, atlasH = C.atlasH, probeTotal = C.probeTotal;
         const normalBias = minCell * SURFACE_NORMAL_BIAS_CELL * normalBiasScale;
-        const chebyBias = minCell * GI_CHEBY_BIAS_CELL;
+        const chebyBias = minCell * GI_CHEBY_BIAS_CELL * chebyBiasScale;
 
         // Per-cascade same-dim reuse: reuse this cascade's live atlases + buffers if its
         // dims are unchanged → NO recompile for this cascade, NO black flash.
@@ -1418,6 +1458,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const idleMs = Number.isFinite(opts.idleMs) ? opts.idleMs : Infinity;
         const playing = opts.playing === true;
         const moving = idleMs < GI_IDLE_MS || playing;
+        lastIdleMs = idleMs;
+        lastMoving = moving;
         // Default: fully idle-gated (moving → return). Continuous mode: keep the bounded GPU
         // SOLVE running while moving, but STILL hold every synchronous/compiling step — the
         // ~200ms MeshBVH rebuild, the staggered cascade build, and the per-tick scene-signature
@@ -1425,6 +1467,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         // is the same GPU cost that already runs smooth at rest, so it's safe every frame.
         if (moving && !continuous) return;
         const restOnly = !moving;   // gates the heavy paths; the solve runs in both modes
+        lastRestOnly = restOnly;
 
         // (A7) Back off after a failed/empty rebuild instead of re-entering the
         // synchronous build every tick.
@@ -1523,6 +1566,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         if (!haveC1) solveList = [0];
         else if (fullPassPerTick) solveList = [0, 1];
         else { solveList = [solveTurn % 2]; solveTurn = (solveTurn + 1) >>> 0; }
+        lastSolveList = solveList.join(',');
+        lastUpdatedCount = tickCap();
 
         inFlight = true;
         try {
@@ -1546,7 +1591,12 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 // tick (round-robin) passes keep the ROT_MIN_TICKS spacing as before.
                 C.ticksSinceRot++;
                 if (ci === 0 && C.probeCursor === 0 && (fullPassPerTick || C.ticksSinceRot >= ROT_MIN_TICKS)) {
-                    if (C.refreshStarted) { frameCounter = (frameCounter + 1) >>> 0; U.frameJitter.value = (frameCounter * 0.61803398875) % 1; }
+                    if (C.refreshStarted && !debugFreezeRayJitter) {
+                        frameCounter = (frameCounter + 1) >>> 0;
+                        U.frameJitter.value = debugFrameJitterOverride ?? ((frameCounter * 0.61803398875) % 1);
+                    } else if (debugFrameJitterOverride !== null) {
+                        U.frameJitter.value = debugFrameJitterOverride;
+                    }
                     C.refreshStarted = true;
                     C.ticksSinceRot = 0;
                 }
@@ -1668,6 +1718,119 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         reactiveTicks = REACTIVE_TICKS;
     }
 
+    function forceLightingRefresh() {
+        node._structGen++;
+        touchGiUniforms();
+    }
+
+    function setDebugKnobs(opts = {}) {
+        const num = (key, fallback = null) => Number.isFinite(opts[key]) ? Number(opts[key]) : fallback;
+        const clampNum = (key, min, max, target) => {
+            const v = num(key);
+            if (v === null) return;
+            target.value = THREE.MathUtils.clamp(v, min, max);
+        };
+
+        let touchedReceiver = false;
+        const samplePositionScale = num('samplePositionScale');
+        if (samplePositionScale !== null) {
+            node.samplePositionScaleNode.value = THREE.MathUtils.clamp(samplePositionScale, 0.001, 1000);
+            touchedReceiver = true;
+        }
+        const sampleNormalMix = num('sampleNormalMix');
+        if (sampleNormalMix !== null) {
+            node.sampleNormalMixNode.value = THREE.MathUtils.clamp(sampleNormalMix, 0, 1);
+            touchedReceiver = true;
+        }
+        const sampleBiasScale = num('sampleBiasScale');
+        if (sampleBiasScale !== null) {
+            node.sampleBiasScaleNode.value = THREE.MathUtils.clamp(sampleBiasScale, -8, 8);
+            touchedReceiver = true;
+        }
+        const sampleObjectNormal = num('sampleObjectNormal');
+        if (sampleObjectNormal !== null) {
+            node.sampleObjectNormalNode.value = THREE.MathUtils.clamp(sampleObjectNormal, 0, 1);
+            touchedReceiver = true;
+        }
+        const borderBand = num('borderBand');
+        if (borderBand !== null) {
+            node.borderBandNode.value = THREE.MathUtils.clamp(borderBand, 0.001, 1);
+            touchedReceiver = true;
+        }
+        const chebyBias = num('chebyBiasScale');
+        if (chebyBias !== null) {
+            chebyBiasScale = THREE.MathUtils.clamp(chebyBias, 0, 16);
+            for (let c = 0; c < NUM_CASC; c++) {
+                node.chebyBiasNode[c].value = Math.max(0, casc[c].minCell * GI_CHEBY_BIAS_CELL * chebyBiasScale);
+            }
+            touchedReceiver = true;
+        }
+        if (touchedReceiver) touchGiUniforms();
+
+        clampNum('traceBiasScale', 0, 32, U.debugTraceBiasScale);
+        clampNum('rayEpsScale', 0, 32, U.debugRayEpsScale);
+        clampNum('directScale', 0, 16, U.debugDirectScale);
+        clampNum('emissiveScale', 0, 16, U.debugEmissiveScale);
+        clampNum('albedoScale', 0, 4, U.debugAlbedoScale);
+        clampNum('bounceScale', 0, 16, U.debugBounceScale);
+        clampNum('cosinePower', 0.01, 16, U.debugCosinePower);
+        clampNum('tempNoiseHBoost', 0, 1, U.debugTempNoiseHBoost);
+        clampNum('tempChangeSigma0', 0, 8, U.debugTempChangeSigma0);
+        clampNum('tempChangeSigma1', 0.01, 16, U.tempChangeSigma1);
+        clampNum('tempChangeHDrop', 0, 0.99, U.tempChangeHDrop);
+        clampNum('tempMinChangeH', 0, 0.99, U.debugTempMinChangeH);
+        clampNum('tempVarEps', 0, 0.1, U.debugTempVarEps);
+        clampNum('tempVarRel', 0, 1, U.debugTempVarRel);
+        clampNum('tempClampSigma', 0.01, 64, U.tempClampSigma);
+        clampNum('depthHistoryScale', 0, 4, U.debugDepthHistoryScale);
+        clampNum('filterKScale', 0, 16, U.debugFilterKScale);
+        clampNum('filterRelScale', 0, 16, U.debugFilterRelScale);
+        clampNum('filterEpsScale', 0, 16, U.debugFilterEpsScale);
+
+        if ('freezeRayJitter' in opts) debugFreezeRayJitter = opts.freezeRayJitter === true;
+        if ('frameJitter' in opts) {
+            const v = Number(opts.frameJitter);
+            if (Number.isFinite(v) && v >= 0) {
+                debugFrameJitterOverride = THREE.MathUtils.clamp(v, 0, 1);
+                U.frameJitter.value = debugFrameJitterOverride;
+            } else {
+                debugFrameJitterOverride = null;
+            }
+        }
+    }
+
+    function getDebugKnobs() {
+        return {
+            samplePositionScale: node.samplePositionScaleNode.value,
+            sampleNormalMix: node.sampleNormalMixNode.value,
+            sampleBiasScale: node.sampleBiasScaleNode.value,
+            sampleObjectNormal: node.sampleObjectNormalNode.value,
+            borderBand: node.borderBandNode.value,
+            chebyBiasScale,
+            traceBiasScale: U.debugTraceBiasScale.value,
+            rayEpsScale: U.debugRayEpsScale.value,
+            directScale: U.debugDirectScale.value,
+            emissiveScale: U.debugEmissiveScale.value,
+            albedoScale: U.debugAlbedoScale.value,
+            bounceScale: U.debugBounceScale.value,
+            cosinePower: U.debugCosinePower.value,
+            tempNoiseHBoost: U.debugTempNoiseHBoost.value,
+            tempChangeSigma0: U.debugTempChangeSigma0.value,
+            tempChangeSigma1: U.tempChangeSigma1.value,
+            tempChangeHDrop: U.tempChangeHDrop.value,
+            tempMinChangeH: U.debugTempMinChangeH.value,
+            tempVarEps: U.debugTempVarEps.value,
+            tempVarRel: U.debugTempVarRel.value,
+            tempClampSigma: U.tempClampSigma.value,
+            depthHistoryScale: U.debugDepthHistoryScale.value,
+            filterKScale: U.debugFilterKScale.value,
+            filterRelScale: U.debugFilterRelScale.value,
+            filterEpsScale: U.debugFilterEpsScale.value,
+            freezeRayJitter: debugFreezeRayJitter,
+            frameJitter: debugFrameJitterOverride ?? -1,
+        };
+    }
+
     function dispose() { disposed = true; disposeGPU(); cachedBuilt = null; buildDirty = true; node.setEnabled(false); }
 
     return {
@@ -1722,7 +1885,9 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         },
         setRadianceClamp: (v) => {
             if (!Number.isFinite(v)) return;
-            U.radianceClamp.value = Math.max(0, v);   // cap multibounce feedback (anti-runaway)
+            const next = Math.max(0, v);
+            if (U.radianceClamp.value === next) return;
+            U.radianceClamp.value = next;   // cap multibounce feedback (anti-runaway)
             // Trace-side knob: it only affects NEWLY traced rays, and at hysteresis 0.95
             // the converged field absorbs them so slowly it reads as "needs a rebuild".
             // Kick the reactive burst so the new clamp fades in over ~1-2 s instead.
@@ -1736,6 +1901,9 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         getChangeThreshold: () => U.tempChangeSigma1.value,
         getSnapAmount: () => U.tempChangeHDrop.value,
         getFireflyClamp: () => U.tempClampSigma.value,
+        setDebugKnobs,
+        getDebugKnobs,
+        forceLightingRefresh,
         // ── STRUCTURAL knob: cascade count (single grid vs cascaded). 1↔2 never changes
         // geometry, so requestRebuild(false) reuses the ~200ms BVH soup (invariant #3); the
         // change flows through the idle gate + staggered build. 1 → wFine≡0 (byte-identical).
@@ -1766,6 +1934,41 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         _debugDepthAtlas: (ci = 0) => casc[ci]?.gpu?.depthAtlas || null,
         _debugStateAtlas: (ci = 0) => casc[ci]?.gpu?.stateAtlas || null,
         _debugStateBuffer: (ci = 0) => casc[ci]?.gpu?.stateBuffer || null,
+        _debugState: () => ({
+            idleMs: lastIdleMs,
+            moving: lastMoving,
+            restOnly: lastRestOnly,
+            continuous,
+            dirty,
+            buildDirty,
+            buildStage,
+            buildCascadeCount,
+            rebuildBackoff,
+            inFlight,
+            reactiveTicks,
+            baseHysteresis,
+            hysteresis: U.hysteresis.value,
+            frameJitter: U.frameJitter.value,
+            frameCounter,
+            tickBudgetRays,
+            tickDtEma,
+            budgetCooldown,
+            checkCounter,
+            geoStable,
+            solveList: lastSolveList,
+            updatedCount: lastUpdatedCount,
+            cascades: cascades,
+            cascadeState: casc.map((C) => ({
+                probes: C.probeTotal,
+                cursor: C.probeCursor,
+                needsClear: C.needsClear,
+                needsClassify: C.needsClassify,
+                refreshStarted: C.refreshStarted,
+                ticksSinceRot: C.ticksSinceRot,
+                hasGpu: !!C.gpu,
+                minCell: C.minCell,
+            })),
+        }),
         _debugRead: async (which, ci = 0) => {
             const g = casc[ci]?.gpu;
             const buf = which === 'irr' ? g?.irrBuffer
