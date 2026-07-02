@@ -80,7 +80,6 @@ import GUI from 'three/addons/libs/lil-gui.module.min.js';
 import { positionWorld, normalWorld, pass, renderOutput } from 'three/tsl';
 import { FilmPipeline, FILM_PRESETS, FILM_PRESET_KEYS, applyFilmPreset, filmPass } from 'powershot-threejs';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
-import { createBenchmark } from './js/bench.js';
 import { loadGiSettings, saveGiSettings, applyGiSettings, addGiPanel } from './js/gi_settings.js';
 
 const statusEl = document.getElementById('status');
@@ -126,8 +125,8 @@ sun.shadow.normalBias = 0.05;
 scene.add(sun);
 scene.add(sun.target);
 
-// soft sky/ground fill so shadowed areas aren't pure black before GI converges
-const hemi = new THREE.HemisphereLight(0x9fc6ff, 0x4a4036, 0.25);
+// Tiny pre-convergence safety fill; SPEEDBALL probes carry the real sky ambient.
+const hemi = new THREE.HemisphereLight(0x9fc6ff, 0x4a4036, 0.05);
 scene.add(hemi);
 
 renderer.shadowMap.enabled = true;
@@ -173,6 +172,28 @@ window.dumpCamera = () => ({
 });
 
 const sunVec = new THREE.Vector3();
+let gi = null;
+const _giSkyZenith = new THREE.Color();
+const _giSkyHorizon = new THREE.Color();
+const _giSkyGround = new THREE.Color();
+
+function updateGiSky() {
+  if (!gi?.setSky) return;
+  // Compute-safe sky injection: approximate the sun-free SkyMesh dome as low-frequency
+  // SH-9 on the CPU, then the probe kernel reads only 9 vec3 uniforms. No texture
+  // sampling, no derivatives, no probe memory. The directional sun remains direct-only.
+  const elev = THREE.MathUtils.clamp(params.elevation, 0, 88);
+  const sunUp = THREE.MathUtils.clamp(Math.sin(THREE.MathUtils.degToRad(elev)), 0, 1);
+  const daylight = Math.sqrt(sunUp);
+  const ray = THREE.MathUtils.clamp(params.rayleigh / 8, 0, 1);
+  const turb = THREE.MathUtils.clamp(params.turbidity / 20, 0, 1);
+  const haze = THREE.MathUtils.clamp((1 - daylight) * 0.65 + turb * 0.35, 0, 1);
+  _giSkyZenith.setRGB(0.10 + 0.12 * ray, 0.20 + 0.20 * ray, 0.42 + 0.34 * ray).multiplyScalar(0.18 + 0.62 * daylight);
+  _giSkyHorizon.setRGB(0.34 + 0.34 * haze, 0.39 + 0.18 * daylight, 0.48 + 0.24 * daylight).multiplyScalar(0.16 + 0.50 * daylight);
+  _giSkyGround.setRGB(0.10, 0.085, 0.065).multiplyScalar(0.06 + 0.16 * daylight);
+  gi.setSky({ zenith: _giSkyZenith, horizon: _giSkyHorizon, ground: _giSkyGround });
+}
+
 function updateSun() {
   const phi = THREE.MathUtils.degToRad(90 - params.elevation);  // 0 = zenith
   const theta = THREE.MathUtils.degToRad(params.azimuth);
@@ -187,6 +208,7 @@ function updateSun() {
   // warm the sun as it nears the horizon
   const warm = THREE.MathUtils.clamp(params.elevation / 18, 0, 1);
   sun.color.setRGB(1.0, 0.6 + 0.4 * warm, 0.35 + 0.65 * warm);
+  updateGiSky();
   markInteraction();
 }
 
@@ -237,7 +259,7 @@ function prepareSponzaMaterialForGi(material) {
 // it after the render loop has started leaves a cached non-GI lights node, and GI
 // never folds in (even a later recompile can't swap it). The probe field auto-fits
 // and builds once Sponza is in the scene (idle-gated); requestRebuild() nudges it.
-const gi = installSpeedballGI({
+gi = installSpeedballGI({
   renderer, scene, camera,
   enabled: params.giEnabled,
   intensity: params.giIntensity,
@@ -250,6 +272,7 @@ if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', 
 gi.setSmoothness(1);                       // pinned (no slider)
 gi.setFilterStrength(1);   // denoise pinned on (no slider): redundant at these defaults, but harmless
 applyGiSettings(gi, params);
+updateGiSky();
 // The GI panel is SHARED (js/gi_settings.js) — identical controls on every demo page;
 // trimming a slider there trims it everywhere. smoothness/denoise stay unexposed.
 addGiPanel(gui, gi, params, { onInteract: markInteraction, onStructure: () => updateProbeHelpers() });
@@ -332,19 +355,6 @@ filmCtrls.push(fGate.add(params, 'filmFlicker', 0, 1, 0.01).name('flicker').onCh
 fGate.add(params, 'filmPrintExposure', -1, 1, 0.01).name('print exposure').onChange((v) => { P.printExposure.value = v; });
 fGate.add(params, 'filmPrintWarmth', -1, 1, 0.01).name('print warmth').onChange((v) => { P.printWarmth.value = v; });
 
-// ── BVH-hitch benchmark: churn an object in/out to force repeated full-soup rebuilds. ──
-// Watch the yellow HUD line for `rebuild-hitch` (worst frame right after each load/unload)
-// and `max` (worst frame in the window). Run only when the GPU is otherwise free.
-const bench = createBenchmark({ scene, gi });
-window.bench = bench;
-const benchParams = { churn: false, intervalMs: 1200, triangles: 40000 };
-const fB = gui.addFolder('Benchmark (BVH hitch)');
-fB.add(benchParams, 'churn').name('churn object').onChange((v) => { v ? bench.start(benchParams) : bench.stop(); });
-fB.add(benchParams, 'intervalMs', 200, 4000, 50).name('interval (ms)').onChange((v) => bench.setInterval(v));
-fB.add(benchParams, 'triangles', 500, 2000000, 500).name('object triangles').onChange((v) => bench.setTriangles(v));
-fB.add({ reset: () => bench.reset() }, 'reset').name('reset stats');
-fB.close();
-
 // ── Load Sponza ────────────────────────────────────────────────────────────────
 setStatus('loading Sponza…');
 new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
@@ -391,7 +401,7 @@ function makeProbeHelperMaterial(lit) {
   const n = gi.node;
   const P = positionWorld.add(normalWorld.mul(n.normalBiasNode[0]));
   const mat = new THREE.MeshBasicNodeMaterial({ depthWrite: false, transparent: true, opacity: 0.95 });
-  mat.colorNode = n.sampleIrradiance(P, normalWorld).max(0.0);
+  mat.colorNode = n.sampleIrradiance(P, normalWorld, normalWorld).max(0.0);
   return mat;
 }
 function updateProbeHelpers() {
@@ -432,7 +442,6 @@ function updateProbeHelpers() {
 }
 
 renderer.setAnimationLoop((nowMs) => {
-  bench.frame(nowMs);   // record this frame's time FIRST (captures the rebuild hitch below)
   controls.update();
   // SPEEDBALL GI self-gates on idle: the BVH build + GPU solve are held while orbiting
   // or dragging a slider (world-space GI is lossless held static), then converge

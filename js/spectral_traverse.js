@@ -86,9 +86,9 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
     );
     // Sample a map-array layer at the transformed UV.
     const sampleLayer = (tex, uv, layerF) =>
-        texture(tex, uv).depth(int(max(layerF, float(0)))).xyz;
+        texture(tex, uv).depth(int(max(layerF, float(0)))).level(0).xyz;
     const sampleLayerRGBA = (tex, uv, layerF) =>
-        texture(tex, uv).depth(int(max(layerF, float(0))));
+        texture(tex, uv).depth(int(max(layerF, float(0)))).level(0);
 
     const materialSideAccepts = (matId, det) => {
         const side = matFloat(matId, 22);

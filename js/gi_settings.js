@@ -11,7 +11,7 @@ export const GI_DEFAULTS = {
     giEnabled: true, giIntensity: 10, giDivisions: 16, giRays: 64,
     giCascades: 1, giContinuous: true, showProbes: false,
     giHysteresis: 0.9, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 40,
-    giLeak: 0.5, giSolid: 0,
+    giLeak: 0.5, giSolid: 0, giSky: 1, giNormalDetail: 1,
     giChangeThreshold: 2.5, giSnapAmount: 0.30, giFireflyClamp: 6.0,
 };
 
@@ -54,6 +54,7 @@ export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure
     const fGI = gui.addFolder('SPEEDBALL GI');
     fGI.add(params, 'giEnabled').name('enabled').onChange((v) => { gi.setEnabled(v); onInteract(); });
     fGI.add(params, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => { gi.setIntensity(v); onInteract(); }); // uncapped
+    fGI.add(params, 'giHysteresis', 0.5, 0.99, 0.01).name('hysteresis').onChange((v) => { gi.setHysteresis(v); onInteract(); });
     // STRUCTURAL knobs (idle-gated rebuild — never a per-tick recompile).
     fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi.setDivisions(v); onStructure(); onInteract(); });
     fGI.add(params, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi.setRays(v); onInteract(); });
@@ -62,11 +63,16 @@ export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure
     fGI.add(params, 'showProbes').name('show probes').onChange(() => onStructure());
     // Quality — UNIFORM-backed, apply instantly (no recompile/rebuild).
     const fQ = fGI.addFolder('Quality');
-    fQ.add(params, 'giHysteresis', 0.5, 0.99, 0.01).name('hysteresis').onChange((v) => { gi.setHysteresis(v); onInteract(); });
     fQ.add(params, 'giNormalBias', 0, 4, 0.05).name('normal bias').onChange((v) => { gi.setNormalBias(v); onInteract(); });
     fQ.add(params, 'giRadianceClamp', 0, 32, 0.5).name('radiance clamp').onChange((v) => { gi.setRadianceClamp(v); onInteract(); });
     fQ.add(params, 'giDepthSharpness', 1, 200, 1).name('depth sharpness').onChange((v) => { gi.setDepthSharpness(v); onInteract(); });
     fQ.add(params, 'giLeak', 0, 1, 0.05).name('chebyshev strength').onChange((v) => { gi.setChebyStrength(v); onInteract(); });
+    if (typeof gi.setSkyIntensity === 'function') {
+        fQ.add(params, 'giSky', 0, 2, 0.05).name('sky light').onChange((v) => { gi.setSkyIntensity(v); onInteract(); });
+    }
+    if (typeof gi.setNormalDetail === 'function') {
+        fQ.add(params, 'giNormalDetail', 0, 1, 0.05).name('normal detail').onChange((v) => { gi.setNormalDetail(v); onInteract(); });
+    }
     // solid-scene (classify) stays hidden + pinned to 0 — a backface test misreads thin
     // two-sided geometry (Sponza curtains), so it's opt-in for enclosed solids only.
     // Adaptive temporal blend is pinned below. Hysteresis remains the one public
@@ -88,6 +94,8 @@ export function applyGiSettings(gi, s) {
     gi.setDepthSharpness(s.giDepthSharpness);
     gi.setChebyStrength(s.giLeak);
     gi.setClassifyStrength(s.giSolid);
+    gi.setSkyIntensity?.(s.giSky);
+    gi.setNormalDetail?.(s.giNormalDetail);
     gi.setChangeThreshold(s.giChangeThreshold);
     gi.setSnapAmount(s.giSnapAmount);
     gi.setFireflyClamp(s.giFireflyClamp);

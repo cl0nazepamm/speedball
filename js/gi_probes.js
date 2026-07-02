@@ -6,10 +6,11 @@
 // compute; nothing reads back to the CPU.
 //
 // MVP (Phase 1): single grid, trace + cosine-gather blend + temporal hysteresis,
-// infinite bounce over frames (trace reads last frame's atlas), miss = BLACK
-// (the load-bearing energy invariant — probes carry ONLY surface inter-reflection;
-// PMREM IBL owns the sky). Leak-free Chebyshev + relocation/classification and
-// SSILVB are Phase 2/3.
+// infinite bounce over frames (trace reads last frame's atlas), miss = SKY
+// (radiance from an INJECTED SH-9 via setSky(), × skyIntensity; zero SH = black —
+// then probes carry ONLY surface inter-reflection and PMREM IBL owns the sky;
+// see "sky → probes" in createProbeField). Leak-free Chebyshev +
+// relocation/classification and SSILVB are Phase 2/3.
 //
 // Churn-free by construction (fixes the surfel-grid recompile freeze):
 //   • irradiance STATE lives in a read_write StorageBufferAttribute (irrBuffer).
@@ -167,15 +168,22 @@ export class GiProbeNode extends LightingNode {
         // Per-cascade biases: coarse cells are larger → its own normal/cheby bias.
         this.normalBiasNode = [uniform(0.04), uniform(0.04)];
         this.chebyBiasNode = [uniform(0.0), uniform(0.0)];
-        // Debug receiver sampling. city_debug.html can push these around without
+        // Debug receiver sampling. debug/city_debug.html can push these around without
         // saving user settings or rebuilding the scene.
         this.samplePositionScaleNode = uniform(1.0);
         this.sampleNormalMixNode = uniform(1.0); // 0 = geometry normal, 1 = shading normal
         this.sampleBiasScaleNode = uniform(1.0);
-        // Receiver GI must be camera-invariant. Three's normalWorld/normalWorldGeometry
-        // reconstruct through cameraViewMatrix, which can wobble on rotation and make the
-        // sample bias look like GI/wall z-fighting. Default to modelNormalMatrix instead.
+        // Receiver sampling GEOMETRY (bias point + visibility weights) must be
+        // camera-invariant. Three's normalWorld/normalWorldGeometry reconstruct through
+        // cameraViewMatrix, which wobbles on rotation and makes the sample bias flicker
+        // like GI/wall z-fighting. Applies ONLY to the bias/weight normal — the
+        // irradiance FETCH direction always uses the detailed shading normal (see setup).
         this.sampleObjectNormalNode = uniform(1.0); // 1 = object normal matrix, bypass camera-view normal reconstruction
+        // How much normal-map detail the GI fetch direction carries on TRUSTED
+        // (tangent-TBN) materials: 0 = smooth vertex normal, 1 = full shading normal.
+        // Flicker-safe at ANY value — both mix inputs are camera-invariant there, and
+        // untrusted materials ignore this entirely (always the stable normal).
+        this.detailStrengthNode = uniform(1.0);
 
         // Cascade-invariant look uniforms (single instance).
         this.intensityNode = uniform(1.0);
@@ -203,6 +211,7 @@ export class GiProbeNode extends LightingNode {
             ...this.gridMinNode, ...this.gridSizeNode, ...this.resNode, ...this.atlasDimNode,
             ...this.normalBiasNode, ...this.chebyBiasNode,
             this.samplePositionScaleNode, this.sampleNormalMixNode, this.sampleBiasScaleNode, this.sampleObjectNormalNode,
+            this.detailStrengthNode,
             this.intensityNode, this.enabledNode, this.cascadeCountNode, this.borderBandNode,
             this.chebyStrengthNode, this.classifyStrengthNode,
         ]) u.setGroup(GI_UNIFORM_GROUP);
@@ -237,6 +246,7 @@ export class GiProbeNode extends LightingNode {
         touchGiUniforms();
     }
     setChebyStrength(v) { if (Number.isFinite(v)) { this.chebyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); touchGiUniforms(); } }
+    setDetailStrength(v) { if (Number.isFinite(v)) { this.detailStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); touchGiUniforms(); } }
     setClassifyStrength(v) { if (Number.isFinite(v)) { this.classifyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); touchGiUniforms(); } }
     // Active-cascade count (fragment-visible): 1 → wFine≡0 (byte-identical), 2 → blend.
     setCascadeCount(n) {
@@ -282,12 +292,16 @@ export class GiProbeNode extends LightingNode {
         return vec2(ox.div(this.atlasDimNode[c].x), oy.div(this.atlasDimNode[c].y));
     }
 
-    // sample the probe field at world (P, N): trilinear over the 8 cage probes,
-    // each fetched octahedrally in the shading-normal direction and weighted by
-    // a depth-moment Chebyshev visibility test (leak-free through thin walls).
+    // sample the probe field at world (P, Nvis, Ndir): trilinear over the 8 cage
+    // probes, each fetched octahedrally in the Ndir direction and weighted by a
+    // depth-moment Chebyshev visibility test (leak-free through thin walls).
+    // Nvis (camera-invariant) drives the weights — the Chebyshev select is a hard
+    // boundary, so any camera-dependent wobble there flickers like z-fighting.
+    // Ndir (detailed shading normal) drives ONLY the fetch direction — irradiance
+    // is cosine-convolved + bilinear over the oct tile, so wobble there stays smooth.
     // Sample ONE cascade c (0=coarse, 1=fine) — the original 8-tap trilinear gather,
     // parameterized per cascade. PURE-EXPRESSION (no toVar/addAssign): fragment colorNode.
-    _sampleCascade(P, N, c) {
+    _sampleCascade(P, Nvis, Ndir, c) {
         const atlas = this._atlas[c];
         const depthAtlas = this._depthAtlas[c];
         const res = this.resNode[c];
@@ -296,8 +310,8 @@ export class GiProbeNode extends LightingNode {
         const gridF = P.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
         const baseF = gridF.floor().clamp(vec3(0.0), res.sub(2.0).max(vec3(0.0)));
         const frac = gridF.sub(baseF).clamp(0.0, 1.0);
-        const Nn = N.normalize();
-        const octN = octEncodeNode(Nn, TSL); // irradiance dir = shading normal
+        const Nn = Nvis.normalize();
+        const octN = octEncodeNode(Ndir.normalize(), TSL); // irradiance dir = detailed shading normal
 
         // PURE-EXPRESSION accumulation (NO toVar/addAssign): this runs inside a
         // fragment material colorNode (not an Fn-wrapped compute kernel), where
@@ -372,8 +386,8 @@ export class GiProbeNode extends LightingNode {
     // includes every cascade-count change). So the E1 (fine) 8-tap subtree is emitted ONLY
     // when the fine cascade is actually bound at setup() time — otherwise the shader is the
     // exact original 8-tap single grid (byte-identical) and never touches _atlas[1]=null.
-    sampleIrradiance(P, N) {
-        const E0 = this._sampleCascade(P, N, 0); // coarse: valid over full bounds, ALWAYS
+    sampleIrradiance(P, Nvis, Ndir) {
+        const E0 = this._sampleCascade(P, Nvis, Ndir, 0); // coarse: valid over full bounds, ALWAYS
         const useFine = Math.round(this.cascadeCountNode.value) >= 2 && !!this._atlas[1] && !!this._depthAtlas[1] && !!this._stateAtlas[1];
         if (!useFine) return E0;                 // single-grid fallback — byte-identical to today
         // Fine inside-test in normalized C1 coords.
@@ -385,17 +399,44 @@ export class GiProbeNode extends LightingNode {
         const wIn = clamp(edge.div(inBand.max(float(1e-4))), float(0.0), float(1.0)); // 1 deep inside, ramps to 0 at the border, 0 outside
         const gate = this.cascadeCountNode.sub(1.0).clamp(float(0.0), float(1.0)); // 0 when cascades==1, 1 when 2 (live extra guard)
         const wFine = wIn.mul(gate);
-        const E1 = this._sampleCascade(P, N, 1);
+        const E1 = this._sampleCascade(P, Nvis, Ndir, 1);
         return mix(E0, E1, wFine);
     }
 
     setup(builder) {
         if (!this._ready) return;
-        const viewDerivedNormal = normalize(mix(normalWorldGeometry, normalWorld, this.sampleNormalMixNode));
+        // The receiver normal has TWO jobs with opposite needs, so it is SPLIT:
+        // - Nvis (bias point + Chebyshev/wrap weights): must be camera-INVARIANT.
+        //   The visibility test is a hard boundary; a camera-dependent normal moves P
+        //   across it every frame and flickers like z-fighting. modelNormalMatrix
+        //   never touches the camera, so the weights are rock-stable.
+        // - Ndir (fetch direction): wants the detailed shading normal — but ONLY when
+        //   that normal is itself camera-invariant. Tangent-attribute normal maps are
+        //   (the view round-trip cancels). Screen-derivative normals are NOT: custom
+        //   normalNode bumps (e.g. the city generator's surface-gradient relief) and
+        //   flat shading come from dFdx/dFdy, which are garbage on 2×2 quads that
+        //   straddle triangle edges — on dense facades the affected pixel set changes
+        //   with every subpixel camera rotation, so the fetch direction random-walks
+        //   and flickers no matter how smooth the irradiance atlas is. The gate is
+        //   BINARY and STATIC per material build (a normal source either is invariant
+        //   or it isn't — a partial blend only dims the flicker): no uniforms, no
+        //   sliders, no per-frame cost. See docs/gi_receiver_normal_flicker.md.
         const objectDerivedNormal = normalize(modelNormalMatrix.mul(normalLocal).toVarying('v_speedballObjectNormal'));
-        const N = normalize(mix(viewDerivedNormal, objectDerivedNormal, this.sampleObjectNormalNode));
-        const P = positionWorld.mul(this.samplePositionScaleNode).add(N.mul(this.normalBiasNode[0]).mul(this.sampleBiasScaleNode));
-        const E = this.sampleIrradiance(P, N).max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
+        const viewDerivedNormal = normalize(mix(normalWorldGeometry, normalWorld, this.sampleNormalMixNode));
+        const stableNormal = normalize(mix(viewDerivedNormal, objectDerivedNormal, this.sampleObjectNormalNode));
+        // KNOWN EDGE: the gate reads builder.geometry, so if one material instance is
+        // shared between a mesh WITH tangents and one WITHOUT, whichever geometry builds
+        // the shader decides the path for that pairing. Fails SAFE (worst case = less GI
+        // detail, never flicker); avoid sharing materials across mixed-tangent geometry.
+        const material = builder.material;
+        const stableTBN = builder.geometry?.hasAttribute?.('tangent') === true
+            && !!material?.normalMap && !material.normalNode && material.flatShading !== true;
+        // detailStrength softens how hard the normal map steers the GI fetch (taste
+        // knob, NOT a flicker tradeoff: on trusted materials both mix inputs are
+        // camera-invariant, so every blend value is equally stable).
+        const detailNormal = stableTBN ? normalize(mix(stableNormal, viewDerivedNormal, this.detailStrengthNode)) : stableNormal;
+        const P = positionWorld.mul(this.samplePositionScaleNode).add(stableNormal.mul(this.normalBiasNode[0]).mul(this.sampleBiasScaleNode));
+        const E = this.sampleIrradiance(P, stableNormal, detailNormal).max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
         builder.context.irradiance.addAssign(E);
     }
 }
@@ -534,6 +575,9 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         tempChangeSigma1: uniform(GI_TEMPORAL_CHANGE_SIGMA1), // delta (in σ) above which a change counts as REAL → snaps. lower = snappier
         tempChangeHDrop: uniform(GI_TEMPORAL_CHANGE_H_DROP),  // how much hysteresis drops on a real change. higher = harder snap
         tempClampSigma: uniform(GI_TEMPORAL_CLAMP_SIGMA),     // firefly clamp band (in σ). lower = tighter/steadier, more lag
+        // ── sky → probes (see the "sky → probes" block below + traceKernel miss branch) ──
+        skyIntensity: uniform(1.0),   // scales the injected SH sky (0 = off)
+        skySH: Array.from({ length: 9 }, () => uniform(new THREE.Vector3())), // radiance SH-9; all-zero = miss stays BLACK (the old invariant)
         debugTraceBiasScale: uniform(1.0),
         debugRayEpsScale: uniform(1.0),
         debugDirectScale: uniform(1.0),
@@ -554,6 +598,67 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     // Fold the shared uniforms into every cascade's U by REFERENCE so buildKernels closes
     // over C.U and reads both shared + per-cascade uniforms uniformly.
     for (const C of casc) Object.assign(C.U, U);
+
+    // ── sky → probes ──────────────────────────────────────────────────────────
+    // Miss rays return sky RADIANCE evaluated from an injected SH-9 (9 vec3
+    // uniforms = 27 floats). So probes carry occlusion-aware sky light and BOUNCE
+    // it (street canyons darken, courtyards glow — flat IBL can't do either).
+    // ZERO textures, zero probe memory, and pure ALU in the kernel — the WGSL
+    // builder forbids sampled textures with implicit/gradient LOD in compute, so
+    // SH is also the only representation that can't break there. Diffuse GI only
+    // needs a low-frequency sky; SH-9 IS that signal.
+    //
+    // Injection API (general-purpose — the library never guesses at the scene):
+    //   setSky(null)                          → off (miss = BLACK, the old invariant)
+    //   setSky(color | 0xrrggbb)              → uniform dome radiance
+    //   setSky({ zenith, horizon, ground })   → vertical gradient dome
+    //   setSky(LightProbe | SphericalHarmonics3) → full SH sky (radiance SH)
+    // The sun must stay NEE-only: inject a sun-free sky or the sun double-counts.
+    function _skyToSH(input) {
+        const out = Array.from({ length: 9 }, () => new THREE.Vector3());
+        if (!input) return out;
+        const src = input.isLightProbe ? input.sh : (input.isSphericalHarmonics3 ? input : null);
+        if (src) {
+            for (let i = 0; i < 9; i++) out[i].copy(src.coefficients[i]);
+            return out;
+        }
+        // color / gradient dome → numeric SH projection over a Fibonacci sphere
+        let radianceAt;
+        const _c = new THREE.Color();
+        if (typeof input === 'number' || input.isColor) {
+            const c = new THREE.Color(input);
+            radianceAt = () => c;
+        } else if (typeof input === 'object') {
+            const zen = new THREE.Color(input.zenith ?? 0);
+            const hor = new THREE.Color(input.horizon ?? input.zenith ?? 0);
+            const gnd = new THREE.Color(input.ground ?? 0);
+            radianceAt = (d) => (d.y >= 0 ? _c.lerpColors(hor, zen, d.y) : _c.lerpColors(hor, gnd, -d.y));
+        } else return out;
+        const N = 128, dir = new THREE.Vector3(), basis = new Array(9).fill(0);
+        const w = (4 * Math.PI) / N;
+        for (let i = 0; i < N; i++) {
+            const y = 1 - (2 * (i + 0.5)) / N;
+            const r = Math.sqrt(Math.max(0, 1 - y * y));
+            const phi = i * Math.PI * (3 - Math.sqrt(5));
+            dir.set(r * Math.cos(phi), y, r * Math.sin(phi));
+            THREE.SphericalHarmonics3.getBasisAt(dir, basis);
+            const c = radianceAt(dir);
+            for (let j = 0; j < 9; j++) {
+                out[j].x += c.r * basis[j] * w;
+                out[j].y += c.g * basis[j] * w;
+                out[j].z += c.b * basis[j] * w;
+            }
+        }
+        return out;
+    }
+    function setSky(input) {
+        const sh = _skyToSH(input);
+        let changed = false;
+        for (let i = 0; i < 9; i++) {
+            if (!U.skySH[i].value.equals(sh[i])) { U.skySH[i].value.copy(sh[i]); changed = true; }
+        }
+        if (changed) reactiveTicks = REACTIVE_TICKS;  // re-converge to the new sky fast
+    }
 
     function isSupported() {
         return renderer?.backend?.isWebGPUBackend === true
@@ -749,7 +854,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const ox = col.mul(float(TILE)).add(float(BORDER)).add(octUV.x.mul(float(OCT_RES))).add(0.5);
                 const oy = row.mul(float(TILE)).add(float(BORDER)).add(octUV.y.mul(float(OCT_RES))).add(0.5);
                 const uv = vec2(ox.div(U.atlasDim.x), oy.div(U.atlasDim.y));
-                acc.addAssign(texture(atlas, uv).xyz.mul(w));
+                acc.addAssign(texture(atlas, uv).level(0).xyz.mul(w));
                 wsum.addAssign(w);
             }
             return acc.div(wsum.max(float(1e-4)));
@@ -875,9 +980,25 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const roll = U.radianceClamp.div(tslMax(tslMax(U.radianceClamp, bl), float(1e-6)));
                 radiance.addAssign(bounce.mul(roll).mul(U.debugBounceScale));
                 outRgb.assign(radiance);
+            }).Else(() => {
+                // miss → SKY radiance from the injected SH-9 (zero SH = the old
+                // miss=BLACK invariant bit-for-bit). hitT stays -1 → depth moments
+                // still record "far": sky light never occludes. If the receiver ALSO
+                // gets diffuse IBL from scene.environment, that ambient double-counts —
+                // turn environmentIntensity down/off and let the probes own the sky.
+                // Basis order/constants match THREE.SphericalHarmonics3.getAt.
+                const x = rd.x, y = rd.y, z = rd.z;
+                const sky = U.skySH[0].mul(0.282095)
+                    .add(U.skySH[1].mul(y.mul(0.488603)))
+                    .add(U.skySH[2].mul(z.mul(0.488603)))
+                    .add(U.skySH[3].mul(x.mul(0.488603)))
+                    .add(U.skySH[4].mul(x.mul(y).mul(1.092548)))
+                    .add(U.skySH[5].mul(y.mul(z).mul(1.092548)))
+                    .add(U.skySH[6].mul(z.mul(z).mul(3.0).sub(1.0).mul(0.315392)))
+                    .add(U.skySH[7].mul(x.mul(z).mul(1.092548)))
+                    .add(U.skySH[8].mul(x.mul(x).sub(y.mul(y)).mul(0.546274)));
+                outRgb.assign(sky.max(vec3(0.0)).mul(U.skyIntensity)); // SH ringing can dip negative → clamp
             });
-            // miss → outRgb stays BLACK (CRITICAL: never sample sky here — IBL
-            // owns the sky hemisphere; sampling it would double-count IBL).
 
             const rb = slot.mul(uint(raysPerProbe)).add(k).mul(uint(4)).toVar();
             rayData.element(rb).assign(outRgb.x);
@@ -1649,7 +1770,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     function setEnabled(on) { node.setEnabled(on === true); if (on && (!casc[0].gpu || !node._ready)) requestRebuild(); }
     // freshBuild=true (default) invalidates the cached BVH+texture soup so rebuild()
     // rebuilds it (geometry/light-count/volume change, or first build). Grid-only callers
-    // (setDivisions/setRays) pass false → the cached soup is reused, no MeshBVH hitch.
+    // (setDivisions/setRays) pass false → the cached soup is reused, no MeshBVH stall.
     function requestRebuild(freshBuild = true) { dirty = true; rebuildBackoff = 0; if (freshBuild) buildDirty = true; }
     // Set explicit probe volume(s) — e.g. synced "SPEEDBALL GI Probe Grid" helpers. Each
     // entry is a world-space THREE.Box3 (auto resolution) OR { box, res } where res is
@@ -1851,6 +1972,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         setEnabled,
         setIntensity: (v) => node.setIntensity(v),
         setChebyStrength: (v) => node.setChebyStrength(v),
+        setNormalDetail: (v) => node.setDetailStrength(v),  // GI normal-map detail on trusted materials (0 = smooth, 1 = full)
         setClassifyStrength: (v) => {
             node.setClassifyStrength(v); // node-side: classification gate + relocation apply
             if (Number.isFinite(v)) {
@@ -1866,7 +1988,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const v = THREE.MathUtils.clamp(Math.round(Number(n)) || TARGET_PROBES_LONG_AXIS, 2, MAX_PROBES_PER_AXIS);
             if (v === targetLongAxis) return;
             targetLongAxis = v;
-            requestRebuild(false); // grid-only resize → reuse cached BVH+textures (no MeshBVH hitch)
+            requestRebuild(false); // grid-only resize → reuse cached BVH+textures (no MeshBVH stall)
         },
         getDivisions: () => targetLongAxis,
         // ── STRUCTURAL knob: ray budget per probe. Re-sizes the ray scratch + rebuilds the
@@ -1875,7 +1997,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const v = THREE.MathUtils.clamp(Math.round(Number(n) / 16) * 16 || RAYS_PER_PROBE_DEFAULT, RAYS_MIN, RAYS_MAX);
             if (v === raysPerProbe) return;
             raysPerProbe = v;
-            requestRebuild(false); // ray budget only → reuse cached BVH+textures (kernel rebuild, no MeshBVH hitch)
+            requestRebuild(false); // ray budget only → reuse cached BVH+textures (kernel rebuild, no MeshBVH stall)
         },
         getRays: () => raysPerProbe,
         // ── UNIFORM knobs (apply INSTANTLY — no recompile, no rebuild). ──
@@ -1906,6 +2028,15 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             reactiveTicks = REACTIVE_TICKS;
         },
         setDepthSharpness: (v) => { if (Number.isFinite(v)) U.depthSharpness.value = THREE.MathUtils.clamp(v, 1, 200); }, // depth-moment cosine power (Chebyshev crispness)
+        setSky,   // inject the sky: null | Color/hex | {zenith,horizon,ground} | LightProbe/SphericalHarmonics3 (radiance SH)
+        setSkyIntensity: (v) => {
+            if (!Number.isFinite(v)) return;
+            const next = Math.max(0, v);
+            if (U.skyIntensity.value === next) return;
+            U.skyIntensity.value = next;    // sky radiance on miss rays (0 = off)
+            reactiveTicks = REACTIVE_TICKS; // trace-side knob: fade the new level in (same reason as setRadianceClamp)
+        },
+        getSkyIntensity: () => U.skyIntensity.value,
         // ── adaptive-blend tuning (live; no recompile). Tune "stable continuous" by feel. ──
         setChangeThreshold: (v) => { if (Number.isFinite(v)) U.tempChangeSigma1.value = THREE.MathUtils.clamp(v, 0.5, 8); },   // σ delta to treat a change as REAL — lower = snappier
         setSnapAmount: (v) => { if (Number.isFinite(v)) U.tempChangeHDrop.value = THREE.MathUtils.clamp(v, 0, 0.9); },         // hysteresis drop on a real change — higher = harder snap
