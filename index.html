@@ -384,7 +384,7 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
   hideStatus();
   markInteraction();
 }, (xhr) => {
-  if (xhr.total) setStatus('loading Sponza… ' + Math.round(xhr.loaded / xhr.total * 100) + '%');
+  if (xhr.total) setStatus('loading Sponza… ' + Math.min(100, Math.round(xhr.loaded / xhr.total * 100)) + '%');
 }, (err) => {
   setStatus('Failed to load ./Sponza/glTF/Sponza.gltf\n' + (err?.message || err), true);
 });
