@@ -4,27 +4,33 @@
 // (camera, sun/time-of-day, seed, props) stays per-page. Not part of the library
 // (js/index.js does not export it).
 
-const KEY = 'speedball-gi-settings-v1';
+const KEY = 'speedball-gi-settings-v2';
 
 // Canonical defaults (= Sponza's tuning).
 export const GI_DEFAULTS = {
-    giEnabled: true, giIntensity: 6, giDivisions: 12, giRays: 64,
-    giCascades: 2, giContinuous: true, showProbes: false,
-    giHysteresis: 0.95, giNormalBias: 1, giRadianceClamp: 8, giDepthSharpness: 50,
-    giLeak: 0, giSolid: 0,
+    giEnabled: true, giIntensity: 10, giDivisions: 16, giRays: 64,
+    giCascades: 1, giContinuous: true, showProbes: false,
+    giHysteresis: 0.6, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 40,
+    giLeak: 0.5, giSolid: 0,
     giChangeThreshold: 2.5, giSnapAmount: 0.30, giFireflyClamp: 6.0,
 };
 
 const GI_KEYS = Object.keys(GI_DEFAULTS);
+const GI_PERSIST_KEYS = GI_KEYS.filter((k) => ![
+    'giChangeThreshold',
+    'giSnapAmount',
+    'giFireflyClamp',
+].includes(k));
 
 // Saved settings merged over the defaults. Type-checked per key so a stale or
-// hand-edited store can never inject NaN/strings into the setters.
+// hand-edited store can never inject NaN/strings into the setters. Adaptive
+// temporal tuning is intentionally not restored: it is pinned to the defaults.
 export function loadGiSettings() {
     let saved = null;
     try { saved = JSON.parse(localStorage.getItem(KEY)); } catch (e) { /* storage disabled */ }
     const out = { ...GI_DEFAULTS };
     if (saved && typeof saved === 'object') {
-        for (const k of GI_KEYS) if (typeof saved[k] === typeof GI_DEFAULTS[k]) out[k] = saved[k];
+        for (const k of GI_PERSIST_KEYS) if (typeof saved[k] === typeof GI_DEFAULTS[k]) out[k] = saved[k];
     }
     return out;
 }
@@ -35,7 +41,7 @@ export function saveGiSettings(params) {
     clearTimeout(_saveTimer);
     _saveTimer = setTimeout(() => {
         const out = {};
-        for (const k of GI_KEYS) if (k in params) out[k] = params[k];
+        for (const k of GI_PERSIST_KEYS) if (k in params) out[k] = params[k];
         try { localStorage.setItem(KEY, JSON.stringify(out)); } catch (e) { /* storage disabled */ }
     }, 300);
 }
@@ -63,11 +69,8 @@ export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure
     fQ.add(params, 'giLeak', 0, 1, 0.05).name('chebyshev strength').onChange((v) => { gi.setChebyStrength(v); onInteract(); });
     // solid-scene (classify) stays hidden + pinned to 0 — a backface test misreads thin
     // two-sided geometry (Sponza curtains), so it's opt-in for enclosed solids only.
-    // Temporal — live adaptive-blend tuning (pairs with continuous mode).
-    const fT = fGI.addFolder('Temporal (adaptive blend)');
-    fT.add(params, 'giChangeThreshold', 0.5, 8, 0.05).name('change threshold σ').onChange((v) => { gi.setChangeThreshold(v); onInteract(); });
-    fT.add(params, 'giSnapAmount', 0, 0.9, 0.01).name('snap amount').onChange((v) => { gi.setSnapAmount(v); onInteract(); });
-    fT.add(params, 'giFireflyClamp', 1, 20, 0.5).name('firefly clamp σ').onChange((v) => { gi.setFireflyClamp(v); onInteract(); });
+    // Adaptive temporal blend is pinned below. Hysteresis remains the one public
+    // temporal control; the rest should feel like engine behavior, not scene tuning.
     return fGI;
 }
 

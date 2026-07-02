@@ -3,50 +3,45 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>SPEEDBALL GI — Procedural City (WebGPU DDGI + Sky)</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="./css/concrete_connect.css">
+<title>SPEEDBALL GI - Procedural City Benchmark</title>
 <style>
-  /* Concrete Connect / E16 branding (see css/concrete_connect.css). */
-  :root { --mono: 'JetBrains Mono', ui-monospace, "Cascadia Code", Menlo, monospace; }
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #9a9a9a; color: #111;
-    font: 12px/1.5 var(--mono); }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #11151c;
+    color: #cdd6e0;
+    font: 12px/1.5 ui-monospace, "Cascadia Code", Menlo, monospace;
+  }
   #c { display: block; width: 100vw; height: 100vh; }
-
-  /* ── HUD: clean text overlay (no panel) ─────────────────────────────────── */
-  #hud { position: fixed; left: 14px; top: 12px; pointer-events: none; max-width: 46ch; z-index: 10;
-    color: #f2f2f2; text-shadow: 0 1px 2px #000, 0 0 2px #000c; }
-  #hud .title { font: 800 13px/1.5 Verdana, system-ui, sans-serif; letter-spacing: 0.12em; text-transform: uppercase; }
-  #hud .sub { color: #d6d6d6; }
-  #hud #gi-stat { display: inline-block; margin-top: 6px; color: #9fd2ff; }
-
-  /* ── status / loading overlay ───────────────────────────────────────────── */
-  #status { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
-    padding: 14px 22px; color: #111; white-space: pre; text-align: center;
-    background: linear-gradient(to bottom, #eeeeee, #b8b8b8); border: 1px solid #242424; border-radius: 6px;
-    box-shadow: 6px 8px 20px rgba(0,0,0,0.45), inset 1px 1px 2px rgba(255,255,255,0.9);
-    font: 700 11px/1.5 var(--mono); text-shadow: 1px 1px 0 #fff; }
-  #status.err { border-color: #6b2330; color: #7a0e1c; background: linear-gradient(to bottom, #f0dede, #cc9a9a); text-shadow: none; }
+  #hud {
+    position: fixed;
+    left: 12px;
+    top: 10px;
+    z-index: 10;
+    max-width: 54ch;
+    pointer-events: none;
+    text-shadow: 0 1px 2px #000a;
+  }
+  #hud b { color: #8fd0ff; font-weight: 600; letter-spacing: .04em; }
+  #hud .sub { color: #8b96a6; }
+  #hud .metric { color: #dce7f7; }
+  #status {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    padding: 14px 20px;
+    border-radius: 10px;
+    background: #1a2230d0;
+    border: 1px solid #2c384a;
+    color: #cdd6e0;
+    white-space: pre;
+    text-align: center;
+  }
+  #status.err { border-color: #6b2330; color: #ff9aa6; background: #2a161bd0; }
   #status.hide { display: none; }
-
-  /* ── lil-gui: concrete skin ─────────────────────────────────────────────── */
-  .lil-gui { --width: 300px; --font-size: 11px;
-    --background-color: #cccccc; --text-color: #141414;
-    --title-background-color: #b8b8b8; --title-text-color: #050505;
-    --widget-color: #909090; --hover-color: #9e9e9e; --focus-color: #ababab;
-    --number-color: #0b3d6b; --string-color: #3a5f2a;
-    --font-family: Verdana, system-ui, sans-serif; --font-family-mono: var(--mono);
-    --widget-height: 20px; }
-  .lil-gui.root { border: 1px solid #242424; border-radius: 8px 8px 3px 3px;
-    background: linear-gradient(to bottom, #e4e4e4, #bcbcbc);
-    box-shadow: 7px 9px 24px rgba(0,0,0,0.48), inset 1px 1px 2px rgba(255,255,255,0.96); }
-  .lil-gui.root > .title { background: linear-gradient(to bottom, #d9d9d9 0%, #bdbdbd 44%, #8f8f8f 50%, #b8b8b8 100%);
-    border-bottom: 1px solid #555; color: #050505; text-shadow: 1px 1px 0 #fff;
-    font: 800 11px/1 Verdana, system-ui, sans-serif; letter-spacing: 0.10em; text-transform: uppercase; }
-  .lil-gui .children { background: transparent; }
-  .lil-gui .title { text-shadow: 1px 1px 0 rgba(255,255,255,0.45); }
+  .lil-gui { --width: 290px; --font-size: 11px; }
 </style>
 <script type="importmap">
 {
@@ -66,12 +61,13 @@
 <body>
 <canvas id="c"></canvas>
 <div id="hud">
-  <div class="title">SPEEDBALL GI · City</div>
-  <span class="sub">procedural city · BVH-traced DDGI · WebGPU</span><br>
-  <span class="sub">WASD + drag to look · sun = time of day</span><br>
-  <span class="sub" id="gi-stat">GI: starting…</span>
+  <b>SPEEDBALL GI</b> <span class="sub">city benchmark</span><br>
+  <span class="metric" id="mode-stat">mode: starting</span><br>
+  <span class="metric" id="fps-stat">fps: --</span><br>
+  <span class="metric" id="bench-stat">benchmark: idle</span><br>
+  <span class="sub" id="gi-stat">gi: starting</span>
 </div>
-<div id="status">initializing WebGPU…</div>
+<div id="status">initializing WebGPU...</div>
 
 <script type="module">
 import * as THREE from 'three';
@@ -79,300 +75,154 @@ import { FirstPersonControls } from 'three/addons/controls/FirstPersonControls.j
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { Inspector } from 'three/addons/inspector/Inspector.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { positionWorld, normalWorld } from 'three/tsl';
-import { createProbeField, giLights } from './js/index.js';
-import { loadGiSettings, saveGiSettings, applyGiSettings, addGiPanel } from './js/gi_settings.js';
+import { installSpeedballGI, excludeFromGI, prepareMaterialsForGI } from './js/index.js';
 import { CityGenerator, createBuildingMaterial, createRoadMaterial } from 'three/addons/generators/CityGenerator.js';
 
 const statusEl = document.getElementById('status');
-const setStatus = (msg, err = false) => { statusEl.textContent = msg; statusEl.classList.toggle('err', err); statusEl.classList.remove('hide'); };
+const setStatus = (msg, err = false) => {
+  statusEl.textContent = msg;
+  statusEl.classList.toggle('err', err);
+  statusEl.classList.remove('hide');
+};
 const hideStatus = () => statusEl.classList.add('hide');
 window.addEventListener('error', (e) => setStatus('Error:\n' + (e.error?.stack || e.message), true));
 window.addEventListener('unhandledrejection', (e) => setStatus('Error:\n' + (e.reason?.stack || e.reason), true));
-const DIAG = new URLSearchParams(location.search).has('diag');
 
-// ── Renderer (matches webgpu_generator_city) ──────────────────────────────────
+const query = new URLSearchParams(location.search);
+const getBool = (name, fallback) => {
+  if (!query.has(name)) return fallback;
+  const v = query.get(name).toLowerCase();
+  return !(v === '0' || v === 'false' || v === 'off' || v === 'no');
+};
+const getNumber = (name, fallback, min = -Infinity, max = Infinity) => {
+  if (!query.has(name)) return fallback;
+  const v = Number(query.get(name));
+  return Number.isFinite(v) ? THREE.MathUtils.clamp(v, min, max) : fallback;
+};
+
+const USE_GI = getBool('gi', true);
+const AUTO_BENCHMARK = getBool('bench', false);
+const pixelRatio = getNumber('dpr', window.devicePixelRatio, 0.5, 4);
+
 const canvas = document.getElementById('c');
 const renderer = new THREE.WebGPURenderer({ canvas, antialias: true });
-renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setPixelRatio(pixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 0.45;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.inspector = new Inspector();        // performance metric (CPU/GPU/FPS), same as the example
+renderer.inspector = new Inspector();
 await renderer.init();
+
 if (renderer.backend?.isWebGPUBackend !== true) {
-  setStatus('WebGPU not available.\nThis demo needs a WebGPU-capable browser\n(Chrome/Edge 121+, or Firefox Nightly).', true);
+  setStatus('WebGPU not available.\nThis benchmark needs a WebGPU-capable browser.', true);
   throw new Error('WebGPU unavailable');
 }
 
-// ── SPEEDBALL GI lighting node — install BEFORE any material compiles ──────────────
-renderer.lighting.createNode = (lights = []) => giLights({
-  maxDirectionalLights: 4, maxPointLights: 16, maxSpotLights: 16, maxHemisphereLights: 2,
-}).setLights(lights);
-
 const pmremGenerator = new THREE.PMREMGenerator(renderer);
-
 const scene = new THREE.Scene();
-scene.environmentIntensity = 0.2;            // matches the example (sky IBL strength)
+scene.environmentIntensity = 0.2;
 
-// ── Sky (matches the example exactly) ─────────────────────────────────────────
-const sky = new SkyMesh();
+const sky = excludeFromGI(new SkyMesh());
 sky.scale.setScalar(10000);
 sky.turbidity.value = 8;
 sky.rayleigh.value = 3;
 sky.mieCoefficient.value = 0.008;
 sky.mieDirectionalG.value = 0.88;
-sky.userData.maxjsVisible = false;           // keep the sky OUT of the GI BVH
+
 const sun = new THREE.Vector3();
 const envScene = new THREE.Scene();
-let cityEnvironment = null;
-let diag = null;
 
-// ── Camera + controls (matches the example) ───────────────────────────────────
 const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 1, 20000);
 camera.position.set(-35, 55, -100);
+
 const controls = new FirstPersonControls(camera, renderer.domElement);
 controls.movementSpeed = 15;
 controls.lookSpeed = 0.25;
 controls.lookAt(35, 55, 0);
+
 const timer = new THREE.Timer();
 
-// GI idle tracking (defined early — generateCity/updateSun call markInteraction).
-let lastInteractionMs = 0;
-const markInteraction = () => { lastInteractionMs = performance.now(); };
-
-// ── Sun light + shadows (matches the example) ─────────────────────────────────
 const sunLight = new THREE.DirectionalLight();
 sunLight.castShadow = true;
-sunLight.shadow.camera.left = -280; sunLight.shadow.camera.right = 280;
-sunLight.shadow.camera.top = 360; sunLight.shadow.camera.bottom = -40;
+sunLight.shadow.camera.left = -280;
+sunLight.shadow.camera.right = 280;
+sunLight.shadow.camera.top = 360;
+sunLight.shadow.camera.bottom = -40;
 sunLight.shadow.camera.far = 2400;
 sunLight.shadow.mapSize.set(4096, 4096);
 sunLight.shadow.bias = -0.0004;
 scene.add(sunLight);
 
-// ── Procedural city (generated at RUNTIME — no GLB) ────────────────────────────
 const parameters = {
-  seed: 94, timeOfDay: 12, exposure: 0.45,   // noon = bright (was dawn/dim); overridden by saved state
-  showTrees: true, showCars: true,
-  // GI settings come from the SHARED store (Sponza is the canonical scene) — one set
-  // of values across every demo page. Scene state above stays city-only.
-  ...loadGiSettings(),
+  seed: Math.round(getNumber('seed', 94, 0, 1000)),
+  timeOfDay: getNumber('time', 12, 6, 18),
+  exposure: getNumber('exposure', 0.45, 0, 4),
+  giIntensity: getNumber('intensity', 6, 0, 100),
+  giDivisions: Math.round(getNumber('divisions', 12, 2, 32)),
+  giRays: Math.round(getNumber('rays', 64, 32, 256)),
+  giCascades: Math.round(getNumber('cascades', 2, 1, 2)),
+  giHysteresis: 0.95,
+  giNormalBias: 1,
+  giChebyStrength: 0,
+  giClassifyStrength: 0,
+  giRadianceClamp: 8,
+  giDepthSharpness: 50,
+  giChangeThreshold: 2.5,
+  giSnapAmount: 0.30,
+  giFireflyClamp: 6.0,
 };
+renderer.toneMappingExposure = parameters.exposure;
 
-let gi = null, cityGroup = null;
+let gi = null;
+let cityGroup = null;
+let buildingMaterial = null;
 const city = new CityGenerator({ seed: parameters.seed });
-// DEBUG: flat untextured materials (flicker isolation) — set false to restore the
-// procedural building/road looks.
-const DEBUG_FLAT_MATERIALS = true;
-const materials = { building: DEBUG_FLAT_MATERIALS
-  ? new THREE.MeshStandardMaterial({ color: 0xb0a99a, roughness: 0.9 })
-  : createBuildingMaterial(city.layout, parameters.seed) };
-// The building/road looks are node-driven (colorNode), so the GI trace can't read
-// them — give the packer representative albedos (visual untouched, colorNode wins).
-materials.building.userData.giColor = 0xb0a99a;   // limestone average of the tower palette
 
-// NOTE: mrdoob's webgpu city example ships each building set as ONE merged mesh with a
-// partId vertex attribute switching the look per zone. For THIS demo the emissive
-// meshes (GLASS panes, partId 4) are separated into their own geometry group + material
-// instance below (separateEmissiveGlass), so the GI trace sees the actual window panes
-// as area lights — local warm spill with real falloff, instead of a facade-wide
-// average that lit the whole city. Identical construction → identical on-screen look.
-const GLASS_PART_ID = 4;
-materials.buildingGlass = DEBUG_FLAT_MATERIALS
-  ? new THREE.MeshStandardMaterial({ color: 0x22282e, roughness: 0.3 })
-  : createBuildingMaterial(city.layout, parameters.seed);
-materials.buildingGlass.userData.giColor = 0x22282e;                        // dark glass albedo
-// materials.buildingGlass.userData.giEmissive = new THREE.Color(0.5, 0.34, 0.16); // avg pane emission — OFF while debugging
-
-function separateEmissiveGlass(group) {
-  group.traverse((o) => {
-    if (!o.isMesh || !o.geometry?.attributes?.partId || o.userData.glassSeparated) return;
-    o.userData.glassSeparated = true;
-    const g = o.geometry;
-    const part = g.attributes.partId.array;
-    const src = g.index ? g.index.array : null;
-    const triCount = ((src ? src.length : g.attributes.position.count) / 3) | 0;
-    const wall = [], glass = [];
-    for (let t = 0; t < triCount; t++) {
-      const i0 = t * 3;
-      const a = src ? src[i0] : i0;
-      const dst = part[a] === GLASS_PART_ID ? glass : wall;
-      if (src) dst.push(src[i0], src[i0 + 1], src[i0 + 2]);
-      else dst.push(i0, i0 + 1, i0 + 2);
-    }
-    g.setIndex(new THREE.BufferAttribute(new Uint32Array([...wall, ...glass]), 1));
-    g.clearGroups();
-    g.addGroup(0, wall.length, 0);
-    g.addGroup(wall.length, glass.length, 1);
-    o.material = [materials.building, materials.buildingGlass];
-  });
-}
-
-// SPEEDBALL GI traces packed scalar PBR; the procedural buildings import metallic, which
-// kills diffuse bounce (metals don't bounce Lambert) — the Sponza trap. Normalise the
-// trace-side scalar to dielectric so the city actually bounces. Node visual is untouched.
-function prepMaterials(o) {
-  const ms = Array.isArray(o.material) ? o.material : (o.material ? [o.material] : []);
-  for (const m of ms) {
-    if (!m || m.userData?.speedballGiPrepared) continue;
-    m.userData = m.userData || {}; m.userData.speedballGiPrepared = true;
-    if (Number.isFinite(m.metalness) && m.metalness > 0.5) { m.metalness = 0; m.needsUpdate = true; }
-    if (Number.isFinite(m.roughness) && m.roughness < 0.6) { m.roughness = 0.6; m.needsUpdate = true; }
-  }
-}
-
-// ── Procedural street props: trees on the curbs, cars in the lanes ─────────────
-// Instanced + seeded (deterministic per city seed), cast/receive shadows, and picked
-// up by the SPEEDBALL GI BVH — so green canopy + car paint actually bounce colour.
-function mulberry32(a) {
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-// low-poly geometry (built once; shared across regenerations — never disposed)
-const _treeTrunkGeo = new THREE.CylinderGeometry(0.4, 0.6, 3.4, 6).translate(0, 1.7, 0);
-const _treeLeafGeo  = new THREE.ConeGeometry(2.6, 6.0, 8).translate(0, 5.6, 0);
-const _carBodyGeo   = new THREE.BoxGeometry(4.4, 1.1, 2.0).translate(0, 1.25, 0);
-const _carCabinGeo  = new THREE.BoxGeometry(2.2, 0.9, 1.7).translate(-0.25, 2.05, 0);
-const _carWheelGeo  = new THREE.CylinderGeometry(0.55, 0.55, 0.45, 10).rotateX(Math.PI / 2); // axle → Z
-const _propMat = {
-  trunk: new THREE.MeshStandardMaterial({ color: 0x5a4632, roughness: 0.95 }),
-  leaf:  new THREE.MeshStandardMaterial({ color: 0x3f6b2e, roughness: 0.85 }),
-  body:  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.35, metalness: 0.0 }),
-  cabin: new THREE.MeshStandardMaterial({ color: 0x243038, roughness: 0.25, metalness: 0.0 }),
-  wheel: new THREE.MeshStandardMaterial({ color: 0x0e0f11, roughness: 0.85 }),
-};
-const CAR_COLORS = [0xb63b34, 0x2f5aa8, 0xd9d9d9, 0x1b1c1e, 0xc7a233, 0x3a7d54, 0xe8e8ee];
-const _ppM4 = new THREE.Matrix4(), _ppOff = new THREE.Matrix4(), _ppQ = new THREE.Quaternion();
-const _ppV = new THREE.Vector3(), _ppS = new THREE.Vector3(), _ppUp = new THREE.Vector3(0, 1, 0), _ppCol = new THREE.Color();
-let propsGroup = null;
-
-function makeInst(geo, mat, mats, colors) {
-  if (!mats.length) return null;
-  const im = new THREE.InstancedMesh(geo, mat, mats.length);
-  for (let i = 0; i < mats.length; i++) im.setMatrixAt(i, mats[i]);
-  if (colors) { for (let i = 0; i < colors.length; i++) im.setColorAt(i, _ppCol.setHex(colors[i])); im.instanceColor.needsUpdate = true; }
-  im.instanceMatrix.needsUpdate = true;
-  im.castShadow = true; im.receiveShadow = true;
-  im.computeBoundingBox(); im.computeBoundingSphere();
-  prepMaterials(im);
-  return im;
-}
-
-function generateProps() {
-  if (propsGroup) { scene.remove(propsGroup); propsGroup.traverse((o) => { if (o.isInstancedMesh) o.dispose(); }); propsGroup = null; }
-  const L = city.layout;
-  const rnd = mulberry32((Math.round(parameters.seed) * 2654435761) >>> 0);
-  const halfW = L.cityW / 2, halfD = L.cityD / 2;
-  const blkX = (bx) => -halfW + bx * (L.blockW + L.street);
-  const blkZ = (bz) => -halfD + bz * (L.blockD + L.street);
-  propsGroup = new THREE.Group(); propsGroup.name = 'CityProps';
-
-  // trees: line every block edge at the curb (both sides of each street get lined)
-  const treeMats = [];
-  if (parameters.showTrees) {
-    const off = 1.5, step = 8.5;
-    for (let bx = 0; bx < L.blocksX; bx++) for (let bz = 0; bz < L.blocksZ; bz++) {
-      const x0 = blkX(bx), x1 = x0 + L.blockW, z0 = blkZ(bz), z1 = z0 + L.blockD;
-      const edges = [
-        { ax: 'x', a: x0, b: x1, fix: z0 - off }, { ax: 'x', a: x0, b: x1, fix: z1 + off },
-        { ax: 'z', a: z0, b: z1, fix: x0 - off }, { ax: 'z', a: z0, b: z1, fix: x1 + off },
-      ];
-      for (const e of edges) {
-        const len = e.b - e.a, n = Math.max(1, Math.floor(len / step));
-        for (let i = 0; i <= n; i++) {
-          if (rnd() < 0.30) continue;
-          const along = e.a + (n > 0 ? i / n : 0.5) * len + (rnd() - 0.5) * 2.0;
-          const px = e.ax === 'x' ? along : e.fix, pz = e.ax === 'x' ? e.fix : along;
-          const sc = 0.8 + rnd() * 0.7;
-          _ppQ.setFromAxisAngle(_ppUp, rnd() * Math.PI * 2);
-          _ppM4.compose(_ppV.set(px, 0, pz), _ppQ, _ppS.set(sc, sc, sc));
-          treeMats.push(_ppM4.clone());
-        }
-      }
-    }
-  }
-
-  // cars: two lanes down each street centerline; skip the intersections
-  const carMats = [], carCols = [], wheelMats = [];
-  if (parameters.showCars) {
-    const laneOff = L.street * 0.16, step = 15;
-    const streetsX = [-halfW - L.street / 2, halfW + L.street / 2];
-    for (let bx = 0; bx < L.blocksX - 1; bx++) streetsX.push(blkX(bx) + L.blockW + L.street / 2);
-    const streetsZ = [-halfD - L.street / 2, halfD + L.street / 2];
-    for (let bz = 0; bz < L.blocksZ - 1; bz++) streetsZ.push(blkZ(bz) + L.blockD + L.street / 2);
-    const spanX = halfW + L.street * 0.6, spanZ = halfD + L.street * 0.6;
-    const nearAny = (v, arr, tol) => arr.some((c) => Math.abs(v - c) < tol);
-    const addCar = (px, pz, rotY) => {
-      _ppQ.setFromAxisAngle(_ppUp, rotY);
-      _ppM4.compose(_ppV.set(px, 0, pz), _ppQ, _ppS.set(1, 1, 1));
-      carMats.push(_ppM4.clone());
-      carCols.push(CAR_COLORS[(rnd() * CAR_COLORS.length) | 0]);
-      const wl = [[1.35, 0.55, 0.95], [1.35, 0.55, -0.95], [-1.35, 0.55, 0.95], [-1.35, 0.55, -0.95]];
-      for (const w of wl) wheelMats.push(_ppM4.clone().multiply(_ppOff.makeTranslation(w[0], w[1], w[2])));
-    };
-    for (const xc of streetsX) for (const lane of [-1, 1]) {
-      const px = xc + lane * laneOff, rotY = lane > 0 ? Math.PI / 2 : -Math.PI / 2;
-      for (let z = -spanZ; z <= spanZ; z += step) {
-        if (rnd() < 0.5 || nearAny(z, streetsZ, L.street * 0.7)) continue;
-        addCar(px, z + (rnd() - 0.5) * 4, rotY);
-      }
-    }
-    for (const zc of streetsZ) for (const lane of [-1, 1]) {
-      const pz = zc + lane * laneOff, rotY = lane > 0 ? 0 : Math.PI;
-      for (let x = -spanX; x <= spanX; x += step) {
-        if (rnd() < 0.5 || nearAny(x, streetsX, L.street * 0.7)) continue;
-        addCar(x + (rnd() - 0.5) * 4, pz, rotY);
-      }
-    }
-  }
-
-  const add = (im) => { if (im) propsGroup.add(im); };
-  add(makeInst(_treeTrunkGeo, _propMat.trunk, treeMats));
-  add(makeInst(_treeLeafGeo, _propMat.leaf, treeMats));
-  add(makeInst(_carBodyGeo, _propMat.body, carMats, carCols));
-  add(makeInst(_carCabinGeo, _propMat.cabin, carMats));
-  add(makeInst(_carWheelGeo, _propMat.wheel, wheelMats));
-  scene.add(propsGroup);
+function markGiSceneChanged() {
+  if (!gi) return;
+  prepareMaterialsForGI(scene);
+  gi.markMaterialsDirty?.();
+  gi.requestRebuild?.();
+  gi.markInteraction?.();
 }
 
 function generateCity() {
   if (cityGroup) scene.remove(cityGroup);
+  buildingMaterial?.dispose?.();
+
   city.parameters.seed = parameters.seed;
-  cityGroup = city.build(materials);
-  if (!window.__noGlassSplit) separateEmissiveGlass(cityGroup);   // demo-only: glass panes → own group/material so GI sees them as area lights
-  cityGroup.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; prepMaterials(o); } });
+  buildingMaterial = createBuildingMaterial(city.layout, parameters.seed);
+  cityGroup = city.build({ building: buildingMaterial });
+  cityGroup.traverse((o) => {
+    if (!o.isMesh) return;
+    o.castShadow = true;
+    o.receiveShadow = true;
+  });
+
   scene.add(cityGroup);
-  generateProps();
-  gi?.requestRebuild();
-  markInteraction();
+  markGiSceneChanged();
 }
 
 const floorW = city.layout.cityW + 2 * city.layout.street;
 const floorD = city.layout.cityD + 2 * city.layout.street;
-const ground = new THREE.Mesh(new THREE.PlaneGeometry(floorW, floorD).rotateX(-Math.PI / 2), DEBUG_FLAT_MATERIALS
-  ? new THREE.MeshStandardMaterial({ color: 0x30343a, roughness: 0.95 })
-  : createRoadMaterial(city.layout));
-ground.material.userData.giColor = 0x30343a;      // wet-asphalt average (road look is node-driven too)
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(floorW, floorD).rotateX(-Math.PI / 2),
+  createRoadMaterial(city.layout)
+);
 ground.receiveShadow = true;
-prepMaterials(ground);
 scene.add(ground);
 generateCity();
 
-// ── Sun placement / sky env (matches the example) ─────────────────────────────
-const _warm = new THREE.Color(0xffb072), _cool = new THREE.Color(0xfff4e8);
+const _warm = new THREE.Color(0xffb072);
+const _cool = new THREE.Color(0xfff4e8);
 function updateSun() {
   const t = parameters.timeOfDay;
   const u = (t - 12) / 6;
   const elevation = Math.max(0, 1 - u * u) * 72;
   const azimuth = 90 - u * 55;
+
   sun.setFromSphericalCoords(1, THREE.MathUtils.degToRad(90 - elevation), THREE.MathUtils.degToRad(azimuth));
   sky.sunPosition.value.copy(sun);
 
@@ -386,242 +236,269 @@ function updateSun() {
   envScene.add(sky);
   const env = pmremGenerator.fromScene(envScene).texture;
   if (scene.environment) scene.environment.dispose();
-  cityEnvironment = env;
-  scene.environment = diag?.environment === false ? null : env;
+  scene.environment = env;
   sky.showSunDisc.value = true;
   scene.add(sky);
 
-  markInteraction();
+  gi?.markInteraction?.();
 }
 updateSun();
 
-// ── GI idle gate via camera transform (FirstPersonControls is drag-to-look, so the
-// camera settles when you let go → GI converges; world-space GI holds static while moving)
-const _prevPos = new THREE.Vector3(Infinity, 0, 0), _prevQuat = new THREE.Quaternion(2, 0, 0, 0);
-function cameraIsMoving() {
-  const moved = camera.position.distanceToSquared(_prevPos) > 1e-7 || Math.abs(camera.quaternion.dot(_prevQuat)) < 0.99999995;
-  _prevPos.copy(camera.position); _prevQuat.copy(camera.quaternion);
-  return moved;
+if (USE_GI) {
+  gi = installSpeedballGI({
+    renderer,
+    scene,
+    camera,
+    enabled: true,
+    intensity: parameters.giIntensity,
+    divisions: parameters.giDivisions,
+    hysteresis: parameters.giHysteresis,
+    prepareMaterials: true,
+  });
+  gi.setSmoothness(1);
+  gi.setFilterStrength(1);
+  gi.setRays(parameters.giRays);
+  gi.setCascades(parameters.giCascades);
+  gi.setContinuous(true);
+  gi.setNormalBias(parameters.giNormalBias);
+  gi.setChebyStrength(parameters.giChebyStrength);
+  gi.setClassifyStrength(parameters.giClassifyStrength);
+  gi.setRadianceClamp(parameters.giRadianceClamp);
+  gi.setDepthSharpness(parameters.giDepthSharpness);
+  gi.setChangeThreshold(parameters.giChangeThreshold);
+  gi.setSnapAmount(parameters.giSnapAmount);
+  gi.setFireflyClamp(parameters.giFireflyClamp);
+  if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', true);
 }
+
+window.gi = gi;
+window.camera = camera;
+window.controls = controls;
+window.renderer = renderer;
+window.scene = scene;
+
+const modeStatEl = document.getElementById('mode-stat');
+const fpsStatEl = document.getElementById('fps-stat');
+const benchStatEl = document.getElementById('bench-stat');
+const giStatEl = document.getElementById('gi-stat');
+
+const benchmark = {
+  seconds: getNumber('seconds', 20, 5, 180),
+  warmup: getNumber('warmup', 2, 0, 30),
+  cameraPath: getBool('path', true),
+  pending: false,
+  running: false,
+  startMs: 0,
+  samples: [],
+  summary: null,
+  emaMs: 16.7,
+  lastFrameMs: 0,
+  hudMs: 0,
+};
+
+const benchTarget = new THREE.Vector3(0, 48, 0);
+function updateBenchmarkCamera(nowMs) {
+  const t = Math.max(0, (nowMs - benchmark.startMs) / 1000);
+  const angle = -2.35 + t * 0.18;
+  const radius = 168 + Math.sin(t * 0.31) * 16;
+  camera.position.set(Math.cos(angle) * radius, 58 + Math.sin(t * 0.43) * 11, Math.sin(angle) * radius);
+  controls.lookAt(benchTarget.x, benchTarget.y, benchTarget.z);
+}
+
+function percentile(sorted, p) {
+  if (!sorted.length) return 0;
+  const i = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
+  return sorted[i];
+}
+
+function summarizeBenchmark() {
+  const samples = benchmark.samples;
+  if (!samples.length) return null;
+
+  const sorted = [...samples].sort((a, b) => a - b);
+  const avgMs = samples.reduce((a, b) => a + b, 0) / samples.length;
+  return {
+    mode: USE_GI ? 'speedball' : 'original',
+    frames: samples.length,
+    seconds: benchmark.seconds,
+    dpr: renderer.getPixelRatio(),
+    avgMs,
+    avgFps: 1000 / avgMs,
+    low1Fps: 1000 / percentile(sorted, 0.99),
+    low5Fps: 1000 / percentile(sorted, 0.95),
+    minFps: 1000 / sorted[sorted.length - 1],
+    maxFps: 1000 / sorted[0],
+  };
+}
+
+function formatSummary(s) {
+  if (!s) return 'benchmark: no samples';
+  return `benchmark: avg ${s.avgFps.toFixed(1)} fps | 1% ${s.low1Fps.toFixed(1)} | min ${s.minFps.toFixed(1)} | ${s.frames} frames`;
+}
+
+function startBenchmark() {
+  benchmark.pending = true;
+  benchmark.running = false;
+  benchmark.startMs = 0;
+  benchmark.samples.length = 0;
+  benchmark.summary = null;
+  benchmark.lastFrameMs = 0;
+  benchStatEl.textContent = USE_GI ? 'benchmark: waiting for GI build' : `benchmark: warming ${benchmark.warmup.toFixed(1)}s`;
+}
+
+function giReadyForBenchmark() {
+  if (!gi) return true;
+  if (gi.hasData?.() !== true) return false;
+  const s = gi.getStats?.();
+  return !!s && s.probes > 0 && s.active === true;
+}
+
+function beginBenchmark(nowMs) {
+  benchmark.pending = false;
+  benchmark.running = true;
+  benchmark.startMs = nowMs;
+  benchmark.lastFrameMs = nowMs;
+  benchStatEl.textContent = `benchmark: warming 0.0/${benchmark.warmup.toFixed(1)}s`;
+}
+
+function finishBenchmark() {
+  benchmark.pending = false;
+  benchmark.running = false;
+  benchmark.summary = summarizeBenchmark();
+  benchStatEl.textContent = formatSummary(benchmark.summary);
+  console.table(benchmark.summary ? [benchmark.summary] : []);
+}
+
+function updateFrameStats(nowMs) {
+  if (!benchmark.lastFrameMs) {
+    benchmark.lastFrameMs = nowMs;
+    return;
+  }
+
+  const dt = nowMs - benchmark.lastFrameMs;
+  benchmark.lastFrameMs = nowMs;
+  if (!Number.isFinite(dt) || dt <= 0 || document.visibilityState === 'hidden') return;
+
+  benchmark.emaMs += (dt - benchmark.emaMs) * 0.08;
+  if (!benchmark.running) return;
+
+  if (!benchmark.startMs) benchmark.startMs = nowMs;
+  const elapsed = (nowMs - benchmark.startMs) / 1000;
+  const measuring = elapsed - benchmark.warmup;
+
+  if (measuring >= 0 && measuring <= benchmark.seconds) benchmark.samples.push(dt);
+  if (measuring >= benchmark.seconds) finishBenchmark();
+}
+
+function reloadBenchmark(useGi) {
+  const next = new URL(location.href);
+  next.searchParams.set('gi', useGi ? '1' : '0');
+  next.searchParams.set('bench', '1');
+  next.searchParams.set('seconds', String(Math.round(benchmark.seconds)));
+  next.searchParams.set('warmup', String(Math.round(benchmark.warmup)));
+  next.searchParams.set('seed', String(parameters.seed));
+  next.searchParams.set('time', parameters.timeOfDay.toFixed(2));
+  next.searchParams.set('dpr', renderer.getPixelRatio().toFixed(2));
+  location.assign(next.toString());
+}
+
+function updateHud(nowMs) {
+  if (nowMs - benchmark.hudMs < 250) return;
+  benchmark.hudMs = nowMs;
+
+  modeStatEl.textContent = `mode: ${USE_GI ? 'Speedball GI' : 'original city'} | dpr ${renderer.getPixelRatio().toFixed(2)} | Inspector on`;
+  fpsStatEl.textContent = `fps: ${(1000 / benchmark.emaMs).toFixed(1)} | frame ${benchmark.emaMs.toFixed(2)} ms`;
+
+  if (benchmark.pending) {
+    const s = gi?.getStats?.();
+    const probes = s?.probes ?? 0;
+    benchStatEl.textContent = gi
+      ? `benchmark: waiting for GI build | ${probes} probes`
+      : 'benchmark: arming';
+  } else if (benchmark.running) {
+    const elapsed = benchmark.startMs ? (nowMs - benchmark.startMs) / 1000 : 0;
+    const measuring = Math.max(0, elapsed - benchmark.warmup);
+    const phase = elapsed < benchmark.warmup ? 'warming' : 'measuring';
+    benchStatEl.textContent = `benchmark: ${phase} ${measuring.toFixed(1)}/${benchmark.seconds.toFixed(1)}s | ${benchmark.samples.length} frames`;
+  } else if (benchmark.summary) {
+    benchStatEl.textContent = formatSummary(benchmark.summary);
+  }
+
+  if (!gi) {
+    giStatEl.textContent = 'gi: off';
+  } else {
+    const s = gi.getStats?.();
+    giStatEl.textContent = s
+      ? `gi: ${s.probes} probes (${s.res.x}x${s.res.y}x${s.res.z}) | rays ${s.rays} | cascades ${s.cascades} | active ${s.active}`
+      : 'gi: building';
+  }
+}
+
+const gui = new GUI({ title: 'City Benchmark' });
+const fScene = gui.addFolder('Scene');
+fScene.add(parameters, 'seed', 0, 1000, 1).onFinishChange(() => { generateCity(); });
+fScene.add(parameters, 'timeOfDay', 6, 18, 0.1).name('time').onChange(updateSun);
+fScene.add(parameters, 'exposure', 0, 4, 0.01).onChange((v) => { renderer.toneMappingExposure = v; });
+
+const benchmarkActions = {
+  mode: USE_GI ? 'Speedball GI' : 'Original',
+  run: startBenchmark,
+  speedball: () => reloadBenchmark(true),
+  original: () => reloadBenchmark(false),
+};
+const fBench = gui.addFolder('Benchmark');
+fBench.add(benchmarkActions, 'mode', ['Speedball GI', 'Original']).onChange((v) => {
+  const nextGi = v === 'Speedball GI';
+  if (nextGi !== USE_GI) reloadBenchmark(nextGi);
+});
+fBench.add(benchmark, 'seconds', 5, 180, 1);
+fBench.add(benchmark, 'warmup', 0, 30, 1);
+fBench.add(benchmark, 'cameraPath').name('camera path');
+fBench.add(benchmarkActions, 'run').name('run');
+fBench.add(benchmarkActions, 'speedball').name('run Speedball');
+fBench.add(benchmarkActions, 'original').name('run original');
+
+if (gi) {
+  const fGI = gui.addFolder('Speedball GI');
+  fGI.add(parameters, 'giIntensity', 0, 100, 0.05).name('intensity').onChange((v) => gi.setIntensity(v));
+  fGI.add(parameters, 'giDivisions', 2, 32, 1).name('divisions').onFinishChange((v) => { gi.setDivisions(v); gi.markInteraction?.(); });
+  fGI.add(parameters, 'giRays', 32, 256, 16).name('rays').onFinishChange((v) => { gi.setRays(v); gi.markInteraction?.(); });
+  fGI.add(parameters, 'giCascades', { 'single grid': 1, 'cascaded': 2 }).name('cascades').onFinishChange((v) => { gi.setCascades(+v); gi.markInteraction?.(); });
+}
+
+window.speedballBenchmark = {
+  start: startBenchmark,
+  finish: finishBenchmark,
+  summary: () => benchmark.summary,
+  runSpeedball: () => reloadBenchmark(true),
+  runOriginal: () => reloadBenchmark(false),
+};
+
+hideStatus();
+if (AUTO_BENCHMARK) startBenchmark();
+
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
-  markInteraction();
+  gi?.markInteraction?.();
 });
 
-// ── SPEEDBALL GI probe field over the runtime city (NO post-processing — only GI) ───
-function markGiMaterialsDirty() {
-  const seen = new WeakSet();
-  const mark = (m) => {
-    if (!m || seen.has(m)) return; seen.add(m);
-    if (m.isMeshBasicMaterial || m.isLineBasicMaterial || m.visible === false) return;
-    m.dispose?.(); m.needsUpdate = true; // needsUpdate alone doesn't rebuild the node graph here
-  };
-  scene.traverse((o) => { if (!o.material) return; (Array.isArray(o.material) ? o.material : [o.material]).forEach(mark); });
-}
-
-gi = createProbeField({ renderer, scene, intensity: parameters.giIntensity, hysteresis: 0.95, divisions: parameters.giDivisions, onRebuilt: markGiMaterialsDirty });
-if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', true);
-gi.setSmoothness(1);                         // pinned (no slider)
-gi.setFilterStrength(1);
-applyGiSettings(gi, parameters);             // the shared settings, incl. cascades/continuous
-window.gi = gi; window.camera = camera; window.controls = controls; window.renderer = renderer; window.scene = scene;
-hideStatus();
-markInteraction();
-
-// ── GUI ────────────────────────────────────────────────────────────────────────
-const gui = new GUI({ title: 'SPEEDBALL GI · City' });
-const fCity = gui.addFolder('City / Sun');
-fCity.add(parameters, 'seed', 0, 100, 1).onChange(generateCity);
-fCity.add(parameters, 'timeOfDay', 6, 18, 0.1).name('time of day').onChange(updateSun);
-fCity.add(parameters, 'showTrees').name('trees').onChange(() => { generateProps(); gi?.requestRebuild(); markInteraction(); });
-fCity.add(parameters, 'showCars').name('cars').onChange(() => { generateProps(); gi?.requestRebuild(); markInteraction(); });
-// The GI panel is SHARED (js/gi_settings.js) — identical controls on every demo page.
-addGiPanel(gui, gi, parameters, { onInteract: markInteraction, onStructure: () => updateProbeHelpers() });
-gui.add(parameters, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => { renderer.toneMappingExposure = v; });
-if (DIAG) addDiagnosticPanel(gui);
-window.gui = gui;
-
-// ── Persist camera + all settings to localStorage, restore on load ──────────────
-// This is what stops every reload (mine included) from resetting your view/time/GI.
-const STORE_KEY = 'speedball-city-state-v1';
-const _fwd = new THREE.Vector3();
-function saveState() {
-  try {
-    camera.getWorldDirection(_fwd);
-    const look = camera.position.clone().add(_fwd.multiplyScalar(80));
-    localStorage.setItem(STORE_KEY, JSON.stringify({
-      cam: camera.position.toArray(), look: look.toArray(), exposure: renderer.toneMappingExposure,
-      // scene-only state — GI settings live in the SHARED store (js/gi_settings.js)
-      p: {
-        seed: parameters.seed, timeOfDay: parameters.timeOfDay,
-        showTrees: parameters.showTrees, showCars: parameters.showCars,
-      },
-    }));
-  } catch (e) { /* storage disabled */ }
-}
-let _saveTimer = 0;
-function scheduleSave() { clearTimeout(_saveTimer); _saveTimer = setTimeout(saveState, 500); }
-function loadState() {
-  let s; try { s = JSON.parse(localStorage.getItem(STORE_KEY)); } catch (e) { return; }
-  if (!s) return;
-  // scene-only keys — GI settings were already merged from the shared store and
-  // applied via applyGiSettings (old city stores may still carry gi* keys; ignore them).
-  if (s.p) for (const k of ['seed', 'timeOfDay', 'showTrees', 'showCars']) if (k in s.p) parameters[k] = s.p[k];
-  if (Number.isFinite(s.exposure)) renderer.toneMappingExposure = s.exposure;
-  if (parameters.seed !== city.parameters.seed) generateCity();
-  generateProps(); gi.requestRebuild();   // apply restored tree/car toggles (same-seed path skips generateCity)
-  if (Array.isArray(s.cam)) camera.position.fromArray(s.cam);
-  if (Array.isArray(s.look)) controls.lookAt(s.look[0], s.look[1], s.look[2]);
-  updateSun();
-  gui.controllersRecursive().forEach((c) => c.updateDisplay());
-  markInteraction();
-}
-gui.onChange(() => { scheduleSave(); saveGiSettings(parameters); });   // scene state + shared GI settings (debounced)
-
-// ── Pass isolation diagnostics (URL-gated: city.html?diag=1) ────────────────
-const diagFlatMaterial = new THREE.MeshBasicMaterial({ color: 0xb0a99a, toneMapped: false });
-const diagNormalMaterial = new THREE.MeshNormalMaterial({ toneMapped: false });
-function applyDiagnostics() {
-  if (!diag) return;
-  scene.overrideMaterial = diag.override === 'flat' ? diagFlatMaterial
-    : diag.override === 'normal' ? diagNormalMaterial
-    : null;
-  const showSky = diag.sky && diag.override === 'full';
-  sunLight.visible = diag.sun;
-  sunLight.castShadow = diag.sun && diag.shadows;
-  renderer.shadowMap.enabled = diag.shadows;
-  scene.environment = diag.environment ? cityEnvironment : null;
-  sky.visible = showSky;
-  materials.building.visible = diag.walls;
-  materials.buildingGlass.visible = diag.glass;
-  materials.buildingGlass.depthWrite = diag.glassDepthWrite;
-  materials.buildingGlass.depthTest = diag.glassDepthTest;
-  materials.buildingGlass.polygonOffset = diag.glassPolygonOffset;
-  materials.buildingGlass.polygonOffsetFactor = diag.glassOffsetFactor;
-  materials.buildingGlass.polygonOffsetUnits = diag.glassOffsetUnits;
-  materials.buildingGlass.needsUpdate = true;
-  if (propsGroup) propsGroup.visible = diag.props;
-  ground.visible = diag.ground;
-  camera.near = Math.max(0.01, diag.near);
-  camera.far = Math.max(camera.near + 1, diag.far);
-  camera.updateProjectionMatrix();
-  sunLight.shadow.bias = diag.shadowBias;
-  sunLight.shadow.normalBias = diag.shadowNormalBias;
-  markInteraction();
-}
-function addDiagnosticPanel(gui) {
-  diag = {
-    override: 'full',
-    freezeGiTick: false,
-    sun: true,
-    shadows: true,
-    environment: true,
-    sky: true,
-    walls: true,
-    glass: true,
-    glassDepthWrite: true,
-    glassDepthTest: true,
-    glassPolygonOffset: false,
-    glassOffsetFactor: 4,
-    glassOffsetUnits: 4,
-    props: true,
-    ground: true,
-    near: camera.near,
-    far: camera.far,
-    shadowBias: sunLight.shadow.bias,
-    shadowNormalBias: sunLight.shadow.normalBias,
-  };
-  const f = gui.addFolder('Pass Isolation');
-  f.add(diag, 'override', { full: 'full', flat: 'flat', normal: 'normal' }).name('override').onChange(applyDiagnostics);
-  f.add(diag, 'freezeGiTick').name('freeze GI tick').onChange(applyDiagnostics);
-  f.add(diag, 'sun').name('sun direct').onChange(applyDiagnostics);
-  f.add(diag, 'shadows').name('sun shadows').onChange(applyDiagnostics);
-  f.add(diag, 'environment').name('environment').onChange(applyDiagnostics);
-  f.add(diag, 'sky').name('sky mesh').onChange(applyDiagnostics);
-  f.add(diag, 'walls').name('wall groups').onChange(applyDiagnostics);
-  f.add(diag, 'glass').name('glass groups').onChange(applyDiagnostics);
-  f.add(diag, 'glassDepthWrite').name('glass depth write').onChange(applyDiagnostics);
-  f.add(diag, 'glassDepthTest').name('glass depth test').onChange(applyDiagnostics);
-  f.add(diag, 'glassPolygonOffset').name('glass offset').onChange(applyDiagnostics);
-  f.add(diag, 'glassOffsetFactor', -16, 16, 1).name('glass offset factor').onChange(applyDiagnostics);
-  f.add(diag, 'glassOffsetUnits', -16, 16, 1).name('glass offset units').onChange(applyDiagnostics);
-  f.add(diag, 'props').name('props').onChange(applyDiagnostics);
-  f.add(diag, 'ground').name('ground').onChange(applyDiagnostics);
-  f.add(diag, 'near', 0.05, 50, 0.05).name('camera near').onChange(applyDiagnostics);
-  f.add(diag, 'far', 200, 20000, 100).name('camera far').onChange(applyDiagnostics);
-  f.add(diag, 'shadowBias', -0.01, 0.01, 0.0001).name('shadow bias').onChange(applyDiagnostics);
-  f.add(diag, 'shadowNormalBias', -2, 2, 0.01).name('shadow normal').onChange(applyDiagnostics);
-  window.speedballDiag = diag;
-  window.applySpeedballDiag = applyDiagnostics;
-}
-loadState();                          // restore last session (camera, time, GI, exposure)
-if (DIAG) applyDiagnostics();
-window.speedballResetView = () => { try { localStorage.removeItem(STORE_KEY); } catch (e) {} location.reload(); };
-
-// ── Probe helper spheres (diagnostic) ──────────────────────────────────────────
-let probeHelperMesh = null, probeHelperSig = '';
-const _pgVec = new THREE.Vector3(), _pgMat = new THREE.Matrix4();
-// Probe spheres show their REAL captured color: each fragment samples the GI field
-// at the sphere surface along its own normal. Falls back to a neutral tint until the
-// atlas is bound.
-function makeProbeHelperMaterial(lit) {
-  if (!lit) return new THREE.MeshBasicMaterial({ color: 0x808080, depthWrite: false, transparent: true, opacity: 0.85, toneMapped: false });
-  const n = gi.node;
-  const P = positionWorld.add(normalWorld.mul(n.normalBiasNode[0]));
-  const mat = new THREE.MeshBasicNodeMaterial({ depthWrite: false, transparent: true, opacity: 0.95 });
-  mat.colorNode = n.sampleIrradiance(P, normalWorld).max(0.0);
-  return mat;
-}
-function updateProbeHelpers() {
-  if (!parameters.showProbes) { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
-  if (!gi || gi.hasData?.() === false || typeof gi.getResolution !== 'function') { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
-  const res = gi.getResolution(); const bounds = gi.getBounds?.();
-  if (!res || !bounds) { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
-  const rx = Math.max(1, Math.round(res.x)), ry = Math.max(1, Math.round(res.y)), rz = Math.max(1, Math.round(res.z));
-  const total = rx * ry * rz;
-  const min = bounds.min, size = _pgVec.subVectors(bounds.max, bounds.min);
-  const lit = gi.node?.active === true;   // atlas bound → can show each probe's real captured color
-  const sig = `${rx},${ry},${rz}|${min.x.toFixed(1)},${min.y.toFixed(1)},${min.z.toFixed(1)}|${size.x.toFixed(1)},${size.y.toFixed(1)},${size.z.toFixed(1)}|${lit ? 1 : 0}`;
-  if (sig === probeHelperSig && probeHelperMesh) { probeHelperMesh.visible = true; return; }
-  probeHelperSig = sig;
-  if (!probeHelperMesh || probeHelperMesh.count !== total || probeHelperMesh._lit !== lit) {
-    if (probeHelperMesh) { scene.remove(probeHelperMesh); probeHelperMesh.geometry.dispose(); probeHelperMesh.material.dispose(); }
-    const cell = Math.max(size.x / Math.max(1, rx - 1), size.y / Math.max(1, ry - 1), size.z / Math.max(1, rz - 1));
-    const geo = new THREE.SphereGeometry(cell * 0.06 + 1e-3, 8, 6);
-    const mat = makeProbeHelperMaterial(lit);
-    probeHelperMesh = new THREE.InstancedMesh(geo, mat, total);
-    probeHelperMesh._lit = lit;
-    probeHelperMesh.frustumCulled = false; probeHelperMesh.renderOrder = 9999;
-    probeHelperMesh.userData.maxjsVisible = false;
-    scene.add(probeHelperMesh);
-  }
-  let idx = 0;
-  for (let k = 0; k < rz; k++) for (let j = 0; j < ry; j++) for (let i = 0; i < rx; i++) {
-    const fx = rx > 1 ? i / (rx - 1) : 0, fy = ry > 1 ? j / (ry - 1) : 0, fz = rz > 1 ? k / (rz - 1) : 0;
-    _pgMat.makeTranslation(min.x + fx * size.x, min.y + fy * size.y, min.z + fz * size.z);
-    probeHelperMesh.setMatrixAt(idx++, _pgMat);
-  }
-  probeHelperMesh.instanceMatrix.needsUpdate = true;
-  probeHelperMesh.visible = true;
-}
-
-// ── Render loop — direct render (no bloom / no AO / no post-FX), only SPEEDBALL GI ───
-const giStatEl = document.getElementById('gi-stat');
-let statMs = 0;
 renderer.setAnimationLoop((nowMs) => {
   timer.update();
-  controls.update(timer.getDelta());
-  if (cameraIsMoving()) { lastInteractionMs = nowMs; scheduleSave(); }
-  if (!diag?.freezeGiTick) gi?.tick({ idleMs: nowMs - lastInteractionMs, playing: false });
-  updateProbeHelpers();
-  renderer.render(scene, camera);
-  if (gi && nowMs - statMs > 250) {
-    statMs = nowMs;
-    const s = gi.getStats?.();
-    giStatEl.textContent = s ? `GI: probes ${s.probes} (${s.res.x}×${s.res.y}×${s.res.z}) · active ${s.active}` : 'GI: building…';
+  const delta = timer.getDelta();
+
+  if (benchmark.running && benchmark.cameraPath) {
+    updateBenchmarkCamera(nowMs);
+  } else {
+    controls.update(delta);
   }
+
+  gi?.update({ camera, playing: benchmark.running && benchmark.cameraPath });
+  if (benchmark.pending && giReadyForBenchmark()) beginBenchmark(nowMs);
+  renderer.render(scene, camera);
+  updateFrameStats(nowMs);
+  updateHud(nowMs);
 });
 </script>
 </body>
