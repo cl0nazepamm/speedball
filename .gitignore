@@ -1,16 +1,15 @@
 .playwright-mcp/
 .codex-*
 
-# Docs / working notes — keep untracked. README.md (placeholder) and the
+# Docs / working notes — keep untracked. README.md, CHANGELOG.md, and the
 # Sponza scene README stay tracked; everything else *.md is ignored.
 *.md
 !README.md
+!CHANGELOG.md
 !Sponza/README.md
 /docs/
 
-node_modules/*
-!node_modules/three-mesh-bvh/
-!node_modules/three-mesh-bvh/**
+node_modules/
 
 *.log
 *.tmp

@@ -20,7 +20,6 @@
     color: #f2f2f2; text-shadow: 0 1px 2px #000, 0 0 2px #000c; }
   #hud .title { font: 800 13px/1.5 Verdana, system-ui, sans-serif; letter-spacing: 0.12em; text-transform: uppercase; }
   #hud .sub { color: #d6d6d6; }
-  #hud #gi-stat { display: inline-block; margin-top: 6px; color: #9fd2ff; }
 
   /* ── status / loading overlay ───────────────────────────────────────────── */
   #status { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
@@ -51,14 +50,15 @@
 <script type="importmap">
 {
   "imports": {
-    "three": "./vendor/three-r185/build/three.webgpu.js",
-    "three/webgpu": "./vendor/three-r185/build/three.webgpu.js",
-    "three/tsl": "./vendor/three-r185/build/three.tsl.js",
-    "three/addons/": "./vendor/three-r185/examples/",
-    "three-mesh-bvh": "./node_modules/three-mesh-bvh/src/index.js"
+    "three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
+    "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
+    "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.tsl.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.0/examples/jsm/",
+    "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.8.3/build/index.module.js",
+    "powershot-threejs": "https://cdn.jsdelivr.net/npm/powershot-threejs@0.3.1/src/index.js"
   },
   "scopes": {
-    "./node_modules/three-mesh-bvh/": { "three": "./vendor/three-r185/build/three.module.js" }
+    "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.8.3/": { "three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.module.js" }
   }
 }
 </script>
@@ -67,10 +67,7 @@
 <canvas id="c"></canvas>
 <div id="hud">
   <div class="title">SPEEDBALL GI</div>
-  <span class="sub">BVH-traced DDGI · WebGPU</span><br>
-  <span class="sub">drag to orbit · scroll to zoom · sun = azimuth/elevation</span><br>
-  <span class="sub" id="gi-stat">GI: starting…</span><br>
-  <span class="sub" id="bench-stat" style="color:#ffd27a"></span>
+  <span class="sub">drag to orbit · scroll to zoom · sun = azimuth/elevation</span>
 </div>
 <div id="status">initializing WebGPU…</div>
 
@@ -81,7 +78,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
 import { positionWorld, normalWorld, pass, renderOutput } from 'three/tsl';
-import { FilmPipeline, FILM_PRESETS, FILM_PRESET_KEYS, applyFilmPreset, filmPass } from './vendor/powershot/index.js';
+import { FilmPipeline, FILM_PRESETS, FILM_PRESET_KEYS, applyFilmPreset, filmPass } from 'powershot-threejs';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { createBenchmark } from './js/bench.js';
 import { loadGiSettings, saveGiSettings, applyGiSettings, addGiPanel } from './js/gi_settings.js';
@@ -434,9 +431,6 @@ function updateProbeHelpers() {
   probeHelperMesh.visible = true;
 }
 
-const giStatEl = document.getElementById('gi-stat');
-const benchStatEl = document.getElementById('bench-stat');
-let statMs = 0;
 renderer.setAnimationLoop((nowMs) => {
   bench.frame(nowMs);   // record this frame's time FIRST (captures the rebuild hitch below)
   controls.update();
@@ -447,17 +441,6 @@ renderer.setAnimationLoop((nowMs) => {
   updateProbeHelpers();
   if (params.filmEnabled) post.render();          // PowerShot film post-chain
   else renderer.render(scene, camera);
-  if (gi && nowMs - statMs > 250) {
-    statMs = nowMs;
-    const s = gi.getStats?.();
-    giStatEl.textContent = s
-      ? `GI: probes ${s.probes} (${s.res.x}×${s.res.y}×${s.res.z}) · active ${s.active}`
-      : 'GI: building…';
-    const b = bench.getStats();
-    benchStatEl.textContent = b.running
-      ? `BENCH ${b.lastToggleKind} · cyc ${b.cycles} · rebuild-hitch ${b.rebuildHitchMs.toFixed(0)}ms · max ${b.maxMs.toFixed(0)}ms · >${b.hitchThresholdMs}ms×${b.hitchCount} · ${b.fps.toFixed(0)}fps`
-      : '';
-  }
 });
 </script>
 </body>
