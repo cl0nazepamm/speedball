@@ -3,7 +3,7 @@
 BVH-traced **dynamic diffuse global illumination** (DDGI) for
 [three.js](https://threejs.org/) WebGPU.
 
-Best for medium scale scenes.
+Best for medium scale scenes. It is prone to leaking but it is continuous and can be used in timelapse/day night cycle scenarios.
 
 ## Launch live Sponza demo
 
