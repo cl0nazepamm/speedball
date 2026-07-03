@@ -10,6 +10,8 @@
   "exports": {
     ".": "./js/index.js",
     "./install": "./js/install.js",
+    "./spectral-scene": "./js/spectral_scene.js",
+    "./spectral-traverse": "./js/spectral_traverse.js",
     "./package.json": "./package.json"
   },
   "scripts": {
@@ -51,6 +53,6 @@
   ],
   "peerDependencies": {
     "three": ">=0.185.0",
-    "three-mesh-bvh": ">=0.7.0"
+    "three-mesh-bvh": ">=0.7.0 <0.9.0"
   }
 }

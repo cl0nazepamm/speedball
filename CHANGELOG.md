@@ -3,6 +3,21 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- Added a NIR (near-infrared) spectral layer to the shared scene modules:
+  `spectral_scene.js` now emits a photocathode-facing `nirAlbedo` field
+  (material slot [25], MAT_STRIDE unchanged at 28) and per-light emitter
+  classes (light slot [16]), bumping `LIGHT_STRIDE` from 16 to 17. These
+  fields are inert for GI and exist for the night-vision render mode of
+  downstream consumers (e.g. the maxjs spectral path tracer).
+- New `speedball-gi/spectral-scene` and `speedball-gi/spectral-traverse`
+  subpath exports so consumers can import the scene foundation directly
+  instead of copying files.
+- Capped the `three-mesh-bvh` peerDependency range to `>=0.7.0 <0.9.0` — the
+  stackless-BVH flattener reads MeshBVH's internal `_roots` byte layout,
+  which changed in 0.9.x.
+
 ## [0.2.0] — 2026-07-03
 
 - Hysteresis is now frame-rate normalized over the real per-probe update
