@@ -27,9 +27,12 @@ const NODE_STRIDE_U32 = 8;     // bvhNodes: 6 aabb floats + miss + payload
 //   [15] metalness-map layer · [16] emissive-map layer   (all −1 = none)
 //   [17] normalScale · [18..19] uv repeat xy · [20..21] uv offset xy
 //   [22] side (0 front, 1 back, 2 double) · [23] alphaTest
-//   [24] alpha-map layer · [25..27] pad
+//   [24] alpha-map layer
+//   [25] nirAlbedo: −1 = untagged (kernel uses JH extrapolation as prior),
+//        else authored [0,1] NIR reflectance (userData.nirAlbedo wins over
+//        the classifyNir heuristics) · [26..27] pad
 const MAT_STRIDE = 28;
-const LIGHT_STRIDE = 16;        // lights: see layout below
+const LIGHT_STRIDE = 17;        // lights: see layout below
 const VERT_STRIDE = 3;          // vertexPos: tightly packed xyz (flat f32 storage, read by offset; also fed to MeshBVH which assumes stride 3)
 const VERTEX_DATA_STRIDE = 8;   // GPU interleaved per-vertex: pos(3) + normal(3) + uv(2)
 const BYTES_PER_BVH_NODE = 32;  // three-mesh-bvh BYTES_PER_NODE (8 x u32)
@@ -149,6 +152,33 @@ function emissiveScaled(material, out) {
     return out;
 }
 
+// ── NIR albedo authoring ───────────────────────────────────────────
+// RGB carries zero information about NIR (metamerism): two identical greens
+// can differ 10× at 850 nm (chlorophyll red edge vs green paint). Truth is
+// injected as DATA — one scalar NIR reflectance per material — with cheap
+// name/colour heuristics providing defaults for the big classes. −1 leaves
+// the material on the JH-extrapolation prior. Colour inputs are LINEAR.
+export function classifyNir(name, r, g, b, roughness, metalness, transmission) {
+    const n = String(name || '');
+    const maxc = Math.max(r, g, b);
+    const minc = Math.min(r, g, b);
+    const sat = maxc > 1e-6 ? (maxc - minc) / maxc : 0;
+    // chlorophyll red edge: foliage is DARK green visibly, ~0.5 in NIR
+    if (/leaf|foliage|grass|tree|plant|veg/i.test(n)) return 0.55;
+    if (g > 1.15 * Math.max(r, b) && roughness > 0.5 && metalness < 0.2) return 0.55;
+    // water absorbs strongly past ~750 nm → near-black through a tube
+    if (/water|ocean|pool/i.test(n)) return 0.04;
+    if (transmission > 0.5 && b > r) return 0.04;
+    // asphalt / very dark low-saturation dielectric
+    if (/asphalt|tarmac|road/i.test(n)) return 0.06;
+    if (maxc < 0.08 && sat < 0.15 && metalness < 0.2 && transmission < 0.5) return 0.06;
+    // skin: waxy NIR lift (sub-surface scattering)
+    const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if (r > g && g > b && b > 1e-6 && r / b >= 1.3 && r / b <= 2.5
+        && lum > 0.12 && lum < 0.7 && metalness < 0.2) return 0.62;
+    return -1; // untagged → JH extrapolation prior
+}
+
 function materialToUber(material) {
     const color = material.color;
     let r = color?.isColor ? color.r : 1;
@@ -205,6 +235,17 @@ function materialToUber(material) {
         ? Math.min(2, Math.max(0, material.side | 0))
         : 0;
 
+    // NIR reflectance (slot [25]): explicit userData.nirAlbedo wins, else the
+    // name/colour classifier, else −1 (JH prior). Clamped roughness/metalness
+    // values match what the classifier expects.
+    const udNir = material.userData?.nirAlbedo;
+    const roughnessC = Math.min(1, Math.max(0.02, roughness));
+    const metalnessC = Math.min(1, Math.max(0, metalness));
+    const transmissionC = Math.min(1, Math.max(0, transmission));
+    const nirAlbedo = Number.isFinite(udNir)
+        ? Math.min(1, Math.max(0, udNir))
+        : classifyNir(material.name, r, g, b, roughnessC, metalnessC, transmissionC);
+
     return [r, g, b,
         Math.min(1, Math.max(0.02, roughness)),
         Math.min(1, Math.max(0, metalness)),
@@ -219,7 +260,8 @@ function materialToUber(material) {
         side,
         Math.min(1, Math.max(0, alphaTest)),
         -1,                     // [24] alpha-map layer, filled by buildMaterialTextures
-        0, 0, 0];               // [25..27] pad
+        nirAlbedo,              // [25] NIR reflectance (−1 = JH prior)
+        0, 0];                  // [26..27] pad
 }
 
 const texUuid = (t) => (t && t.isTexture ? t.uuid : '-');
@@ -420,9 +462,35 @@ function flattenBVHRoot(rootBuffer) {
 }
 
 // ── Light extraction ───────────────────────────────────────────────
-// Layout (stride 16 floats): [0] type(0 dir/1 point/2 spot/3 rect),
+// Layout (stride 17 floats): [0] type(0 dir/1 point/2 spot/3 rect),
 // [1..3] worldPos, [4..6] worldDir (toward target), [7..9] color*intensity,
-// [10] range, [11] decay, [12] cosAngle, [13] cosPenumbra, [14] w, [15] h.
+// [10] range, [11] decay, [12] cosAngle, [13] cosPenumbra, [14] w, [15] h,
+// [16] emitter class (packed): 0 untagged (JH emission), 2 LED,
+//      3 sodium (LPS 589 nm), 4 IR illuminator (850 nm band); any value
+//      ≥ 500 = incandescent/halogen with that colour temperature in Kelvin
+//      (class 1 + userData.colorTemp ?? 2856 collapse to this at pack time).
+// Source: light.userData.emitterClass — string ('incandescent', 'halogen',
+// 'led', 'sodium', 'ir') or number 0..4. Untagged lights keep today's
+// JH-emission behaviour exactly.
+
+function emitterClassValue(obj) {
+    const raw = obj.userData?.emitterClass;
+    let cls = 0;
+    if (typeof raw === 'string') {
+        const s = raw.trim().toLowerCase();
+        if (s.startsWith('incan') || s === 'halogen' || s === 'tungsten') cls = 1;
+        else if (s === 'led') cls = 2;
+        else if (s.startsWith('sodium') || s === 'lps') cls = 3;
+        else if (s === 'ir' || s.startsWith('ir_') || s.startsWith('ir ') || s.includes('illuminator')) cls = 4;
+    } else if (Number.isFinite(raw)) {
+        cls = Math.min(4, Math.max(0, Math.trunc(raw)));
+    }
+    if (cls === 1) {
+        const t = Number.isFinite(obj.userData?.colorTemp) ? obj.userData.colorTemp : 2856;
+        return Math.min(20000, Math.max(500, t));
+    }
+    return cls;
+}
 
 export function collectLights(THREE, scene, camera = null) {
     const out = [];
@@ -437,10 +505,18 @@ export function collectLights(THREE, scene, camera = null) {
         obj.getWorldPosition(pos);
         const c = obj.color, k = Number.isFinite(obj.intensity) ? obj.intensity : 1;
         if (k <= 0) return;
-        const cr = (c?.isColor ? c.r : 1) * k;
-        const cg = (c?.isColor ? c.g : 1) * k;
-        const cb = (c?.isColor ? c.b : 1) * k;
-        if (cr <= 0 && cg <= 0 && cb <= 0) return;
+        const eclass = emitterClassValue(obj);
+        let cr = (c?.isColor ? c.r : 1) * k;
+        let cg = (c?.isColor ? c.g : 1) * k;
+        let cb = (c?.isColor ? c.b : 1) * k;
+        if (cr <= 0 && cg <= 0 && cb <= 0) {
+            // An IR illuminator is legitimately BLACK in RGB — intensity alone
+            // drives its 850 nm band (and it stays invisible in visible mode
+            // because the band is far outside the sampled domain). Everything
+            // else with a black colour genuinely emits nothing.
+            if (eclass !== 4) return;
+            cr = cg = cb = k;
+        }
         let type = 1, range = 0, decay = 2, cosAngle = -1, cosPen = -1, w = 0, h = 0;
         dir.set(0, 0, -1);
         if (obj.isDirectionalLight || obj.isSpotLight) {
@@ -467,7 +543,7 @@ export function collectLights(THREE, scene, camera = null) {
         } else {
             return;
         }
-        out.push([type, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z, cr, cg, cb, range, decay, cosAngle, cosPen, w, h]);
+        out.push([type, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z, cr, cg, cb, range, decay, cosAngle, cosPen, w, h, eclass]);
     });
     return out;
 }

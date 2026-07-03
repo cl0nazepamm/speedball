@@ -18,7 +18,7 @@ const {
     Loop, If, Break, texture, texture3D,
     int, uint, vec2, vec3,
     uintBitsToFloat, equirectUV,
-    select, max, min, abs, sqrt, sin, cos, exp, pow,
+    select, max, min, abs, sqrt, sin, cos, exp, pow, smoothstep,
     dot, cross, normalize, reflect, mix, clamp, float,
 } = TSL;
 
@@ -26,8 +26,73 @@ export const PI = 3.141592653589793;
 export const LAMBDA_MIN = 380.0;
 export const LAMBDA_MAX = 720.0;
 export const LAMBDA_RANGE = LAMBDA_MAX - LAMBDA_MIN;
+// NV-mode λ domain: photocathode-weighted sampling over the GaAs response
+// window. The JH coefficient normalization stays anchored to the VISIBLE
+// range the LUT was fitted over (see jhEval); only the sampling domain moves.
+export const NV_LAMBDA_MIN = 550.0;
+export const NV_LAMBDA_MAX = 900.0;
 export const T_MAX = 1e30;
 export const RAY_EPS = 1e-3;
+
+// ── Gen-3 GaAs photocathode response S(λ) ──────────────────────────
+// Analytic fit (measured curves are out of scope): a window rising from
+// ~550 nm, broad peak around 780–830 nm, steep cutoff to ~900 nm. The CPU fit
+// and the TSL emitter below MUST stay in exact sync — the CPU side builds the
+// λ inverse-CDF and the ∫S(λ)dλ normalization the kernel divides by.
+function smoothstepJS(e0, e1, x) {
+    const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
+    return t * t * (3 - 2 * t);
+}
+
+export function photocathodeResponseJS(l) {
+    const rise = smoothstepJS(540, 620, l);
+    const cut = 1 - smoothstepJS(860, 900, l);
+    const peakShape = 0.75 + 0.25 * Math.exp(-(((l - 805) / 70) ** 2));
+    return rise * cut * peakShape;
+}
+
+// TSL emitter — same fit as photocathodeResponseJS.
+export function photocathodeS(lambda) {
+    const rise = smoothstep(float(540.0), float(620.0), lambda);
+    const cut = float(1.0).sub(smoothstep(float(860.0), float(900.0), lambda));
+    const dn = lambda.sub(805.0).div(70.0);
+    const peakShape = float(0.75).add(exp(dn.mul(dn).mul(-1.0)).mul(0.25));
+    return rise.mul(cut).mul(peakShape);
+}
+
+// Precompute the NV λ sampler: a small inverse-CDF LUT mapping u∈[0,1) → λ
+// (64 entries, linear interp — plenty for a curve this smooth), plus the
+// response integral ∫S(λ)dλ over the domain. pdf(λ) = S(λ)/integral.
+export function buildPhotocathodeSampler(entries = 64, lambdaMin = NV_LAMBDA_MIN, lambdaMax = NV_LAMBDA_MAX) {
+    const STEPS = 2048;
+    const dl = (lambdaMax - lambdaMin) / STEPS;
+    const cdf = new Float64Array(STEPS + 1);
+    for (let i = 0; i < STEPS; i++) {
+        const l = lambdaMin + (i + 0.5) * dl;
+        cdf[i + 1] = cdf[i] + photocathodeResponseJS(l) * dl;
+    }
+    const integral = cdf[STEPS];
+    const lut = new Float32Array(entries);
+    let cursor = 0;
+    for (let e = 0; e < entries; e++) {
+        const target = (e / (entries - 1)) * integral;
+        while (cursor < STEPS && cdf[cursor + 1] < target) cursor++;
+        const c0 = cdf[cursor];
+        const c1 = cdf[Math.min(cursor + 1, STEPS)];
+        const f = c1 > c0 ? (target - c0) / (c1 - c0) : 0;
+        lut[e] = lambdaMin + (cursor + f) * dl;
+    }
+    lut[entries - 1] = lambdaMax;
+    return { lut, integral };
+}
+
+// LPS sodium: one 589 nm line, σ ≈ 4 nm. The gaussian's amplitude is chosen so
+// the line conserves the light's Y (what jhEmission's smooth spectrum would
+// integrate to): A = Y · CIE_Y_INTEGRAL / (√(2π)·σ·ȳ(589)). Precomputed:
+// 106.936 / (10.027 · 0.7746) ≈ 13.77.
+const SODIUM_Y_SCALE = 13.77;
+const SODIUM_SIGMA = 4.0;
+const IR_ILLUM_SIGMA = 15.0;
 
 // Linear RGB → scalar reflectance at λ via a smooth 3-bin spectrum
 // (blue→green→red). Cheap and good enough for averaged color.
@@ -144,19 +209,73 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
         return select(isB, c2, select(isG, c1, c0));
     };
     const jhEval = (c, lambda) => {
-        const Ln = clamp(lambda.sub(LAMBDA_MIN).div(LAMBDA_RANGE), 0.0, 1.0);
+        // Ln normalization stays anchored to the VISIBLE range the LUT was
+        // fitted over, but is NOT clamped above 1: past 720 nm the
+        // sigmoid-quadratic extrapolates smoothly into NIR (the old clamp
+        // froze the spectrum at its red-edge value). The sigmoid is in [0,1]
+        // by construction; the outer clamp is only an fp guard.
+        const Ln = max(lambda.sub(LAMBDA_MIN).div(LAMBDA_RANGE), 0.0);
         const x = c.x.mul(Ln).add(c.y).mul(Ln).add(c.z);
-        return float(0.5).add(x.mul(0.5).div(sqrt(x.mul(x).add(1.0))));
+        return clamp(float(0.5).add(x.mul(0.5).div(sqrt(x.mul(x).add(1.0)))), 0.0, 1.0);
     };
-    const jhReflectance = haveLut
+    const jhReflectanceBase = haveLut
         ? (rgb, lambda) => jhEval(jhCoeffs(clamp(rgb, 0.0, 1.0)), lambda)
         : (rgb, lambda) => rgbToSpectral(rgb, lambda);
+    // nirAlbedo (material slot [25]): −1 = untagged → JH extrapolation is the
+    // default PRIOR; ≥0 = authored NIR reflectance, blended in across the red
+    // edge. RGB carries zero information about NIR (metamerism) — foliage
+    // red-edge, water absorption etc. are injected as data, never inferred.
+    const jhReflectance = (rgb, lambda, nirAlbedo = null) => {
+        const base = jhReflectanceBase(rgb, lambda);
+        if (!nirAlbedo) return base;
+        const blend = smoothstep(float(700.0), float(740.0), lambda);
+        return select(
+            nirAlbedo.lessThan(float(0.0)),
+            base,
+            mix(base, clamp(nirAlbedo, 0.0, 1.0), blend),
+        );
+    };
     const jhEmission = haveLut
         ? (rgb, lambda) => {
             const m = max(max(rgb.x, rgb.y), rgb.z);
-            return jhReflectance(rgb.div(max(m, float(1e-6))), lambda).mul(m);
+            return jhReflectanceBase(rgb.div(max(m, float(1e-6))), lambda).mul(m);
         }
         : (rgb, lambda) => rgbToSpectral(rgb, lambda);
+
+    // Light emission at λ for a tagged emitter class (lights buffer slot [16]).
+    // Packed encoding (see spectral_scene.js collectLights): 0 = untagged
+    // (JH prior), 2 = LED, 3 = sodium (LPS), 4 = IR illuminator; any value
+    // ≥ 500 = incandescent/halogen with that colour temperature in Kelvin.
+    // Env emission stays JH (envAtLambda is untouched).
+    const emitterAtLambda = (rgb, lambda, eclass) => {
+        const base = jhEmission(rgb, lambda);
+        const lum = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        // incandescent: RGB-derived intensity scaled by the Planck ratio
+        // B(λ,T)/B(560,T) — the NIR tail that dominates through a tube.
+        const T = max(eclass, float(500.0));
+        const c2 = float(1.4388e7); // second radiation constant, nm·K
+        const planckRatio = pow(float(560.0).div(lambda), float(5.0))
+            .mul(exp(c2.div(T.mul(560.0))).sub(1.0))
+            .div(max(exp(c2.div(T.mul(lambda))).sub(1.0), float(1e-6)));
+        const incandescent = lum.mul(planckRatio);
+        // LED: phosphor-white spectrum dies past ~700 nm (no NIR tail).
+        const led = base.mul(float(1.0).sub(smoothstep(float(690.0), float(725.0), lambda)));
+        // sodium: single 589 nm line, Y-conserving amplitude (constant is
+        // precomputed CPU-side, see SODIUM_Y_SCALE).
+        const dn = lambda.sub(589.0).div(SODIUM_SIGMA);
+        const sodium = lum.mul(SODIUM_Y_SCALE).mul(exp(dn.mul(dn).mul(-0.5)));
+        // IR illuminator: 850 nm band; its RGB is meaningless, so the light's
+        // intensity (max channel) sets the band's PEAK spectral radiance.
+        // Contributes ~nothing in visible mode — correct and expected.
+        const di = lambda.sub(850.0).div(IR_ILLUM_SIGMA);
+        const ir = max(max(rgb.x, rgb.y), rgb.z).mul(exp(di.mul(di).mul(-0.5)));
+        const isLed = abs(eclass.sub(float(2.0))).lessThan(float(0.25));
+        const isNa = abs(eclass.sub(float(3.0))).lessThan(float(0.25));
+        const isIr = abs(eclass.sub(float(4.0))).lessThan(float(0.25));
+        const isInc = eclass.greaterThanEqual(float(500.0));
+        return select(isInc, incandescent,
+            select(isIr, ir, select(isNa, sodium, select(isLed, led, base))));
+    };
 
     // env radiance at λ for a world direction (or sky fallback)
     const envAtLambda = (dir, lambda) => {
@@ -323,7 +442,7 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
     return {
         fetchVert, fetchNorm, fetchUV, hitUV, triVert, matFloat,
         srgbToLinear, sampleLayer,
-        jhReflectance, jhEmission, envAtLambda, cosineSample,
+        jhReflectance, jhEmission, emitterAtLambda, envAtLambda, cosineSample,
         traverseClosest, traverseAny,
         haveAlbedoMap, haveNormalMap, haveRoughMap, haveMetalMap, haveEmissiveMap, haveAlphaMap,
         albedoTex, normalTex, roughTex, metalTex, emissiveTex, alphaTex,

@@ -1014,7 +1014,9 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
 
                 // NEE over ALL lights (count small; loop avoids sampling noise).
                 Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
-                    const lb = li.mul(uint(16)).toVar();
+                    // stride matches spectral_scene LIGHT_STRIDE (17: [16] is
+                    // the emitter class, unused here — probes are RGB-domain)
+                    const lb = li.mul(uint(17)).toVar();
                     const ltype = lights.element(lb);
                     const lpos = loadLightVec3(lb, 1);
                     const ldir = loadLightVec3(lb, 4);
