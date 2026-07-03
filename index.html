@@ -13,7 +13,7 @@
   :root { --mono: 'JetBrains Mono', ui-monospace, "Cascadia Code", Menlo, monospace; }
   html, body { margin: 0; height: 100%; overflow: hidden; background: #9a9a9a; color: #111;
     font: 12px/1.5 var(--mono); }
-  #c { display: block; width: 100vw; height: 100vh; }
+  #c { display: block; width: 100vw; height: 100vh; touch-action: none; }
 
   /* ── HUD: clean text overlay (no panel) ─────────────────────────────────── */
   #hud { position: fixed; left: 14px; top: 12px; pointer-events: none; max-width: 46ch; z-index: 10;
@@ -46,6 +46,23 @@
     font: 800 11px/1 Verdana, system-ui, sans-serif; letter-spacing: 0.10em; text-transform: uppercase; }
   .lil-gui .children { background: transparent; }
   .lil-gui .title { text-shadow: 1px 1px 0 rgba(255,255,255,0.45); }
+
+  @media (max-width: 700px), (max-height: 560px) {
+    #hud { left: 10px; top: max(8px, env(safe-area-inset-top)); max-width: calc(100vw - 20px); }
+    #hud .title { font-size: 11px; letter-spacing: 0.08em; }
+    #hud .sub { display: none; }
+    #status { width: min(320px, calc(100vw - 32px)); box-sizing: border-box; white-space: pre-wrap; }
+    .lil-gui { --width: calc(100vw - 16px); --font-size: 12px; --widget-height: 26px; }
+    .lil-gui.root {
+      position: fixed !important;
+      left: 8px !important; right: 8px !important; top: auto !important;
+      bottom: calc(8px + env(safe-area-inset-bottom, 0px)) !important;
+      width: auto !important; max-height: min(34vh, 360px); overflow-y: auto;
+      overscroll-behavior: contain; touch-action: pan-y;
+    }
+    .lil-gui.root.closed { max-height: 32px; overflow: hidden; }
+    .lil-gui.root > .title { min-height: 28px; }
+  }
 </style>
 <script type="importmap">
 {
@@ -223,6 +240,7 @@ window.addEventListener('resize', () => {
 });
 
 const gui = new GUI({ title: 'SPEEDBALL GI · Sky' });
+const compactControls = window.matchMedia('(max-width: 700px), (max-height: 560px)');
 const fSky = gui.addFolder('Sky / Sun');
 fSky.add(params, 'azimuth', 0, 360, 1).name('azimuth°').onChange(updateSun);
 fSky.add(params, 'elevation', -3, 88, 0.5).name('elevation°').onChange(updateSun);
@@ -354,6 +372,7 @@ filmCtrls.push(fGate.add(params, 'filmWeave', 0, 3, 0.01).name('gate weave').onC
 filmCtrls.push(fGate.add(params, 'filmFlicker', 0, 1, 0.01).name('flicker').onChange((v) => { P.flicker.value = v; }));
 fGate.add(params, 'filmPrintExposure', -1, 1, 0.01).name('print exposure').onChange((v) => { P.printExposure.value = v; });
 fGate.add(params, 'filmPrintWarmth', -1, 1, 0.01).name('print warmth').onChange((v) => { P.printWarmth.value = v; });
+if (compactControls.matches) gui.close();
 
 // ── Load Sponza ────────────────────────────────────────────────────────────────
 setStatus('loading Sponza…');
