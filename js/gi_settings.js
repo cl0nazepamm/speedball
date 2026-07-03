@@ -51,6 +51,11 @@ export function saveGiSettings(params) {
 // pages at once. onInteract = the page's markInteraction; onStructure fires for
 // knobs that re-place probes so pages can refresh their probe helpers.
 export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure = () => {} } = {}) {
+    // Demos may opt out of loadGiSettings() so hosted pages always start clean.
+    // Fill any missing GI key here before lil-gui touches it; undefined values can
+    // make add(...).name(...) explode on optional controls like sky/normal detail.
+    for (const k of GI_KEYS) if (!(k in params)) params[k] = GI_DEFAULTS[k];
+
     const fGI = gui.addFolder('SPEEDBALL GI');
     fGI.add(params, 'giEnabled').name('enabled').onChange((v) => { gi.setEnabled(v); onInteract(); });
     fGI.add(params, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => { gi.setIntensity(v); onInteract(); }); // uncapped
@@ -83,22 +88,23 @@ export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure
 
 // Push every shared setting into a probe field via its live setters.
 export function applyGiSettings(gi, s) {
-    gi.setEnabled(s.giEnabled);
-    gi.setIntensity(s.giIntensity);
-    gi.setDivisions(s.giDivisions);
-    gi.setRays(s.giRays);
-    gi.setCascades(s.giCascades);
-    gi.setContinuous(s.giContinuous);
-    gi.setHysteresis(s.giHysteresis);
-    gi.setHysteresisNormalization?.(s.giHysteresisNormalize);
-    gi.setNormalBias(s.giNormalBias);
-    gi.setRadianceClamp(s.giRadianceClamp);
-    gi.setDepthSharpness(s.giDepthSharpness);
-    gi.setChebyStrength(s.giLeak);
-    gi.setClassifyStrength(s.giSolid);
-    gi.setSkyIntensity?.(s.giSky);
-    gi.setNormalDetail?.(s.giNormalDetail);
-    gi.setChangeThreshold(s.giChangeThreshold);
-    gi.setSnapAmount(s.giSnapAmount);
-    gi.setFireflyClamp(s.giFireflyClamp);
+    const cfg = { ...GI_DEFAULTS, ...s };
+    gi.setEnabled(cfg.giEnabled);
+    gi.setIntensity(cfg.giIntensity);
+    gi.setDivisions(cfg.giDivisions);
+    gi.setRays(cfg.giRays);
+    gi.setCascades(cfg.giCascades);
+    gi.setContinuous(cfg.giContinuous);
+    gi.setHysteresis(cfg.giHysteresis);
+    gi.setHysteresisNormalization?.(cfg.giHysteresisNormalize);
+    gi.setNormalBias(cfg.giNormalBias);
+    gi.setRadianceClamp(cfg.giRadianceClamp);
+    gi.setDepthSharpness(cfg.giDepthSharpness);
+    gi.setChebyStrength(cfg.giLeak);
+    gi.setClassifyStrength(cfg.giSolid);
+    gi.setSkyIntensity?.(cfg.giSky);
+    gi.setNormalDetail?.(cfg.giNormalDetail);
+    gi.setChangeThreshold(cfg.giChangeThreshold);
+    gi.setSnapAmount(cfg.giSnapAmount);
+    gi.setFireflyClamp(cfg.giFireflyClamp);
 }
