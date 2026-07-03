@@ -299,9 +299,15 @@ export class GiProbeNode extends LightingNode {
     // boundary, so any camera-dependent wobble there flickers like z-fighting.
     // Ndir (detailed shading normal) drives ONLY the fetch direction — irradiance
     // is cosine-convolved + bilinear over the oct tile, so wobble there stays smooth.
+    // dualDetail: fetch the atlas at BOTH directions per tap and blend the fetched
+    // irradiance by detailStrength. Strength in the ANGLE domain saturates perceptually
+    // almost immediately (the detail pattern is fully visible after a few degrees of
+    // steering on a 6×6 oct tile), so the knob felt like a toggle; blending the
+    // IRRADIANCE is linear in the visible contrast by construction — 0.5 really is
+    // half the detail. Emitted only for trusted materials (8 extra small-texture taps).
     // Sample ONE cascade c (0=coarse, 1=fine) — the original 8-tap trilinear gather,
     // parameterized per cascade. PURE-EXPRESSION (no toVar/addAssign): fragment colorNode.
-    _sampleCascade(P, Nvis, Ndir, c) {
+    _sampleCascade(P, Nvis, Ndir, c, dualDetail = false) {
         const atlas = this._atlas[c];
         const depthAtlas = this._depthAtlas[c];
         const res = this.resNode[c];
@@ -312,6 +318,7 @@ export class GiProbeNode extends LightingNode {
         const frac = gridF.sub(baseF).clamp(0.0, 1.0);
         const Nn = Nvis.normalize();
         const octN = octEncodeNode(Ndir.normalize(), TSL); // irradiance dir = detailed shading normal
+        const octNs = dualDetail ? octEncodeNode(Nn, TSL) : null; // smooth dir, for the detail-strength blend
 
         // PURE-EXPRESSION accumulation (NO toVar/addAssign): this runs inside a
         // fragment material colorNode (not an Fn-wrapped compute kernel), where
@@ -370,7 +377,8 @@ export class GiProbeNode extends LightingNode {
 
             const stateEff = mix(float(1.0), stateV, this.classifyStrengthNode);
             const w = wTri.mul(wrapW).mul(visW).mul(stateEff);
-            const e = texture(atlas, this._tileUV(col, row, octN, c)).xyz;
+            const eD = texture(atlas, this._tileUV(col, row, octN, c)).xyz;
+            const e = dualDetail ? mix(texture(atlas, this._tileUV(col, row, octNs, c)).xyz, eD, this.detailStrengthNode) : eD;
             acc = acc.add(e.mul(w));
             wsum = wsum.add(w);
         }
@@ -386,8 +394,8 @@ export class GiProbeNode extends LightingNode {
     // includes every cascade-count change). So the E1 (fine) 8-tap subtree is emitted ONLY
     // when the fine cascade is actually bound at setup() time — otherwise the shader is the
     // exact original 8-tap single grid (byte-identical) and never touches _atlas[1]=null.
-    sampleIrradiance(P, Nvis, Ndir) {
-        const E0 = this._sampleCascade(P, Nvis, Ndir, 0); // coarse: valid over full bounds, ALWAYS
+    sampleIrradiance(P, Nvis, Ndir, dualDetail = false) {
+        const E0 = this._sampleCascade(P, Nvis, Ndir, 0, dualDetail); // coarse: valid over full bounds, ALWAYS
         const useFine = Math.round(this.cascadeCountNode.value) >= 2 && !!this._atlas[1] && !!this._depthAtlas[1] && !!this._stateAtlas[1];
         if (!useFine) return E0;                 // single-grid fallback — byte-identical to today
         // Fine inside-test in normalized C1 coords.
@@ -399,7 +407,7 @@ export class GiProbeNode extends LightingNode {
         const wIn = clamp(edge.div(inBand.max(float(1e-4))), float(0.0), float(1.0)); // 1 deep inside, ramps to 0 at the border, 0 outside
         const gate = this.cascadeCountNode.sub(1.0).clamp(float(0.0), float(1.0)); // 0 when cascades==1, 1 when 2 (live extra guard)
         const wFine = wIn.mul(gate);
-        const E1 = this._sampleCascade(P, Nvis, Ndir, 1);
+        const E1 = this._sampleCascade(P, Nvis, Ndir, 1, dualDetail);
         return mix(E0, E1, wFine);
     }
 
@@ -431,12 +439,14 @@ export class GiProbeNode extends LightingNode {
         const material = builder.material;
         const stableTBN = builder.geometry?.hasAttribute?.('tangent') === true
             && !!material?.normalMap && !material.normalNode && material.flatShading !== true;
-        // detailStrength softens how hard the normal map steers the GI fetch (taste
-        // knob, NOT a flicker tradeoff: on trusted materials both mix inputs are
-        // camera-invariant, so every blend value is equally stable).
-        const detailNormal = stableTBN ? normalize(mix(stableNormal, viewDerivedNormal, this.detailStrengthNode)) : stableNormal;
+        // detailStrength (taste knob, NOT a flicker tradeoff — both fetch directions
+        // are camera-invariant on trusted materials) blends the FETCHED IRRADIANCE
+        // inside _sampleCascade, not the direction: angle-domain strength saturates
+        // perceptually within a few degrees (reads as a toggle), irradiance-domain
+        // strength is linear in the visible contrast.
+        const detailNormal = stableTBN ? viewDerivedNormal : stableNormal;
         const P = positionWorld.mul(this.samplePositionScaleNode).add(stableNormal.mul(this.normalBiasNode[0]).mul(this.sampleBiasScaleNode));
-        const E = this.sampleIrradiance(P, stableNormal, detailNormal).max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
+        const E = this.sampleIrradiance(P, stableNormal, detailNormal, stableTBN).max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
         builder.context.irradiance.addAssign(E);
     }
 }
