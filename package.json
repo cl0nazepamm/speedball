@@ -24,7 +24,14 @@
     "url": "https://github.com/cl0nazepamm/speedball/issues"
   },
   "files": [
-    "js",
+    "js/gi_irradiance_volume.js",
+    "js/gi_lights_node.js",
+    "js/gi_oct.js",
+    "js/gi_probes.js",
+    "js/index.js",
+    "js/install.js",
+    "js/spectral_scene.js",
+    "js/spectral_traverse.js",
     "LICENSE",
     "README.md"
   ],
