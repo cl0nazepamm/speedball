@@ -1,6 +1,6 @@
 {
   "name": "speedball-gi",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Real-time BVH-traced dynamic diffuse global illumination (DDGI) for three.js WebGPU — octahedral irradiance probes, infinite bounce, idle-gated, one-call setup.",
   "type": "module",
   "license": "MIT",

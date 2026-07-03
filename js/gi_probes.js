@@ -21,7 +21,7 @@
 import * as THREE from 'three';
 import { LightingNode } from 'three/webgpu';
 import {
-    Fn, If, Loop, Return, instanceIndex, storage, uniform, texture, sharedUniformGroup,
+    Fn, If, Loop, Return, instanceIndex, storage, uniform, texture, textureLevel, sharedUniformGroup,
     float, int, uint, vec2, vec3, vec4, uvec2,
     max as tslMax, min as tslMin, mix, clamp, floor, normalize, dot, cross, length,
     abs as tslAbs, sqrt, cos, sin, pow, exp, textureStore,
@@ -312,7 +312,12 @@ export class GiProbeNode extends LightingNode {
     // meta/relocation fetch, Chebyshev visibility, wrap weight, irradiance fetch.
     // Shared VERBATIM by the unrolled single-grid gather and the looped cascaded gather
     // so the two paths can never drift. Pure expression — legal in both contexts.
-    _tapEW(c, P, Nn, octN, octNs, px, py, pz, wTri) {
+    // lod0: fetch with EXPLICIT level 0 (textureSampleLevel). Required when the gather
+    // runs inside a NON-UNIFORM branch (the cascaded receiver skips whole cascades per
+    // pixel), where WGSL forbids implicit-derivative sampling. The atlases have no
+    // mips, so level 0 is what implicit LOD resolves to anyway — visually identical.
+    _tapEW(c, P, Nn, octN, octNs, px, py, pz, wTri, lod0 = false) {
+        const fetch = (tex, uv) => (lod0 ? textureLevel(tex, uv, float(0.0)) : texture(tex, uv));
         const col = px;
         const row = pz.mul(this.resNode[c].y).add(py);
 
@@ -320,7 +325,7 @@ export class GiProbeNode extends LightingNode {
         // classifyStrength (default 0 = ignored) — relocation/classification by a
         // backface test misreads thin 2-sided walls, so it's opt-in for solid scenes.
         const metaUV = vec2(col.add(0.5).div(this.resNode[c].x), row.add(0.5).div(this.resNode[c].y.mul(this.resNode[c].z)));
-        const meta = texture(this._stateAtlas[c], metaUV);
+        const meta = fetch(this._stateAtlas[c], metaUV);
         const stateV = meta.x;
         const reloc = vec3(meta.y, meta.z, meta.w).mul(this.classifyStrengthNode);
 
@@ -329,7 +334,7 @@ export class GiProbeNode extends LightingNode {
         const toSurf = P.sub(probePos);
         const dist = length(toSurf);
         const octD = octEncodeNode(toSurf.div(dist.max(float(1e-6))), TSL);
-        const m = texture(this._depthAtlas[c], this._tileUV(col, row, octD, c));
+        const m = fetch(this._depthAtlas[c], this._tileUV(col, row, octD, c));
         const m1 = m.x; const m2 = m.y;
         const variance = m2.sub(m1.mul(m1)).abs();
         // Self-occlusion tolerance: a lit surface must not shadow ITSELF against its own
@@ -354,8 +359,8 @@ export class GiProbeNode extends LightingNode {
 
         const stateEff = mix(float(1.0), stateV, this.classifyStrengthNode);
         const w = wTri.mul(wrapW).mul(visW).mul(stateEff);
-        const eD = texture(this._atlas[c], this._tileUV(col, row, octN, c)).xyz;
-        const e = octNs ? mix(texture(this._atlas[c], this._tileUV(col, row, octNs, c)).xyz, eD, this.detailStrengthNode) : eD;
+        const eD = fetch(this._atlas[c], this._tileUV(col, row, octN, c)).xyz;
+        const e = octNs ? mix(fetch(this._atlas[c], this._tileUV(col, row, octNs, c)).xyz, eD, this.detailStrengthNode) : eD;
         return { e, w };
     }
 
@@ -425,7 +430,7 @@ export class GiProbeNode extends LightingNode {
                 const wy = mix(float(1.0).sub(frac.y), frac.y, dy);
                 const wz = mix(float(1.0).sub(frac.z), frac.z, dz);
                 const wTri = wx.mul(wy).mul(wz).add(1e-4);
-                const { e, w } = this._tapEW(c, P, Nn, octN, null, px, py, pz, wTri);
+                const { e, w } = this._tapEW(c, P, Nn, octN, null, px, py, pz, wTri, true);
                 acc.addAssign(e.mul(w));
                 wsum.addAssign(w);
             });
@@ -433,12 +438,16 @@ export class GiProbeNode extends LightingNode {
         })();
     }
 
-    // Cascaded sample: always the coarse cascade; blend toward the fine cascade across a
-    // narrow inner border when P is inside C1 and cascades>=2. Fixed tap count (8 or 16),
-    // no data-dependent branch → bounded fragment cost. cascades==1 → E0 exactly.
-    // The cascaded path uses the LOOPED gather (_sampleCascadeLooped) so the doubled tap
-    // count fits WebKit's 8192-byte pipeline-variable budget; normal-detail dual fetch
-    // stays single-grid only (kept minimal while the looped path proves out on Safari).
+    // Cascaded sample: coarse cascade, blended toward the fine cascade across a narrow
+    // inner border when P is inside C1 and cascades>=2. Each cascade is sampled ONLY
+    // where its blend weight is live: outside the fine box (wFine=0) the fine gather is
+    // skipped, deep inside it (wFine=1) the coarse gather is skipped — so almost every
+    // pixel pays the same 8 taps as single-grid mode and only the border band pays 16.
+    // Cost stays bounded (worst case 16 taps, confined to the band); the taps inside
+    // these NON-UNIFORM branches use explicit LOD-0 fetches (see _tapEW). cascades==1 →
+    // E0 exactly. The cascaded path uses the LOOPED gather (_sampleCascadeLooped) so the
+    // tap bodies fit WebKit's 8192-byte pipeline-variable budget; normal-detail dual
+    // fetch stays single-grid only (kept minimal while the looped path proves out).
     //
     // COMPILE-TIME cascade selection (invariants #5/#6): a TSL fragment cannot reference a
     // null StorageTexture, and the material RECOMPILES whenever _structGen changes (which
@@ -449,18 +458,25 @@ export class GiProbeNode extends LightingNode {
         const useFine = Math.round(this.cascadeCountNode.value) >= 2 && !!this._atlas[1] && !!this._depthAtlas[1] && !!this._stateAtlas[1];
         if (!useFine) return this._sampleCascade(P, Nvis, Ndir, 0, dualDetail); // byte-identical single-grid fallback
 
-        const E0 = this._sampleCascadeLooped(P, Nvis, Ndir, 0); // coarse: valid over full bounds, ALWAYS
-        // Fine inside-test in normalized C1 coords.
-        const f = P.sub(this.gridMinNode[1]).div(this.gridSizeNode[1].max(vec3(1e-6))); // 0..1 inside the fine box
-        const fLo = tslMin(tslMin(f.x, f.y), f.z);
-        const fHi = tslMin(tslMin(float(1.0).sub(f.x), float(1.0).sub(f.y)), float(1.0).sub(f.z));
-        const edge = tslMin(fLo, fHi); // dist to nearest face; <0 outside
-        const inBand = this.borderBandNode;
-        const wIn = clamp(edge.div(inBand.max(float(1e-4))), float(0.0), float(1.0)); // 1 deep inside, ramps to 0 at the border, 0 outside
-        const gate = this.cascadeCountNode.sub(1.0).clamp(float(0.0), float(1.0)); // 0 when cascades==1, 1 when 2 (live extra guard)
-        const wFine = wIn.mul(gate);
-        const E1 = this._sampleCascadeLooped(P, Nvis, Ndir, 1);
-        return mix(E0, E1, wFine);
+        return Fn(() => {
+            // Fine inside-test in normalized C1 coords.
+            const f = P.sub(this.gridMinNode[1]).div(this.gridSizeNode[1].max(vec3(1e-6))); // 0..1 inside the fine box
+            const fLo = tslMin(tslMin(f.x, f.y), f.z);
+            const fHi = tslMin(tslMin(float(1.0).sub(f.x), float(1.0).sub(f.y)), float(1.0).sub(f.z));
+            const edge = tslMin(fLo, fHi); // dist to nearest face; <0 outside
+            const inBand = this.borderBandNode;
+            const wIn = clamp(edge.div(inBand.max(float(1e-4))), float(0.0), float(1.0)); // 1 deep inside, ramps to 0 at the border, 0 outside
+            const gate = this.cascadeCountNode.sub(1.0).clamp(float(0.0), float(1.0)); // 0 when cascades==1, 1 when 2 (live extra guard)
+            const wFine = wIn.mul(gate).toVar();
+            const E = vec3(0.0).toVar();
+            If(wFine.lessThan(float(1.0)), () => {
+                E.assign(this._sampleCascadeLooped(P, Nvis, Ndir, 0)); // coarse: valid over full bounds
+            });
+            If(wFine.greaterThan(float(0.0)), () => {
+                E.assign(mix(E, this._sampleCascadeLooped(P, Nvis, Ndir, 1), wFine));
+            });
+            return E;
+        })();
     }
 
     setup(builder) {

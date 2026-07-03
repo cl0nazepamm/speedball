@@ -10,7 +10,7 @@ const KEY = 'speedball-gi-settings-v2';
 export const GI_DEFAULTS = {
     giEnabled: true, giIntensity: 10, giDivisions: 16, giRays: 64,
     giCascades: 1, giContinuous: true, showProbes: false,
-    giHysteresis: 0.9, giHysteresisNormalize: true, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 40,
+    giHysteresis: 0.6, giHysteresisNormalize: true, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 40,
     giLeak: 0.5, giSolid: 0, giSky: 1, giNormalDetail: 1,
     giChangeThreshold: 2.5, giSnapAmount: 0.30, giFireflyClamp: 6.0,
 };

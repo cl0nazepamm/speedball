@@ -9,7 +9,8 @@ Best for medium scale scenes. It is prone to leaking but it is continuous and ca
 ## Hysteresis
 Hysteresis is the main slider for radiosity fade in/out.
 
-It is normalized by default over the real interval between updates of a probe (frame rate × how many ticks the round-robin scan needs to revisit it), so the temporal blend feels similar across machines, browsers, and grid sizes. The correction is bounded — on very slow machines or very large grids it converges as fast as it can without dissolving into per-update noise.
+It is normalized by default over the real interval between updates of a probe (frame rate × how many ticks the round-robin scan needs to revisit it), so the temporal blend feels similar across machines, browsers, and grid sizes. 
+With slow machines or very large grids it converges as fast as it can without dissolving into per-update noise.
 
 The live demo exposes a **normalize hysteresis** switch so you can turn the normalization off and compare against the raw per-update value.
 
@@ -61,6 +62,7 @@ has already run, three has cached a non-GI lights node and GI will fail.
   exactly like final shading. 
 - **Best for small to medium scale scenes** — very large worlds or many separated islands
   can waste probes unless bounds and cascades are curated.
+- **Cascades:** — Don't even bother with cascades if you are not using Chromium. Additionally cascaded grid will require higher ray count to look as smooth as single grid probes.
 - **Convergence is temporal** — loads, light edits, and geometry changes fade in
   over a few frames instead of snapping instantly. Similar to Lumen.
 
