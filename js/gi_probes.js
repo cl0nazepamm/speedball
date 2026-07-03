@@ -113,6 +113,9 @@ const GI_TEMPORAL_VAR_REL = 0.0025;    // relative floor: lum^2 * this
 const GI_TEMPORAL_CHANGE_SIGMA0 = 0.75;
 const GI_TEMPORAL_CHANGE_SIGMA1 = 2.5;
 const GI_TEMPORAL_CLAMP_SIGMA = 6.0;
+const HYSTERESIS_DT_REF_MS = 1000 / 60;
+const HYSTERESIS_DT_MIN_MS = 1000 / 240;
+const HYSTERESIS_DT_GATE_MS = 1000 / 30;
 
 let _node = null;
 
@@ -388,6 +391,9 @@ export class GiProbeNode extends LightingNode {
     // Cascaded sample: always the coarse cascade; blend toward the fine cascade across a
     // narrow inner border when P is inside C1 and cascades>=2. Fixed tap count (8 or 16),
     // no data-dependent branch → bounded fragment cost. cascades==1 → E0 exactly.
+    // Normal-detail dual fetch stays single-grid only: with cascades it turns the old
+    // 16-tap receiver into a much larger shader and can hit the WGSL 8192-byte private
+    // variable floor on stricter backends.
     //
     // COMPILE-TIME cascade selection (invariants #5/#6): a TSL fragment cannot reference a
     // null StorageTexture, and the material RECOMPILES whenever _structGen changes (which
@@ -395,9 +401,10 @@ export class GiProbeNode extends LightingNode {
     // when the fine cascade is actually bound at setup() time — otherwise the shader is the
     // exact original 8-tap single grid (byte-identical) and never touches _atlas[1]=null.
     sampleIrradiance(P, Nvis, Ndir, dualDetail = false) {
-        const E0 = this._sampleCascade(P, Nvis, Ndir, 0, dualDetail); // coarse: valid over full bounds, ALWAYS
         const useFine = Math.round(this.cascadeCountNode.value) >= 2 && !!this._atlas[1] && !!this._depthAtlas[1] && !!this._stateAtlas[1];
-        if (!useFine) return E0;                 // single-grid fallback — byte-identical to today
+        if (!useFine) return this._sampleCascade(P, Nvis, Ndir, 0, dualDetail); // byte-identical single-grid fallback
+
+        const E0 = this._sampleCascade(P, Nvis, Ndir, 0, false); // coarse: valid over full bounds, ALWAYS
         // Fine inside-test in normalized C1 coords.
         const f = P.sub(this.gridMinNode[1]).div(this.gridSizeNode[1].max(vec3(1e-6))); // 0..1 inside the fine box
         const fLo = tslMin(tslMin(f.x, f.y), f.z);
@@ -407,7 +414,7 @@ export class GiProbeNode extends LightingNode {
         const wIn = clamp(edge.div(inBand.max(float(1e-4))), float(0.0), float(1.0)); // 1 deep inside, ramps to 0 at the border, 0 outside
         const gate = this.cascadeCountNode.sub(1.0).clamp(float(0.0), float(1.0)); // 0 when cascades==1, 1 when 2 (live extra guard)
         const wFine = wIn.mul(gate);
-        const E1 = this._sampleCascade(P, Nvis, Ndir, 1, dualDetail);
+        const E1 = this._sampleCascade(P, Nvis, Ndir, 1, false);
         return mix(E0, E1, wFine);
     }
 
@@ -552,6 +559,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     let lightQuant = 1;       // scene-relative position deadband for the light signature (B4)
     // reactivity: self-detect live light/geometry edits and re-converge fast.
     let baseHysteresis = THREE.MathUtils.clamp(hysteresis, 0, 0.99);
+    let hysteresisNormalize = true;
     let chebyBiasScale = 1.0;
     let debugFreezeRayJitter = false;
     let debugFrameJitterOverride = null;
@@ -1660,16 +1668,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             hTickBase = baseHysteresis;
         }
         // Frame-rate normalize: the blend `mix(candidate, prev, h)` is applied ONCE PER TICK,
-        // so a fixed per-tick h smooths LESS on slower browsers (fewer ticks/sec) — the same
-        // slider reads noisier on Firefox/Safari than on Chrome. Treat h as a time constant by
-        // raising it to (dt / 60fps-reference), reusing the same gap-filtered tick-dt EMA the
-        // auto-throttle reads (0 until warm → exponent 1 → no correction). Unchanged at 60 fps;
-        // auto-lowers when frames are slow, auto-raises when fast → same feel on every browser.
-        const H_DT_REF = 1000 / 60;
-        // clamp the measured dt to [240fps, 10fps]; 100ms upper bound matches the auto-throttle's
-        // dt<100 gate below (slow GPUs like an M-series Mac Mini can dip to ~14fps on heavy solves).
-        const hDtN = tickDtEma > 0 ? Math.min(Math.max(tickDtEma, 1000 / 240), 100) : H_DT_REF;
-        U.hysteresis.value = Math.pow(hTickBase, hDtN / H_DT_REF);
+        // so a fixed per-tick h smooths LESS on slower browsers (fewer ticks/sec). Treat h as
+        // a time constant only while cadence is sane. Under hard pressure (<~30 fps), the dt
+        // correction gets too aggressive and turns temporal stability into "catch up now";
+        // gate it off and let auto-throttle fix the workload instead.
+        const hDtOk = hysteresisNormalize && tickDtEma > 0 && tickDtEma <= HYSTERESIS_DT_GATE_MS;
+        const hDtN = hDtOk ? Math.max(tickDtEma, HYSTERESIS_DT_MIN_MS) : HYSTERESIS_DT_REF_MS;
+        U.hysteresis.value = Math.pow(hTickBase, hDtN / HYSTERESIS_DT_REF_MS);
 
         // Auto-throttle: compare CONSECUTIVE tick timestamps (gaps from idle-gating or
         // motion are discarded, so this reads GPU pressure, not pauses). Sustained
@@ -1957,6 +1962,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             albedoScale: U.debugAlbedoScale.value,
             bounceScale: U.debugBounceScale.value,
             cosinePower: U.debugCosinePower.value,
+            hysteresisNormalize,
             tempNoiseHBoost: U.debugTempNoiseHBoost.value,
             tempChangeSigma0: U.debugTempChangeSigma0.value,
             tempChangeSigma1: U.tempChangeSigma1.value,
@@ -2018,6 +2024,11 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             baseHysteresis = THREE.MathUtils.clamp(v, 0, 0.99); // steady-state temporal blend (higher = more stable/slower)
             U.hysteresis.value = baseHysteresis;                // apply now; tick() re-asserts it when no reactive burst is active
         },
+        setHysteresisNormalization: (on) => {
+            hysteresisNormalize = on !== false;
+            U.hysteresis.value = baseHysteresis;
+        },
+        getHysteresisNormalization: () => hysteresisNormalize,
         setNormalBias: (v) => {
             if (!Number.isFinite(v)) return;
             normalBiasScale = THREE.MathUtils.clamp(v, 0, 8);   // × the auto minCell·SURFACE_NORMAL_BIAS_CELL offset

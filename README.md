@@ -5,6 +5,15 @@ BVH-traced **dynamic diffuse global illumination** (DDGI) for
 
 Best for medium scale scenes. It is prone to leaking but it is continuous and can be used in timelapse/day night cycle scenarios.
 
+
+## Hysteresis
+Hysteresis is the main slider for radiosity fade in/out.
+
+It is frame-rate normalized by default so the temporal blend feels closer across machines and browsers.
+The live demo exposes a **normalize hysteresis** switch so you can turn that off and compare against the raw per-tick value.
+
+It automatically turns off if you push it below 30FPS.
+
 ## Launch live Sponza demo
 
 **[▶ cl0nazepamm.github.io/speedball](https://cl0nazepamm.github.io/speedball/)**

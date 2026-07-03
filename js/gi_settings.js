@@ -10,7 +10,7 @@ const KEY = 'speedball-gi-settings-v2';
 export const GI_DEFAULTS = {
     giEnabled: true, giIntensity: 10, giDivisions: 16, giRays: 64,
     giCascades: 1, giContinuous: true, showProbes: false,
-    giHysteresis: 0.9, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 40,
+    giHysteresis: 0.9, giHysteresisNormalize: true, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 40,
     giLeak: 0.5, giSolid: 0, giSky: 1, giNormalDetail: 1,
     giChangeThreshold: 2.5, giSnapAmount: 0.30, giFireflyClamp: 6.0,
 };
@@ -55,6 +55,7 @@ export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure
     fGI.add(params, 'giEnabled').name('enabled').onChange((v) => { gi.setEnabled(v); onInteract(); });
     fGI.add(params, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => { gi.setIntensity(v); onInteract(); }); // uncapped
     fGI.add(params, 'giHysteresis', 0.5, 0.99, 0.01).name('hysteresis').onChange((v) => { gi.setHysteresis(v); onInteract(); });
+    fGI.add(params, 'giHysteresisNormalize').name('normalize hysteresis').onChange((v) => { gi.setHysteresisNormalization?.(v); onInteract(); });
     // STRUCTURAL knobs (idle-gated rebuild — never a per-tick recompile).
     fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi.setDivisions(v); onStructure(); onInteract(); });
     fGI.add(params, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi.setRays(v); onInteract(); });
@@ -89,6 +90,7 @@ export function applyGiSettings(gi, s) {
     gi.setCascades(s.giCascades);
     gi.setContinuous(s.giContinuous);
     gi.setHysteresis(s.giHysteresis);
+    gi.setHysteresisNormalization?.(s.giHysteresisNormalize);
     gi.setNormalBias(s.giNormalBias);
     gi.setRadianceClamp(s.giRadianceClamp);
     gi.setDepthSharpness(s.giDepthSharpness);
