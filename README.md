@@ -9,10 +9,9 @@ Best for medium scale scenes. It is prone to leaking but it is continuous and ca
 ## Hysteresis
 Hysteresis is the main slider for radiosity fade in/out.
 
-It is frame-rate normalized by default so the temporal blend feels closer across machines and browsers.
-The live demo exposes a **normalize hysteresis** switch so you can turn that off and compare against the raw per-tick value.
+It is normalized by default over the real interval between updates of a probe (frame rate × how many ticks the round-robin scan needs to revisit it), so the temporal blend feels similar across machines, browsers, and grid sizes. The correction is bounded — on very slow machines or very large grids it converges as fast as it can without dissolving into per-update noise.
 
-It automatically turns off if you push it below 30FPS.
+The live demo exposes a **normalize hysteresis** switch so you can turn the normalization off and compare against the raw per-update value.
 
 ## Launch live Sponza demo
 

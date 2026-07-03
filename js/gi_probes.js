@@ -113,9 +113,9 @@ const GI_TEMPORAL_VAR_REL = 0.0025;    // relative floor: lum^2 * this
 const GI_TEMPORAL_CHANGE_SIGMA0 = 0.75;
 const GI_TEMPORAL_CHANGE_SIGMA1 = 2.5;
 const GI_TEMPORAL_CLAMP_SIGMA = 6.0;
-const HYSTERESIS_DT_REF_MS = 1000 / 60;
-const HYSTERESIS_DT_MIN_MS = 1000 / 240;
-const HYSTERESIS_DT_GATE_MS = 1000 / 30;
+const HYSTERESIS_DT_REF_MS = 1000 / 60; // the slider is calibrated at 60 fps, full-pass-per-tick
+const HYSTERESIS_EXP_MIN = 0.25;        // 240 Hz floor — a fast display must not over-smooth
+const HYSTERESIS_EXP_MAX = 4;           // cap on history dropped per update — the anti-boil bound
 
 let _node = null;
 
@@ -308,13 +308,61 @@ export class GiProbeNode extends LightingNode {
     // steering on a 6×6 oct tile), so the knob felt like a toggle; blending the
     // IRRADIANCE is linear in the visible contrast by construction — 0.5 really is
     // half the detail. Emitted only for trusted materials (8 extra small-texture taps).
+    // ONE trilinear tap of cascade c at probe coords (px,py,pz), trilinear weight wTri:
+    // meta/relocation fetch, Chebyshev visibility, wrap weight, irradiance fetch.
+    // Shared VERBATIM by the unrolled single-grid gather and the looped cascaded gather
+    // so the two paths can never drift. Pure expression — legal in both contexts.
+    _tapEW(c, P, Nn, octN, octNs, px, py, pz, wTri) {
+        const col = px;
+        const row = pz.mul(this.resNode[c].y).add(py);
+
+        // per-probe meta (NEAREST): R=state, GBA=relocation offset. Gated by
+        // classifyStrength (default 0 = ignored) — relocation/classification by a
+        // backface test misreads thin 2-sided walls, so it's opt-in for solid scenes.
+        const metaUV = vec2(col.add(0.5).div(this.resNode[c].x), row.add(0.5).div(this.resNode[c].y.mul(this.resNode[c].z)));
+        const meta = texture(this._stateAtlas[c], metaUV);
+        const stateV = meta.x;
+        const reloc = vec3(meta.y, meta.z, meta.w).mul(this.classifyStrengthNode);
+
+        // Chebyshev visibility: relocated probe → surface direction vs stored depth.
+        const probePos = this._probePos(px, py, pz, c).add(reloc);
+        const toSurf = P.sub(probePos);
+        const dist = length(toSurf);
+        const octD = octEncodeNode(toSurf.div(dist.max(float(1e-6))), TSL);
+        const m = texture(this._depthAtlas[c], this._tileUV(col, row, octD, c));
+        const m1 = m.x; const m2 = m.y;
+        const variance = m2.sub(m1.mul(m1)).abs();
+        // Self-occlusion tolerance: a lit surface must not shadow ITSELF against its own
+        // low-res depth moments. dist (probe→fragment) carries the normal-bias offset and
+        // is compared to oct-averaged depth, so on dense/thick geometry it slips just past
+        // m1 per triangle → the leak-free term "errors on triangles". A depth bias (db, <
+        // wall thickness) treats the surface as visible within tolerance, so real walls
+        // still occlude (no leak) but a surface stops fighting its own shadow.
+        const db = this.chebyBiasNode[c];
+        const dm = dist.sub(m1).sub(db).max(float(0.0));
+        const chebyRaw = variance.div(variance.add(dm.mul(dm)).max(float(1e-6)));
+        const cheby = select(dist.lessThanEqual(m1.add(db)), float(1.0), chebyRaw);
+        const visW = mix(float(1.0), tslMax(cheby.mul(cheby).mul(cheby), float(0.05)), this.chebyStrengthNode);
+
+        // Smooth backface/wrap weight (standard DDGI; was MISSING). Fades out probes whose
+        // hemisphere faces AWAY from the surface, so the Chebyshev term no longer has to
+        // HARD-cut them — that hard cut is the splotch that fights normal bias. Gated by
+        // chebyStrength so leak control = 0 stays the exact pure-trilinear look.
+        const dirToProbe = probePos.sub(P).div(dist.max(float(1e-6)));
+        const wrap = dot(dirToProbe, Nn).mul(0.5).add(0.5);
+        const wrapW = mix(float(1.0), tslMax(wrap.mul(wrap), float(0.05)), this.chebyStrengthNode);
+
+        const stateEff = mix(float(1.0), stateV, this.classifyStrengthNode);
+        const w = wTri.mul(wrapW).mul(visW).mul(stateEff);
+        const eD = texture(this._atlas[c], this._tileUV(col, row, octN, c)).xyz;
+        const e = octNs ? mix(texture(this._atlas[c], this._tileUV(col, row, octNs, c)).xyz, eD, this.detailStrengthNode) : eD;
+        return { e, w };
+    }
+
     // Sample ONE cascade c (0=coarse, 1=fine) — the original 8-tap trilinear gather,
     // parameterized per cascade. PURE-EXPRESSION (no toVar/addAssign): fragment colorNode.
     _sampleCascade(P, Nvis, Ndir, c, dualDetail = false) {
-        const atlas = this._atlas[c];
-        const depthAtlas = this._depthAtlas[c];
         const res = this.resNode[c];
-        const ry = res.y;
         const cell = this.gridSizeNode[c].div(res.sub(1.0).max(vec3(1.0)));
         const gridF = P.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
         const baseF = gridF.floor().clamp(vec3(0.0), res.sub(2.0).max(vec3(0.0)));
@@ -335,65 +383,62 @@ export class GiProbeNode extends LightingNode {
             const px = float(bx.add(uint(dx)));
             const py = float(by.add(uint(dy)));
             const pz = float(bz.add(uint(dz)));
-            const col = px;
-            const row = pz.mul(ry).add(py);
             const wx = dx ? frac.x : float(1.0).sub(frac.x);
             const wy = dy ? frac.y : float(1.0).sub(frac.y);
             const wz = dz ? frac.z : float(1.0).sub(frac.z);
             const wTri = wx.mul(wy).mul(wz).add(1e-4);
-
-            // per-probe meta (NEAREST): R=state, GBA=relocation offset. Gated by
-            // classifyStrength (default 0 = ignored) — relocation/classification by a
-            // backface test misreads thin 2-sided walls, so it's opt-in for solid scenes.
-            const metaUV = vec2(col.add(0.5).div(this.resNode[c].x), row.add(0.5).div(this.resNode[c].y.mul(this.resNode[c].z)));
-            const meta = texture(this._stateAtlas[c], metaUV);
-            const stateV = meta.x;
-            const reloc = vec3(meta.y, meta.z, meta.w).mul(this.classifyStrengthNode);
-
-            // Chebyshev visibility: relocated probe → surface direction vs stored depth.
-            const probePos = this._probePos(px, py, pz, c).add(reloc);
-            const toSurf = P.sub(probePos);
-            const dist = length(toSurf);
-            const octD = octEncodeNode(toSurf.div(dist.max(float(1e-6))), TSL);
-            const m = texture(depthAtlas, this._tileUV(col, row, octD, c));
-            const m1 = m.x; const m2 = m.y;
-            const variance = m2.sub(m1.mul(m1)).abs();
-            // Self-occlusion tolerance: a lit surface must not shadow ITSELF against its own
-            // low-res depth moments. dist (probe→fragment) carries the normal-bias offset and
-            // is compared to oct-averaged depth, so on dense/thick geometry it slips just past
-            // m1 per triangle → the leak-free term "errors on triangles". A depth bias (db, <
-            // wall thickness) treats the surface as visible within tolerance, so real walls
-            // still occlude (no leak) but a surface stops fighting its own shadow.
-            const db = this.chebyBiasNode[c];
-            const dm = dist.sub(m1).sub(db).max(float(0.0));
-            const chebyRaw = variance.div(variance.add(dm.mul(dm)).max(float(1e-6)));
-            const cheby = select(dist.lessThanEqual(m1.add(db)), float(1.0), chebyRaw);
-            const visW = mix(float(1.0), tslMax(cheby.mul(cheby).mul(cheby), float(0.05)), this.chebyStrengthNode);
-
-            // Smooth backface/wrap weight (standard DDGI; was MISSING). Fades out probes whose
-            // hemisphere faces AWAY from the surface, so the Chebyshev term no longer has to
-            // HARD-cut them — that hard cut is the splotch that fights normal bias. Gated by
-            // chebyStrength so leak control = 0 stays the exact pure-trilinear look.
-            const dirToProbe = probePos.sub(P).div(dist.max(float(1e-6)));
-            const wrap = dot(dirToProbe, Nn).mul(0.5).add(0.5);
-            const wrapW = mix(float(1.0), tslMax(wrap.mul(wrap), float(0.05)), this.chebyStrengthNode);
-
-            const stateEff = mix(float(1.0), stateV, this.classifyStrengthNode);
-            const w = wTri.mul(wrapW).mul(visW).mul(stateEff);
-            const eD = texture(atlas, this._tileUV(col, row, octN, c)).xyz;
-            const e = dualDetail ? mix(texture(atlas, this._tileUV(col, row, octNs, c)).xyz, eD, this.detailStrengthNode) : eD;
+            const { e, w } = this._tapEW(c, P, Nn, octN, octNs, px, py, pz, wTri);
             acc = acc.add(e.mul(w));
             wsum = wsum.add(w);
         }
         return acc.div(wsum.max(float(1e-4)));
     }
 
+    // Looped gather for the CASCADED receiver: the exact per-tap math (_tapEW), but
+    // emitted as a real WGSL loop inside an Fn instead of 8 inlined taps. Two inlined
+    // 8-tap subtrees (16 taps) overflow WebKit's 8192-byte budget for pipeline-variable
+    // storage (Safari: "combined byte size of all variables in the private address
+    // space exceeds 8192 bytes" → invalid RenderPipeline on every GI material). A loop
+    // keeps ONE tap's variables live regardless of tap count, and the Fn wrapper gives
+    // toVar/addAssign proper statement sequencing (the raw fragment expression context
+    // does not — see _sampleCascade). The single-grid path intentionally stays on the
+    // unrolled pure-expression gather: it is the shipped default, byte-identical.
+    _sampleCascadeLooped(P, Nvis, Ndir, c) {
+        return Fn(() => {
+            const res = this.resNode[c];
+            const cell = this.gridSizeNode[c].div(res.sub(1.0).max(vec3(1.0)));
+            const gridF = P.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
+            const baseF = gridF.floor().clamp(vec3(0.0), res.sub(2.0).max(vec3(0.0)));
+            const frac = gridF.sub(baseF).clamp(0.0, 1.0);
+            const Nn = Nvis.normalize();
+            const octN = octEncodeNode(Ndir.normalize(), TSL);
+            const acc = vec3(0.0).toVar();
+            const wsum = float(0.0).toVar();
+            Loop({ start: uint(0), end: uint(8), type: 'uint', condition: '<' }, ({ i }) => {
+                const dx = i.bitAnd(uint(1)).toFloat();
+                const dy = i.shiftRight(uint(1)).bitAnd(uint(1)).toFloat();
+                const dz = i.shiftRight(uint(2)).bitAnd(uint(1)).toFloat();
+                const px = baseF.x.add(dx);
+                const py = baseF.y.add(dy);
+                const pz = baseF.z.add(dz);
+                const wx = mix(float(1.0).sub(frac.x), frac.x, dx);
+                const wy = mix(float(1.0).sub(frac.y), frac.y, dy);
+                const wz = mix(float(1.0).sub(frac.z), frac.z, dz);
+                const wTri = wx.mul(wy).mul(wz).add(1e-4);
+                const { e, w } = this._tapEW(c, P, Nn, octN, null, px, py, pz, wTri);
+                acc.addAssign(e.mul(w));
+                wsum.addAssign(w);
+            });
+            return acc.div(wsum.max(float(1e-4)));
+        })();
+    }
+
     // Cascaded sample: always the coarse cascade; blend toward the fine cascade across a
     // narrow inner border when P is inside C1 and cascades>=2. Fixed tap count (8 or 16),
     // no data-dependent branch → bounded fragment cost. cascades==1 → E0 exactly.
-    // Normal-detail dual fetch stays single-grid only: with cascades it turns the old
-    // 16-tap receiver into a much larger shader and can hit the WGSL 8192-byte private
-    // variable floor on stricter backends.
+    // The cascaded path uses the LOOPED gather (_sampleCascadeLooped) so the doubled tap
+    // count fits WebKit's 8192-byte pipeline-variable budget; normal-detail dual fetch
+    // stays single-grid only (kept minimal while the looped path proves out on Safari).
     //
     // COMPILE-TIME cascade selection (invariants #5/#6): a TSL fragment cannot reference a
     // null StorageTexture, and the material RECOMPILES whenever _structGen changes (which
@@ -404,7 +449,7 @@ export class GiProbeNode extends LightingNode {
         const useFine = Math.round(this.cascadeCountNode.value) >= 2 && !!this._atlas[1] && !!this._depthAtlas[1] && !!this._stateAtlas[1];
         if (!useFine) return this._sampleCascade(P, Nvis, Ndir, 0, dualDetail); // byte-identical single-grid fallback
 
-        const E0 = this._sampleCascade(P, Nvis, Ndir, 0, false); // coarse: valid over full bounds, ALWAYS
+        const E0 = this._sampleCascadeLooped(P, Nvis, Ndir, 0); // coarse: valid over full bounds, ALWAYS
         // Fine inside-test in normalized C1 coords.
         const f = P.sub(this.gridMinNode[1]).div(this.gridSizeNode[1].max(vec3(1e-6))); // 0..1 inside the fine box
         const fLo = tslMin(tslMin(f.x, f.y), f.z);
@@ -414,7 +459,7 @@ export class GiProbeNode extends LightingNode {
         const wIn = clamp(edge.div(inBand.max(float(1e-4))), float(0.0), float(1.0)); // 1 deep inside, ramps to 0 at the border, 0 outside
         const gate = this.cascadeCountNode.sub(1.0).clamp(float(0.0), float(1.0)); // 0 when cascades==1, 1 when 2 (live extra guard)
         const wFine = wIn.mul(gate);
-        const E1 = this._sampleCascade(P, Nvis, Ndir, 1, false);
+        const E1 = this._sampleCascadeLooped(P, Nvis, Ndir, 1);
         return mix(E0, E1, wFine);
     }
 
@@ -1667,14 +1712,23 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         } else {
             hTickBase = baseHysteresis;
         }
-        // Frame-rate normalize: the blend `mix(candidate, prev, h)` is applied ONCE PER TICK,
-        // so a fixed per-tick h smooths LESS on slower browsers (fewer ticks/sec). Treat h as
-        // a time constant only while cadence is sane. Under hard pressure (<~30 fps), the dt
-        // correction gets too aggressive and turns temporal stability into "catch up now";
-        // gate it off and let auto-throttle fix the workload instead.
-        const hDtOk = hysteresisNormalize && tickDtEma > 0 && tickDtEma <= HYSTERESIS_DT_GATE_MS;
-        const hDtN = hDtOk ? Math.max(tickDtEma, HYSTERESIS_DT_MIN_MS) : HYSTERESIS_DT_REF_MS;
-        U.hysteresis.value = Math.pow(hTickBase, hDtN / HYSTERESIS_DT_REF_MS);
+        // Frame-rate normalize: the blend `mix(candidate, prev, h)` is applied ONCE PER PROBE
+        // UPDATE — and a probe only updates when the round-robin scan window reaches it,
+        // i.e. every ceil(unionProbes / tickCap) ticks. The REAL interval between blends of
+        // one probe is therefore tickDt × passTicks, not tickDt: a divisions-32 grid on a
+        // slow machine was smoothing 10-40× slower than the slider promised ("hysteresis
+        // just lags"). Treat h as a time constant over that per-probe interval. The exponent
+        // is CLAMPED both ways: the floor keeps 240 Hz displays from over-smoothing, the cap
+        // bounds how much history a single update may drop — exact time-constant fidelity at
+        // multi-second update intervals would need h^40 ≈ 0, i.e. raw single-pass noise.
+        // passTicks is the "no lag" fix; the cap is the "no boil" guarantee. The clamp is
+        // continuous (no on/off gate), so cadence hovering at a threshold cannot flip-flop.
+        const passTicks = Math.max(1, Math.ceil(totalUnionProbes() / tickCap()));
+        const updateDt = (tickDtEma > 0 ? tickDtEma : HYSTERESIS_DT_REF_MS) * passTicks;
+        const hExp = hysteresisNormalize
+            ? THREE.MathUtils.clamp(updateDt / HYSTERESIS_DT_REF_MS, HYSTERESIS_EXP_MIN, HYSTERESIS_EXP_MAX)
+            : 1;
+        U.hysteresis.value = Math.pow(hTickBase, hExp);
 
         // Auto-throttle: compare CONSECUTIVE tick timestamps (gaps from idle-gating or
         // motion are discarded, so this reads GPU pressure, not pauses). Sustained
