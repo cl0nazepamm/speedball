@@ -156,8 +156,13 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
         instRow(inst, 0).mul(n.x).add(instRow(inst, 1).mul(n.y)).add(instRow(inst, 2).mul(n.z)));
     const instDetSign = (inst) => instF(inst, 14);
     const instLocalRay = (inst, ro, rd) => ({ ro: instInvPoint(inst, ro), rd: instInvDir(inst, rd) });
-    const tlasF = (n, k) => materials.element(U.tlasBase.add(n.mul(uint(8))).add(uint(k)));
-    const tlasU = (n, k) => TSL.floatBitsToUint(tlasF(n, k));
+    // TLAS node = 12 PLAIN floats: [0..5] bounds, [6] miss, [7] instOffset,
+    // [8] instCount (0 = interior → descend), [9..11] reserved. Every value is
+    // an exact small integer as f32 — NO bit-casts: uint payloads stored in a
+    // float buffer die on some drivers (denormal miss links flush to zero,
+    // 0xFFFFFFFF interior markers are NaNs whose bits may canonicalize).
+    const TLAS_STRIDE = uint(12);
+    const tlasF = (n, k) => materials.element(U.tlasBase.add(n.mul(TLAS_STRIDE)).add(uint(k)));
 
     // ── PBR map array textures ─────────────────────────────────────
     const albedoTex = maps.albedo || null;
@@ -421,8 +426,8 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
             If(cursor.greaterThanEqual(U.tlasNodeCount), () => { Break(); });
             const bmin = vec3(tlasF(cursor, 0), tlasF(cursor, 1), tlasF(cursor, 2));
             const bmax = vec3(tlasF(cursor, 3), tlasF(cursor, 4), tlasF(cursor, 5));
-            const miss = tlasU(cursor, 6);
-            const payload = tlasU(cursor, 7);
+            const miss = uint(tlasF(cursor, 6));
+            const instCountF = tlasF(cursor, 8);
 
             const t0 = bmin.sub(ro).mul(invD);
             const t1 = bmax.sub(ro).mul(invD);
@@ -430,12 +435,11 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
             const tFar = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
 
             If(tFar.greaterThanEqual(max(tNear, float(0))).and(tNear.lessThan(bestTVar)), () => {
-                If(payload.equal(uint(0xFFFFFFFF)), () => {
+                If(instCountF.lessThan(float(0.5)), () => {
                     cursor.assign(cursor.add(uint(1)));
                 }).Else(() => {
-                    const instOffset = payload.bitAnd(uint(0x00FFFFFF));
-                    const instCount = payload.shiftRight(uint(24));
-                    Loop({ start: uint(0), end: instCount, type: 'uint', condition: '<' }, ({ i }) => {
+                    const instOffset = uint(tlasF(cursor, 7));
+                    Loop({ start: uint(0), end: uint(instCountF), type: 'uint', condition: '<' }, ({ i }) => {
                         blasClosest(instOffset.add(i), ro, rd, bestTVar, bestTriVar, bestInst);
                     });
                     cursor.assign(miss);
@@ -513,19 +517,18 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
             If(cursor.greaterThanEqual(U.tlasNodeCount).or(blocked.greaterThan(float(0.5))), () => { Break(); });
             const bmin = vec3(tlasF(cursor, 0), tlasF(cursor, 1), tlasF(cursor, 2));
             const bmax = vec3(tlasF(cursor, 3), tlasF(cursor, 4), tlasF(cursor, 5));
-            const miss = tlasU(cursor, 6);
-            const payload = tlasU(cursor, 7);
+            const miss = uint(tlasF(cursor, 6));
+            const instCountF = tlasF(cursor, 8);
             const t0 = bmin.sub(ro).mul(invD);
             const t1 = bmax.sub(ro).mul(invD);
             const tNear = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
             const tFar = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
             If(tFar.greaterThanEqual(max(tNear, float(0))).and(tNear.lessThan(maxDist)), () => {
-                If(payload.equal(uint(0xFFFFFFFF)), () => {
+                If(instCountF.lessThan(float(0.5)), () => {
                     cursor.assign(cursor.add(uint(1)));
                 }).Else(() => {
-                    const instOffset = payload.bitAnd(uint(0x00FFFFFF));
-                    const instCount = payload.shiftRight(uint(24));
-                    Loop({ start: uint(0), end: instCount, type: 'uint', condition: '<' }, ({ i }) => {
+                    const instOffset = uint(tlasF(cursor, 7));
+                    Loop({ start: uint(0), end: uint(instCountF), type: 'uint', condition: '<' }, ({ i }) => {
                         blasAny(instOffset.add(i), ro, rd, maxDist, blocked);
                     });
                     cursor.assign(miss);

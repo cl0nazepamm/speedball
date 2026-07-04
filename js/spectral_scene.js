@@ -831,15 +831,17 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     const maps = await buildMaterialTextures(THREE, uberList, uberMaterials, TEXTURE_ATLAS_SIZE);
 
     // Materials buffer with the dynamic tail:
-    //   [ ubers (uberCount×MAT_STRIDE) | instances (instCount×MAT_STRIDE) | TLAS (tlasNodes×8) ]
-    // The uint view aliases the SAME ArrayBuffer so TLAS miss/payload words are
-    // written bit-exactly (a float round-trip could canonicalize NaN patterns).
+    //   [ ubers (uberCount×MAT_STRIDE) | instances (instCount×MAT_STRIDE) | TLAS (tlasNodes×12) ]
+    // TLAS nodes are PLAIN floats (bounds, miss, instOffset, instCount — all
+    // exact small integers as f32). Never bit-cast uints into a float buffer:
+    // denormal miss links flush to zero on some drivers and NaN interior
+    // markers lose their payload bits.
+    const TLAS_STRIDE_F32 = 12;
     const dyn0 = computeDynamic();
     const instBase = uberList.length * MAT_STRIDE;     // float-element index
     const tlasBase = instBase + instCount * MAT_STRIDE;
     const tlasNodeCount = dyn0.records.length;
-    const materials = new Float32Array(tlasBase + tlasNodeCount * NODE_STRIDE_U32);
-    const materialsU32 = new Uint32Array(materials.buffer);
+    const materials = new Float32Array(tlasBase + tlasNodeCount * TLAS_STRIDE_F32);
     for (let i = 0; i < uberList.length; i++) materials.set(uberList[i], i * MAT_STRIDE);
 
     function writeDynamic(dyn) {
@@ -856,13 +858,13 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         }
         for (let i = 0; i < dyn.records.length; i++) {
             const rec = dyn.records[i];
-            const b = tlasBase + i * NODE_STRIDE_U32;
+            const b = tlasBase + i * TLAS_STRIDE_F32;
             materials[b] = rec.bx[0]; materials[b + 1] = rec.bx[1]; materials[b + 2] = rec.bx[2];
             materials[b + 3] = rec.bx[3]; materials[b + 4] = rec.bx[4]; materials[b + 5] = rec.bx[5];
-            materialsU32[b + 6] = rec.miss >>> 0;
-            materialsU32[b + 7] = rec.leaf
-                ? (((rec.cnt & 0xFF) << 24) | (rec.off & 0x00FFFFFF)) >>> 0
-                : 0xFFFFFFFF;
+            materials[b + 6] = rec.miss;                    // exact ints ≤ 2^24 as f32
+            materials[b + 7] = rec.leaf ? rec.off : 0;
+            materials[b + 8] = rec.leaf ? rec.cnt : 0;      // 0 = interior → descend
+            materials[b + 9] = 0; materials[b + 10] = 0; materials[b + 11] = 0;
         }
     }
     writeDynamic(dyn0);
