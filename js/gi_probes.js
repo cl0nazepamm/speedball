@@ -591,8 +591,9 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     }
     const casc = [makeCascade(), makeCascade()];
 
-    let continuous = false;   // false = idle-gated (default). true = keep the bounded GPU solve
-                              // running while the camera moves; heavy build steps still wait for rest.
+    let continuous = true;    // DEFAULT ON: keep the bounded GPU solve running while the camera
+                              // moves — heavy build steps still wait for rest, so the no-hitch
+                              // guarantee holds. false opts into strict idle-gating (solve too).
     let dirty = true;
     // Cached CPU build (BVH soup + material textures). The BVH depends ONLY on geometry,
     // so a divisions/rays change must NOT rebuild it — that ~200ms synchronous MeshBVH +
