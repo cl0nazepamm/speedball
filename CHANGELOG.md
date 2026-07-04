@@ -3,7 +3,7 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] — 2026-07-04
 
 - **Two-level BVH (TLAS/BLAS): moving objects now update GI instantly.**
   Each unique geometry builds ONE local-space BLAS (instanced/shared meshes
