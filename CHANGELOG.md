@@ -30,9 +30,15 @@ All notable changes to Speedball GI are documented here. This project follows
 - New `speedball-gi/spectral-scene` and `speedball-gi/spectral-traverse`
   subpath exports so consumers can import the scene foundation directly
   instead of copying files.
-- Capped the `three-mesh-bvh` peerDependency range to `>=0.7.0 <0.9.0` — the
-  stackless-BVH flattener reads MeshBVH's internal `_roots` byte layout,
-  which changed in 0.9.x.
+- **`three-mesh-bvh` requirement moved to `>=0.9.4 <0.10.0`** (was capped at
+  `<0.9.0`). The stackless-BVH flattener reads MeshBVH's internal `_roots`
+  byte layout; 0.9.4 changed the interior right-child word from an absolute
+  uint32 index to a parent-relative offset in node units, and the flattener
+  now decodes that encoding. The flatten walk is also validated end-to-end
+  (bounds-checked offsets, exact node/triangle accounting) so any future
+  upstream layout drift throws a descriptive error at build time instead of
+  rendering black. Builds also use `maxLeafSize` (the 0.9.7+ name for
+  `maxLeafTris`), so no deprecation warnings.
 
 ## [0.2.0] — 2026-07-03
 

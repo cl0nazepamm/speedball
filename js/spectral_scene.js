@@ -393,14 +393,22 @@ async function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
 }
 
 // ── Threaded (stackless) BVH re-flatten ────────────────────────────
-// three-mesh-bvh node layout (BYTES_PER_NODE = 32, addressed in 32-bit
-// words): bounds = float bits [n32+0..5]; leaf test u16[n32*2+15]===0xFFFF;
-// leaf: triOffset=u32[n32+6] (tri units), triCount=u16[n32*2+14]; internal:
-// left child = n32+8 (contiguous in source), right child word = u32[n32+6].
-// We re-emit DFS so the LEFT child is contiguous (idx+1) in the output and
-// every node gets a single escape/miss index = first node after its subtree.
+// three-mesh-bvh 0.9.4+ node layout (BYTES_PER_NODE = 32, addressed in
+// 32-bit words): bounds = float bits [n32+0..5]; leaf test
+// u16[n32*2+15]===0xFFFF; leaf: triOffset=u32[n32+6] (tri units),
+// triCount=u16[n32*2+14]; internal: left child = n32+8 (contiguous in
+// source), right child = n32 + u32[n32+6]*8 (PARENT-RELATIVE offset in
+// node units — 0.8.x stored an absolute u32 index in that word, so this
+// decode REQUIRES >=0.9.4). We re-emit DFS so the LEFT child is contiguous
+// (idx+1) in the output and every node gets a single escape/miss index =
+// first node after its subtree.
+//
+// The decode reads MeshBVH._roots private bytes, so layout drift in a
+// future upstream bump must fail LOUDLY here (a mis-walk otherwise renders
+// as silent black): every visited offset is bounds-checked, and the walk
+// must consume exactly the whole buffer and account for every triangle.
 
-function flattenBVHRoot(rootBuffer) {
+function flattenBVHRoot(rootBuffer, expectedTriCount) {
     const f32 = new Float32Array(rootBuffer);
     const u16 = new Uint16Array(rootBuffer);
     const u32 = new Uint32Array(rootBuffer);
@@ -413,6 +421,8 @@ function flattenBVHRoot(rootBuffer) {
     // node, push a "finalize" marker, then push its children (right first so
     // left is processed next → contiguous idx+1).
     const work = [{ n32: 0, kind: 'visit' }];
+    const nodeCapacity = u32.length >>> 3; // buffer holds exactly this many 32-byte nodes
+    let flattenedTris = 0;
 
     while (work.length > 0) {
         const item = work.pop();
@@ -421,6 +431,9 @@ function flattenBVHRoot(rootBuffer) {
             continue;
         }
         const n32 = item.n32;
+        if (n32 < 0 || (n32 & 7) !== 0 || (n32 >>> 3) >= nodeCapacity || records.length >= nodeCapacity) {
+            throw new Error(`spectral_scene: BVH flatten walked outside the node buffer (n32=${n32}, visited=${records.length}, nodes=${nodeCapacity}) — three-mesh-bvh internal layout drifted; flattenBVHRoot expects the 0.9.4+ parent-relative child encoding.`);
+        }
         const isLeaf = u16[n32 * 2 + 15] === 0xFFFF;
         const idx = records.length;
         const rec = {
@@ -435,14 +448,23 @@ function flattenBVHRoot(rootBuffer) {
             rec.triOffset = u32[n32 + 6];
             rec.triCount = u16[n32 * 2 + 14];
             rec.miss = records.length; // escape = next slot
+            flattenedTris += rec.triCount;
         } else {
             const leftN32 = n32 + 8;
-            const rightN32 = u32[n32 + 6];
+            // 0.9.4+: parent-relative offset in NODE units (8 u32 words/node)
+            const rightN32 = n32 + u32[n32 + 6] * 8;
             // finalize sets miss AFTER both children are flattened
             work.push({ kind: 'finalize', idx });
             work.push({ kind: 'visit', n32: rightN32 });
             work.push({ kind: 'visit', n32: leftN32 });
         }
+    }
+
+    if (records.length !== nodeCapacity) {
+        throw new Error(`spectral_scene: BVH flatten visited ${records.length} nodes but the buffer holds ${nodeCapacity} — three-mesh-bvh internal layout drifted.`);
+    }
+    if (Number.isFinite(expectedTriCount) && flattenedTris !== expectedTriCount) {
+        throw new Error(`spectral_scene: BVH flatten accounted for ${flattenedTris} triangles, expected ${expectedTriCount} — three-mesh-bvh internal layout drifted.`);
     }
 
     // Records are serialized at POOL-assembly time (buildSpectralScene) so a
@@ -606,11 +628,11 @@ function buildLocalBlas(THREE, d) {
     geometry.clearGroups();
     geometry.computeBoundingBox();
     const localBounds = geometry.boundingBox ? geometry.boundingBox.clone() : new THREE.Box3();
-    const bvh = new MeshBVH(geometry, { maxLeafTris: 8, indirect: false });
+    const bvh = new MeshBVH(geometry, { maxLeafSize: 8, indirect: false });
     const roots = bvh._roots;
     geometry.dispose?.();
     if (!Array.isArray(roots) || roots.length === 0) return null;
-    const records = flattenBVHRoot(roots[0]);
+    const records = flattenBVHRoot(roots[0], d.visibleTriCount);
     // Per-triangle material in BVH order (MeshBVH permuted triIndex in place;
     // the material rides the triangle's first vertex through the permutation).
     const triMaterial = new Uint32Array(d.visibleTriCount);
