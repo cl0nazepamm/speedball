@@ -1,10 +1,12 @@
 // spectral_scene.js — CPU build pipeline for the WebGPU spectral path tracer.
 //
-// Flattens the visible scene (meshes + InstancedMesh instances) into ONE
-// world-space indexed triangle soup, dedupes materials into a flat uber
-// table, builds a CPU MeshBVH (three-mesh-bvh), and re-flattens the BVH to a
-// STACKLESS threaded layout (each node carries a single "miss"/escape index)
-// so the GPU traversal is one loop with no traversal stack.
+// TWO-LEVEL BVH: one LOCAL-space BLAS per unique geometry (deduped, so
+// shared/instanced geometry is built once) pooled into a single stackless
+// threaded node buffer, plus an instance table + TLAS over instance
+// world-AABBs packed into the tail of the materials buffer. Materials are
+// deduped into a flat uber table. Moving objects ride
+// built.updateTransforms() — an in-place instance/TLAS rewrite that needs no
+// soup rewrite, no MeshBVH rebuild, and no shader recompile.
 //
 // Output is plain typed arrays + counts; spectral_kernel turns them into
 // StorageBufferAttributes. Nothing here touches the GPU.
@@ -443,22 +445,10 @@ function flattenBVHRoot(rootBuffer) {
         }
     }
 
-    // Serialize to one Uint32Array (bounds stored as float bits).
-    const nodeCount = records.length;
-    const buf = new ArrayBuffer(nodeCount * NODE_STRIDE_U32 * 4);
-    const outF = new Float32Array(buf);
-    const outU = new Uint32Array(buf);
-    for (let i = 0; i < nodeCount; i++) {
-        const base = i * NODE_STRIDE_U32;
-        const rec = records[i];
-        outF[base + 0] = rec.bx[0]; outF[base + 1] = rec.bx[1]; outF[base + 2] = rec.bx[2];
-        outF[base + 3] = rec.bx[3]; outF[base + 4] = rec.bx[4]; outF[base + 5] = rec.bx[5];
-        outU[base + 6] = rec.miss >>> 0;
-        outU[base + 7] = rec.leaf
-            ? (((rec.triCount & 0xFF) << 24) | (rec.triOffset & 0x00FFFFFF)) >>> 0
-            : 0xFFFFFFFF;
-    }
-    return { nodes: outU, nodeCount };
+    // Records are serialized at POOL-assembly time (buildSpectralScene) so a
+    // per-geometry BLAS can be placed at any base offset: miss links and leaf
+    // triOffsets get the pool bases added there.
+    return records;
 }
 
 // ── Light extraction ───────────────────────────────────────────────
@@ -549,13 +539,126 @@ export function collectLights(THREE, scene, camera = null) {
 }
 
 // ── Main build ─────────────────────────────────────────────────────
+// TWO-LEVEL layout:
+//   • one BLAS per unique (geometry × per-tri material mapping), built in
+//     LOCAL space and pooled into the classic bvhNodes/triIndex/vertexData/
+//     triMaterial buffers (node encoding unchanged — miss links and leaf
+//     triOffsets are pre-offset to pool-absolute indices at assembly),
+//   • an instance table (inverse world 3×4 rows + winding sign + BLAS range)
+//     and a TLAS over instance world-AABBs, both packed into the TAIL of the
+//     materials float buffer so NO extra storage binding is needed,
+//   • built.updateTransforms() — the moving-object fast path: recompute the
+//     instance records + TLAS IN PLACE (identical array sizes) from the live
+//     matrixWorlds. Microseconds of CPU; the caller re-uploads the (small)
+//     materials buffer. No soup rewrite, no MeshBVH rebuild, no recompile.
+
+// Local-space soup + BVH for ONE unique geometry/material mapping.
+// vertexMaterial is stamped so the per-triangle material survives the BVH
+// index permutation; material-array draws get a unique first vertex per
+// visible triangle (preserves Multi/Sub assignment across shared vertices).
+function buildLocalBlas(THREE, d) {
+    const { pos, index, normal, uv } = d;
+    const vCount = pos.count;
+    const extra = d.uniqueTriMaterial ? d.visibleTriCount : 0;
+    const totalV = vCount + extra;
+    const vertexPos = new Float32Array(totalV * VERT_STRIDE);
+    const vertexNormal = new Float32Array(totalV * 3); // LOCAL space, 0 = none → flat
+    const vertexUV = new Float32Array(totalV * 2);
+    const vertexMaterial = new Uint32Array(totalV);
+    const triIndex = new Uint32Array(d.visibleTriCount * 3);
+    for (let i = 0; i < vCount; i++) {
+        const o = i * VERT_STRIDE;
+        vertexPos[o] = pos.getX(i); vertexPos[o + 1] = pos.getY(i); vertexPos[o + 2] = pos.getZ(i);
+        if (normal) {
+            const no = i * 3;
+            vertexNormal[no] = normal.getX(i); vertexNormal[no + 1] = normal.getY(i); vertexNormal[no + 2] = normal.getZ(i);
+        }
+        if (uv) {
+            const uo = i * 2;
+            vertexUV[uo] = uv.getX(i); vertexUV[uo + 1] = uv.getY(i);
+        }
+    }
+    const tagBase = vCount;
+    for (let t = 0; t < d.visibleTriCount; t++) {
+        const sourceTri = d.visibleTriIndices ? d.visibleTriIndices[t] : t;
+        if (sourceTri < 0 || sourceTri >= d.triCount) continue;
+        const sourceA = index ? index.getX(sourceTri * 3) : sourceTri * 3;
+        const a = d.uniqueTriMaterial ? tagBase + t : sourceA;
+        const b = index ? index.getX(sourceTri * 3 + 1) : sourceTri * 3 + 1;
+        const c = index ? index.getX(sourceTri * 3 + 2) : sourceTri * 3 + 2;
+        if (d.uniqueTriMaterial) {
+            const po = a * VERT_STRIDE, ps = sourceA * VERT_STRIDE;
+            vertexPos[po] = vertexPos[ps]; vertexPos[po + 1] = vertexPos[ps + 1]; vertexPos[po + 2] = vertexPos[ps + 2];
+            const no = a * 3, ns = sourceA * 3;
+            vertexNormal[no] = vertexNormal[ns]; vertexNormal[no + 1] = vertexNormal[ns + 1]; vertexNormal[no + 2] = vertexNormal[ns + 2];
+            const uo = a * 2, us = sourceA * 2;
+            vertexUV[uo] = vertexUV[us]; vertexUV[uo + 1] = vertexUV[us + 1];
+        }
+        const to = t * 3;
+        triIndex[to] = a; triIndex[to + 1] = b; triIndex[to + 2] = c;
+        const um = d.triMat[sourceTri];
+        vertexMaterial[a] = um;
+        if (!d.uniqueTriMaterial) { vertexMaterial[b] = um; vertexMaterial[c] = um; }
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(vertexPos, VERT_STRIDE));
+    geometry.setIndex(new THREE.BufferAttribute(triIndex, 1));
+    geometry.clearGroups();
+    geometry.computeBoundingBox();
+    const localBounds = geometry.boundingBox ? geometry.boundingBox.clone() : new THREE.Box3();
+    const bvh = new MeshBVH(geometry, { maxLeafTris: 8, indirect: false });
+    const roots = bvh._roots;
+    geometry.dispose?.();
+    if (!Array.isArray(roots) || roots.length === 0) return null;
+    const records = flattenBVHRoot(roots[0]);
+    // Per-triangle material in BVH order (MeshBVH permuted triIndex in place;
+    // the material rides the triangle's first vertex through the permutation).
+    const triMaterial = new Uint32Array(d.visibleTriCount);
+    for (let t = 0; t < d.visibleTriCount; t++) triMaterial[t] = vertexMaterial[triIndex[t * 3]] >>> 0;
+    return { vertexPos, vertexNormal, vertexUV, triIndex, triMaterial, records, localBounds, vertCount: totalV, triCount: d.visibleTriCount };
+}
+
+// Threaded TLAS over instance world-AABBs. Median split by index midpoint on
+// the longest axis, so the node COUNT is a pure function of the instance
+// count — updateTransforms can rebuild the whole TLAS into the same slots.
+// Leaves reference PERMUTED instance slots [off, off+cnt); `order` maps
+// slot → source instance index.
+function buildTlasRecords(aabbs, leafSize = 2) {
+    const order = aabbs.map((_, i) => i);
+    const records = [];
+    function emit(lo, hi) {
+        const rec = { bx: [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity], leaf: false, off: 0, cnt: 0, miss: 0 };
+        records.push(rec);
+        for (let i = lo; i < hi; i++) {
+            const a = aabbs[order[i]];
+            if (a.min[0] < rec.bx[0]) rec.bx[0] = a.min[0];
+            if (a.min[1] < rec.bx[1]) rec.bx[1] = a.min[1];
+            if (a.min[2] < rec.bx[2]) rec.bx[2] = a.min[2];
+            if (a.max[0] > rec.bx[3]) rec.bx[3] = a.max[0];
+            if (a.max[1] > rec.bx[4]) rec.bx[4] = a.max[1];
+            if (a.max[2] > rec.bx[5]) rec.bx[5] = a.max[2];
+        }
+        if (hi - lo <= leafSize) {
+            rec.leaf = true; rec.off = lo; rec.cnt = hi - lo;
+        } else {
+            const ex = rec.bx[3] - rec.bx[0], ey = rec.bx[4] - rec.bx[1], ez = rec.bx[5] - rec.bx[2];
+            const axis = (ex >= ey && ex >= ez) ? 0 : (ey >= ez ? 1 : 2);
+            const sub = order.slice(lo, hi).sort((a, b) => aabbs[a].c[axis] - aabbs[b].c[axis]);
+            for (let i = 0; i < sub.length; i++) order[lo + i] = sub[i];
+            const mid = (lo + hi) >> 1;
+            emit(lo, mid);
+            emit(mid, hi);
+        }
+        rec.miss = records.length; // escape = first slot after this subtree
+    }
+    emit(0, order.length);
+    return { records, order };
+}
 
 export async function buildSpectralScene({ THREE, scene, camera = null, maxTriangles = 4_000_000 } = {}) {
     if (!scene) return null;
     scene.updateMatrixWorld(true);
 
-    // Pass 1: gather eligible (mesh, matrixWorld, materialUberIndex-per-group)
-    // and count verts/tris so we can allocate once.
     const uberList = [];
     const uberMaterials = []; // parallel to uberList: source THREE material (for map extraction)
     const uberMap = new Map();
@@ -573,11 +676,11 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         return idx;
     }
 
-    const draws = []; // { geometry, matrices: Mat4[], triMat: Uint32 per-source-tri material }
-    let totalVerts = 0;
-    let totalTris = 0;
-
-    const mat4Scratch = new THREE.Matrix4();
+    // Pass 1: gather draws; dedupe BLAS by (geometry identity × per-tri uber
+    // mapping) so shared and instanced geometry costs ONE local soup + BVH.
+    const blasList = [];
+    const blasByKey = new Map();
+    const instances = []; // { blas, object, instanceIndex } — matrices re-read on update
     scene.traverseVisible((obj) => {
         if (!isTraceableMesh(obj, camera)) return;
         const geom = obj.geometry;
@@ -591,136 +694,135 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
             buildTriangleMaterialMap(geom, mats, triCount, internMaterial, Array.isArray(obj.material));
         if (visibleTriCount <= 0) return;
 
-        const matrices = [];
+        const uniqueTriMaterial = Array.isArray(obj.material);
+        let key = `${geom.uuid}:${index ? index.version : -1}:${pos.version}:${uniqueTriMaterial ? 1 : 0}`;
+        if (uniqueTriMaterial) {
+            let h = 0;
+            for (let t = 0; t < triCount; t++) h = ((h * 31) + triMat[t] + 1) >>> 0;
+            key += ':' + h;
+        } else {
+            key += ':' + triMat[0];
+        }
+
+        let blasIdx = blasByKey.get(key);
+        if (blasIdx === undefined) {
+            const blas = buildLocalBlas(THREE, {
+                pos, index, triCount, visibleTriCount, visibleTriIndices, triMat, uniqueTriMaterial,
+                normal: geom.attributes.normal || null,
+                uv: geom.attributes.uv || null,
+            });
+            if (!blas) return;
+            blasIdx = blasList.length;
+            blasList.push(blas);
+            blasByKey.set(key, blasIdx);
+        }
         if (obj.isInstancedMesh) {
             const capacity = Number.isFinite(obj.instanceMatrix?.count) ? obj.instanceMatrix.count : obj.count;
             const count = Math.max(0, Math.min(obj.count | 0, capacity | 0));
-            for (let i = 0; i < count; i++) {
-                const m = new THREE.Matrix4();
-                obj.getMatrixAt(i, m);
-                m.premultiply(obj.matrixWorld);
-                matrices.push(m);
-            }
+            for (let i = 0; i < count; i++) instances.push({ blas: blasIdx, object: obj, instanceIndex: i });
         } else {
-            matrices.push(obj.matrixWorld.clone());
+            instances.push({ blas: blasIdx, object: obj, instanceIndex: -1 });
         }
-        if (matrices.length === 0) return;
-
-        const uniqueTriMaterial = Array.isArray(obj.material);
-        totalVerts += (pos.count + (uniqueTriMaterial ? visibleTriCount : 0)) * matrices.length;
-        totalTris += visibleTriCount * matrices.length;
-        draws.push({
-            geom, pos, index, triCount, visibleTriCount, visibleTriIndices, matrices, triMat, uniqueTriMaterial,
-            normal: geom.attributes.normal || null,
-            uv: geom.attributes.uv || null,
-        });
     });
 
-    if (totalTris === 0 || totalVerts === 0) return null;
-    if (totalTris > maxTriangles) {
+    if (blasList.length === 0 || instances.length === 0) return null;
+    const instCount = instances.length;
+    if (instCount >= (1 << 24)) return { error: `too many instances for the TLAS leaf payload: ${instCount}` };
+
+    // Pool assembly: place every BLAS at its base offsets, then serialize
+    // nodes with pool-absolute miss links / leaf triOffsets.
+    let poolVerts = 0, poolTris = 0, poolNodes = 0;
+    for (const b of blasList) {
+        b.vertBase = poolVerts; b.triBase = poolTris; b.nodeBase = poolNodes;
+        poolVerts += b.vertCount; poolTris += b.triCount; poolNodes += b.records.length;
+    }
+    if (poolTris === 0) return null;
+    if (poolTris > maxTriangles) {
         // Hard cap: refuse to build rather than blow the storage-buffer ceiling.
-        return { error: `scene too large for path tracer: ${totalTris} tris > ${maxTriangles} cap` };
+        // NOTE: the cap now applies to POOLED (unique) triangles — instances are free.
+        return { error: `scene too large for path tracer: ${poolTris} tris > ${maxTriangles} cap` };
+    }
+    if (poolTris >= (1 << 24) || poolNodes >= (1 << 24)) {
+        return { error: `BVH pool exceeds the 24-bit index ceiling (${poolTris} tris / ${poolNodes} nodes)` };
     }
 
-    // Pass 2: allocate and fill the world-space indexed soup. vertexMaterial
-    // is stamped so the final per-triangle material survives the BVH index
-    // permutation. Material-array draws get a unique first vertex per visible
-    // triangle, which preserves exact Multi/Sub group material assignment even
-    // when source triangles share vertices.
-    const vertexPos = new Float32Array(totalVerts * VERT_STRIDE);
-    const vertexNormal = new Float32Array(totalVerts * 3); // world-space, 0 = none → flat
-    const vertexUV = new Float32Array(totalVerts * 2);
-    const triIndex = new Uint32Array(totalTris * 3);
-    const vertexMaterial = new Uint32Array(totalVerts);
-    let vCursor = 0; // vertex count written
-    let tCursor = 0; // triangle count written
-
-    const v = new THREE.Vector3();
-    const nrm = new THREE.Vector3();
-    const normalMat = new THREE.Matrix3();
-    for (const d of draws) {
-        const { pos, index, triCount, visibleTriCount, visibleTriIndices, matrices, triMat, uniqueTriMaterial, normal, uv } = d;
-        const vCount = pos.count;
-        for (const m of matrices) {
-            const vBase = vCursor;
-            const tagBase = vBase + vCount;
-            normalMat.getNormalMatrix(m); // inverse-transpose of the model 3x3
-            for (let i = 0; i < vCount; i++) {
-                v.fromBufferAttribute(pos, i).applyMatrix4(m);
-                const o = (vBase + i) * VERT_STRIDE;
-                vertexPos[o] = v.x; vertexPos[o + 1] = v.y; vertexPos[o + 2] = v.z;
-                if (normal) {
-                    nrm.fromBufferAttribute(normal, i).applyMatrix3(normalMat).normalize();
-                    const no = (vBase + i) * 3;
-                    vertexNormal[no] = nrm.x; vertexNormal[no + 1] = nrm.y; vertexNormal[no + 2] = nrm.z;
-                }
-                if (uv) {
-                    const uo = (vBase + i) * 2;
-                    vertexUV[uo] = uv.getX(i); vertexUV[uo + 1] = uv.getY(i);
-                }
-            }
-            for (let t = 0; t < visibleTriCount; t++) {
-                const sourceTri = visibleTriIndices ? visibleTriIndices[t] : t;
-                if (sourceTri < 0 || sourceTri >= triCount) continue;
-                const sourceA = vBase + (index ? index.getX(sourceTri * 3) : sourceTri * 3);
-                const a = uniqueTriMaterial ? tagBase + t : sourceA;
-                const b = vBase + (index ? index.getX(sourceTri * 3 + 1) : sourceTri * 3 + 1);
-                const c = vBase + (index ? index.getX(sourceTri * 3 + 2) : sourceTri * 3 + 2);
-                if (uniqueTriMaterial) {
-                    const po = a * VERT_STRIDE;
-                    const ps = sourceA * VERT_STRIDE;
-                    vertexPos[po] = vertexPos[ps];
-                    vertexPos[po + 1] = vertexPos[ps + 1];
-                    vertexPos[po + 2] = vertexPos[ps + 2];
-                    const no = a * 3;
-                    const ns = sourceA * 3;
-                    vertexNormal[no] = vertexNormal[ns];
-                    vertexNormal[no + 1] = vertexNormal[ns + 1];
-                    vertexNormal[no + 2] = vertexNormal[ns + 2];
-                    const uo = a * 2;
-                    const us = sourceA * 2;
-                    vertexUV[uo] = vertexUV[us];
-                    vertexUV[uo + 1] = vertexUV[us + 1];
-                }
-                const to = (tCursor + t) * 3;
-                triIndex[to] = a;
-                triIndex[to + 1] = b;
-                triIndex[to + 2] = c;
-                const um = triMat[sourceTri];
-                vertexMaterial[a] = um;
-                if (!uniqueTriMaterial) {
-                    vertexMaterial[b] = um;
-                    vertexMaterial[c] = um;
-                }
-            }
-            vCursor += vCount + (uniqueTriMaterial ? visibleTriCount : 0);
-            tCursor += visibleTriCount;
+    const triIndex = new Uint32Array(poolTris * 3);
+    const triMaterial = new Uint32Array(poolTris);
+    const vertexData = new Float32Array(poolVerts * VERTEX_DATA_STRIDE);
+    const nodeBuf = new ArrayBuffer(poolNodes * NODE_STRIDE_U32 * 4);
+    const nodesF = new Float32Array(nodeBuf);
+    const nodesU = new Uint32Array(nodeBuf);
+    for (const b of blasList) {
+        for (let i = 0; i < b.vertCount; i++) {
+            const dd = (b.vertBase + i) * VERTEX_DATA_STRIDE, p = i * VERT_STRIDE, n = i * 3, u = i * 2;
+            vertexData[dd] = b.vertexPos[p]; vertexData[dd + 1] = b.vertexPos[p + 1]; vertexData[dd + 2] = b.vertexPos[p + 2];
+            vertexData[dd + 3] = b.vertexNormal[n]; vertexData[dd + 4] = b.vertexNormal[n + 1]; vertexData[dd + 5] = b.vertexNormal[n + 2];
+            vertexData[dd + 6] = b.vertexUV[u]; vertexData[dd + 7] = b.vertexUV[u + 1];
         }
+        for (let t = 0; t < b.triCount; t++) {
+            const to = (b.triBase + t) * 3, ts = t * 3;
+            triIndex[to] = b.triIndex[ts] + b.vertBase;
+            triIndex[to + 1] = b.triIndex[ts + 1] + b.vertBase;
+            triIndex[to + 2] = b.triIndex[ts + 2] + b.vertBase;
+            triMaterial[b.triBase + t] = b.triMaterial[t];
+        }
+        for (let i = 0; i < b.records.length; i++) {
+            const base = (b.nodeBase + i) * NODE_STRIDE_U32;
+            const rec = b.records[i];
+            nodesF[base] = rec.bx[0]; nodesF[base + 1] = rec.bx[1]; nodesF[base + 2] = rec.bx[2];
+            nodesF[base + 3] = rec.bx[3]; nodesF[base + 4] = rec.bx[4]; nodesF[base + 5] = rec.bx[5];
+            nodesU[base + 6] = (rec.miss + b.nodeBase) >>> 0;
+            nodesU[base + 7] = rec.leaf
+                ? (((rec.triCount & 0xFF) << 24) | ((rec.triOffset + b.triBase) & 0x00FFFFFF)) >>> 0
+                : 0xFFFFFFFF;
+        }
+        b.blasRoot = b.nodeBase;
+        b.blasEnd = b.nodeBase + b.records.length;
+        // pooled now — drop the per-BLAS copies so `built` holds one copy of the soup
+        b.vertexPos = null; b.vertexNormal = null; b.vertexUV = null;
+        b.triIndex = null; b.triMaterial = null; b.records = null;
     }
 
-    // Build a real BufferGeometry for MeshBVH (single root → clear groups).
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(vertexPos, VERT_STRIDE));
-    geometry.setIndex(new THREE.BufferAttribute(triIndex, 1));
-    geometry.clearGroups();
-    geometry.computeBoundingBox();
-    // World-space AABB of the EXACT traced triangle soup. Returned so consumers
-    // (SPEEDBALL GI grid auto-fit) bound to what the BVH actually contains — no second
-    // scene walk, no dependency on per-object visibility flags. Cloned because the
-    // geometry is disposed below.
-    const bounds = geometry.boundingBox ? geometry.boundingBox.clone() : null;
-
-    const bvh = new MeshBVH(geometry, { maxLeafTris: 8, indirect: false });
-    const roots = bvh._roots;
-    if (!Array.isArray(roots) || roots.length === 0) return { error: 'BVH build produced no root' };
-    const { nodes: bvhNodes, nodeCount } = flattenBVHRoot(roots[0]);
-
-    // MeshBVH permuted triIndex in place (whole triangles). Per-triangle
-    // material in BVH order = material of the triangle's first vertex, which
-    // vertexMaterial carries through the permutation.
-    const triMaterial = new Uint32Array(totalTris);
-    for (let t = 0; t < totalTris; t++) {
-        triMaterial[t] = vertexMaterial[triIndex[t * 3]] >>> 0;
+    // ── Dynamic tail: instance records + TLAS ──────────────────────
+    const _m4 = new THREE.Matrix4();
+    const _inv = new THREE.Matrix4();
+    const _box = new THREE.Box3();
+    function instanceWorldMatrix(ins, out) {
+        const o = ins.object;
+        if (ins.instanceIndex >= 0) {
+            o.getMatrixAt(ins.instanceIndex, out);
+            out.premultiply(o.matrixWorld);
+        } else {
+            out.copy(o.matrixWorld);
+        }
+        return out;
+    }
+    function computeDynamic() {
+        const aabbs = new Array(instCount);
+        const invRows = new Float32Array(instCount * 12);
+        const detSign = new Float32Array(instCount);
+        const worldBounds = new THREE.Box3();
+        worldBounds.makeEmpty();
+        for (let i = 0; i < instCount; i++) {
+            const ins = instances[i];
+            instanceWorldMatrix(ins, _m4);
+            _inv.copy(_m4).invert();
+            const e = _inv.elements; // column-major → store ROWS (w = translation term)
+            const o = i * 12;
+            invRows[o] = e[0]; invRows[o + 1] = e[4]; invRows[o + 2] = e[8]; invRows[o + 3] = e[12];
+            invRows[o + 4] = e[1]; invRows[o + 5] = e[5]; invRows[o + 6] = e[9]; invRows[o + 7] = e[13];
+            invRows[o + 8] = e[2]; invRows[o + 9] = e[6]; invRows[o + 10] = e[10]; invRows[o + 11] = e[14];
+            detSign[i] = _m4.determinant() < 0 ? -1 : 1;
+            _box.copy(blasList[ins.blas].localBounds).applyMatrix4(_m4);
+            aabbs[i] = {
+                min: [_box.min.x, _box.min.y, _box.min.z],
+                max: [_box.max.x, _box.max.y, _box.max.z],
+                c: [(_box.min.x + _box.max.x) * 0.5, (_box.min.y + _box.max.y) * 0.5, (_box.min.z + _box.max.z) * 0.5],
+            };
+            worldBounds.union(_box);
+        }
+        const { records, order } = buildTlasRecords(aabbs);
+        return { invRows, detSign, records, order, worldBounds };
     }
 
     // Extract PBR maps into array textures FIRST — this writes each material's
@@ -728,10 +830,57 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     // materials buffer below.
     const maps = await buildMaterialTextures(THREE, uberList, uberMaterials, TEXTURE_ATLAS_SIZE);
 
-    // Materials buffer
-    const materials = new Float32Array(uberList.length * MAT_STRIDE);
-    for (let i = 0; i < uberList.length; i++) {
-        materials.set(uberList[i], i * MAT_STRIDE);
+    // Materials buffer with the dynamic tail:
+    //   [ ubers (uberCount×MAT_STRIDE) | instances (instCount×MAT_STRIDE) | TLAS (tlasNodes×8) ]
+    // The uint view aliases the SAME ArrayBuffer so TLAS miss/payload words are
+    // written bit-exactly (a float round-trip could canonicalize NaN patterns).
+    const dyn0 = computeDynamic();
+    const instBase = uberList.length * MAT_STRIDE;     // float-element index
+    const tlasBase = instBase + instCount * MAT_STRIDE;
+    const tlasNodeCount = dyn0.records.length;
+    const materials = new Float32Array(tlasBase + tlasNodeCount * NODE_STRIDE_U32);
+    const materialsU32 = new Uint32Array(materials.buffer);
+    for (let i = 0; i < uberList.length; i++) materials.set(uberList[i], i * MAT_STRIDE);
+
+    function writeDynamic(dyn) {
+        for (let slot = 0; slot < instCount; slot++) {
+            const src = dyn.order[slot];
+            const ins = instances[src];
+            const blas = blasList[ins.blas];
+            const b = instBase + slot * MAT_STRIDE;
+            materials.set(dyn.invRows.subarray(src * 12, src * 12 + 12), b);
+            materials[b + 12] = blas.blasRoot;   // exact ≤ 2^24 (guarded above)
+            materials[b + 13] = blas.blasEnd;
+            materials[b + 14] = dyn.detSign[src];
+            materials.fill(0, b + 15, b + MAT_STRIDE);
+        }
+        for (let i = 0; i < dyn.records.length; i++) {
+            const rec = dyn.records[i];
+            const b = tlasBase + i * NODE_STRIDE_U32;
+            materials[b] = rec.bx[0]; materials[b + 1] = rec.bx[1]; materials[b + 2] = rec.bx[2];
+            materials[b + 3] = rec.bx[3]; materials[b + 4] = rec.bx[4]; materials[b + 5] = rec.bx[5];
+            materialsU32[b + 6] = rec.miss >>> 0;
+            materialsU32[b + 7] = rec.leaf
+                ? (((rec.cnt & 0xFF) << 24) | (rec.off & 0x00FFFFFF)) >>> 0
+                : 0xFFFFFFFF;
+        }
+    }
+    writeDynamic(dyn0);
+
+    // Moving-object fast path: re-read live matrixWorlds, rewrite the dynamic
+    // tail in place. Returns { bounds } or null when the TLAS no longer fits
+    // (instance count changed under us → caller should full-rebuild).
+    function updateTransforms() {
+        const seen = new Set();
+        for (const ins of instances) {
+            if (seen.has(ins.object)) continue;
+            seen.add(ins.object);
+            ins.object.updateWorldMatrix?.(true, false);
+        }
+        const dyn = computeDynamic();
+        if (dyn.records.length !== tlasNodeCount) return null;
+        writeDynamic(dyn);
+        return { bounds: dyn.worldBounds.clone() };
     }
 
     // Lights
@@ -744,27 +893,16 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         ? scene.userData.maxjsPathTraceEnvironment
         : (scene.environment?.isTexture ? scene.environment : null);
 
-    geometry.dispose?.();
-
-    // Interleave pos+normal+uv into one GPU storage buffer (8 floats/vertex) so
-    // the kernel stays within the 8 storage-buffer budget. Layout per vertex:
-    // [px,py,pz, nx,ny,nz, u,v]. Original vertex order (BVH only permuted tris).
-    const vertexData = new Float32Array(totalVerts * VERTEX_DATA_STRIDE);
-    for (let i = 0; i < totalVerts; i++) {
-        const d = i * VERTEX_DATA_STRIDE, p = i * VERT_STRIDE, n = i * 3, u = i * 2;
-        vertexData[d] = vertexPos[p]; vertexData[d + 1] = vertexPos[p + 1]; vertexData[d + 2] = vertexPos[p + 2];
-        vertexData[d + 3] = vertexNormal[n]; vertexData[d + 4] = vertexNormal[n + 1]; vertexData[d + 5] = vertexNormal[n + 2];
-        vertexData[d + 6] = vertexUV[u]; vertexData[d + 7] = vertexUV[u + 1];
-    }
-
     return {
         error: null,
-        bounds, // THREE.Box3 | null — world-space AABB of the traced soup
-        bvhNodes, nodeCount,
-        triIndex, triCount: totalTris,
-        vertexData, vertexCount: totalVerts,
+        bounds: dyn0.worldBounds.clone(), // world-space AABB of the traced instances
+        bvhNodes: nodesU, nodeCount: poolNodes,
+        triIndex, triCount: poolTris,
+        vertexData, vertexCount: poolVerts,
         triMaterial,
         materials, materialCount: uberList.length,
+        instBase, instCount, tlasBase, tlasNodeCount,
+        updateTransforms,
         lights, lightCount: lightRecords.length,
         env,
         maps, // { albedo, normal, roughness, metalness, emissive, alpha } DataArrayTexture | null

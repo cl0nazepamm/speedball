@@ -88,8 +88,9 @@ const ROT_MIN_TICKS = 6;           // min ticks between ray-set rotations. Small
                                    // the temporal blend has to absorb. Large grids (multi-tick
                                    // passes ≥ this) are unaffected — they already rotate per pass.
 const LIGHT_CHECK_INTERVAL = 6;    // ticks between light-change checks
-const GEO_CHECK_INTERVAL = 24;     // ticks between geometry-change checks (full rebuild = expensive)
-const GEO_SETTLE_INTERVALS = 2;    // geo must be stable this many checks before a rebuild fires (debounce)
+const XFORM_CHECK_INTERVAL = 2;    // ticks between transform checks (in-place TLAS rewrite = cheap)
+const GEO_CHECK_INTERVAL = 24;     // ticks between STRUCTURE checks (topology → full rebuild = expensive)
+const GEO_SETTLE_INTERVALS = 2;    // structure must be stable this many checks before a rebuild fires (debounce)
 // ── freeze-proofing: gate the synchronous BVH rebuild + GPU solve on viewport idle ──
 // The CPU MeshBVH build in rebuild() blocks the render thread, so it (and the GPU
 // solve) must NEVER land while the user is orbiting, the timeline is playing, or a
@@ -627,6 +628,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     let debugFrameJitterOverride = null;
     let lastLightSig = null;
     let lastGeoSig = null;
+    let lastXformSig = null;
     let geoStable = -1;       // -1 = no pending geo change; >=0 = stable-check count since a change (debounce, A1)
     let checkCounter = 0;
     let reactiveTicks = 0;
@@ -845,12 +847,19 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const materials = storage(buffers.materials, 'float', buffers.materials.count).toReadOnly();
         const lights = storage(buffers.lights, 'float', buffers.lights.count).toReadOnly();
 
-        const Utrav = { nodeCount: uniform(built.nodeCount >>> 0, 'uint'), envRotation: uniform(0.0), envIntensity: uniform(1.0) };
+        const Utrav = {
+            nodeCount: uniform(built.nodeCount >>> 0, 'uint'),
+            tlasNodeCount: uniform((built.tlasNodeCount ?? 0) >>> 0, 'uint'),
+            instBase: uniform((built.instBase ?? 0) >>> 0, 'uint'),
+            tlasBase: uniform((built.tlasBase ?? 0) >>> 0, 'uint'),
+            envRotation: uniform(0.0),
+            envIntensity: uniform(1.0),
+        };
         const trav = buildTraversal({
             storages: { bvhNodes, triIndex, vertexData, triMaterial, materials },
             U: Utrav, env: null, lut: null, lutRes: 0, maps: built.maps,
         });
-        const { fetchVert, fetchNorm, traverseClosest, traverseAny, matFloat, triVert, fetchUV, hitUV, sampleLayer, srgbToLinear, albedoTex, emissiveTex, haveAlbedoMap, haveEmissiveMap } = trav;
+        const { fetchVert, fetchNorm, traverseClosest, traverseAny, instLocalRay, instNormalToWorld, matFloat, triVert, fetchUV, hitUV, sampleLayer, srgbToLinear, albedoTex, emissiveTex, haveAlbedoMap, haveEmissiveMap } = trav;
 
         // ray scratch: 4 floats per (probe,ray) = rgb + hitT. itemSize-1 'float'
         // scalar storage — the proven in-repo pattern (gi_irradiance_volume), not
@@ -957,16 +966,26 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const hitT = float(-1.0).toVar();
             const bestT = float(T_MAX).toVar();
             const bestTri = int(-1).toVar();
-            traverseClosest(ro, rd, bestT, bestTri);
+            const bestInst = int(-1).toVar();
+            traverseClosest(ro, rd, bestT, bestTri, bestInst);
 
             If(bestTri.greaterThanEqual(int(0)), () => {
                 hitT.assign(bestT);
                 const triId = uint(bestTri);
+                const instId = uint(bestInst);
                 const matId = triMaterial.element(triId);
+                // Vertex data is LOCAL space — shade via the hit instance: the
+                // local ray reproduces the traversal's barycentrics exactly
+                // (affine-invariant), the geometric normal transforms to world
+                // through (M⁻¹)ᵀ, and hitPoint stays on the WORLD ray (t is
+                // the same parameter in both spaces).
+                const L = instLocalRay(instId, ro, rd);
+                const lro = L.ro.toVar();
+                const lrd = L.rd.toVar();
                 const p0 = fetchVert(triVert(triId, 0));
                 const p1 = fetchVert(triVert(triId, 1));
                 const p2 = fetchVert(triVert(triId, 2));
-                const ngRaw = normalize(cross(p1.sub(p0), p2.sub(p0)));
+                const ngRaw = instNormalToWorld(instId, normalize(cross(p1.sub(p0), p2.sub(p0))));
                 const faceFwd = dot(ngRaw, rd).lessThan(float(0.0));
                 const ng = ngRaw.mul(select(faceFwd, float(1.0), float(-1.0))).toVar();
                 const hitPoint = ro.add(rd.mul(bestT));
@@ -981,13 +1000,13 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 // UVs are numerically identical. A real hit guarantees |det|>0.
                 const e1 = p1.sub(p0);
                 const e2 = p2.sub(p0);
-                const pv = cross(rd, e2);
+                const pv = cross(lrd, e2);
                 const det = dot(e1, pv);
                 const invDet = float(1.0).div(det);
-                const tv = ro.sub(p0);
+                const tv = lro.sub(p0);
                 const ub = dot(tv, pv).mul(invDet);
                 const qv = cross(tv, e1);
-                const vb = dot(rd, qv).mul(invDet);
+                const vb = dot(lrd, qv).mul(invDet);
                 const uv0 = hitUV(triId, ub, vb);
                 const uv = uv0.mul(vec2(matFloat(matId, 18), matFloat(matId, 19))).add(vec2(matFloat(matId, 20), matFloat(matId, 21)));
 
@@ -1282,14 +1301,16 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const rd = normalize(classifyRayDir(k)).toVar();
                 const bestT = float(T_MAX).toVar();
                 const bestTri = int(-1).toVar();
-                traverseClosest(ro, rd, bestT, bestTri);
+                const bestInst = int(-1).toVar();
+                traverseClosest(ro, rd, bestT, bestTri, bestInst);
                 If(bestTri.greaterThanEqual(int(0)), () => {
                     hits.addAssign(float(1.0));
                     const triId = uint(bestTri);
                     const p0 = fetchVert(triVert(triId, 0));
                     const p1 = fetchVert(triVert(triId, 1));
                     const p2 = fetchVert(triVert(triId, 2));
-                    const ng = normalize(cross(p1.sub(p0), p2.sub(p0)));
+                    // local verts → world geometric normal via the hit instance
+                    const ng = instNormalToWorld(uint(bestInst), normalize(cross(p1.sub(p0), p2.sub(p0))));
                     If(dot(rd, ng).greaterThan(float(0.0)), () => { // backface → probe is behind this surface
                         back.addAssign(float(1.0));
                         If(bestT.lessThan(closeBackDist), () => { closeBackDist.assign(bestT); closeBackDir.assign(rd); });
@@ -1695,11 +1716,18 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             return;
         }
 
-        // reactivity: detect live light/geometry edits (throttled). Light change →
-        // cheap in-place buffer refresh; geometry change → debounced rebuild. These walk the
-        // scene graph (CPU), so in continuous mode they run ONLY at rest — never per orbit frame.
+        // reactivity: detect live edits (throttled). Transform change → in-place
+        // instance/TLAS rewrite (near-instant, no rebuild). Light change → cheap
+        // in-place buffer refresh. STRUCTURE change (topology/instance set) →
+        // debounced full rebuild. These walk the scene graph (CPU), so in
+        // continuous mode they run ONLY at rest — never per orbit frame.
         if (restOnly) {
             checkCounter++;
+            if (checkCounter % XFORM_CHECK_INTERVAL === 0) {
+                const xs = xformSignature();
+                if (lastXformSig !== null && xs !== lastXformSig) refreshTransforms();
+                lastXformSig = xs;
+            }
             if (checkCounter % LIGHT_CHECK_INTERVAL === 0) {
                 const ls = lightSignature();
                 if (lastLightSig !== null && ls !== lastLightSig) refreshLights();
@@ -1707,8 +1735,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             }
             if (checkCounter % GEO_CHECK_INTERVAL === 0) {
                 const gs = geoSignature();
-                // (A1) Debounce: rebuild only after the geometry has been STABLE for
-                // GEO_SETTLE_INTERVALS consecutive checks, so a continuous drag never
+                // (A1) Debounce: rebuild only after the structure has been STABLE for
+                // GEO_SETTLE_INTERVALS consecutive checks, so a continuous edit never
                 // thrashes. geoStable: -1 = no pending change; >=0 = stable-checks counted.
                 if (lastGeoSig === null) lastGeoSig = gs;
                 else if (gs !== lastGeoSig) { lastGeoSig = gs; geoStable = 0; }
@@ -1906,21 +1934,56 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         });
         return n + ':' + s;
     }
+    // STRUCTURE signature: topology / vertex edits / instance-set identity —
+    // anything that invalidates the pooled BLAS soup and needs a full rebuild.
+    // Transforms are deliberately EXCLUDED: moves ride the TLAS fast path.
     function geoSignature() {
         let meshes = 0, prims = 0, hash = 0;
-        // (A1) Quantize world translation to ~¼ cell: sub-perceptual sync jitter does
-        // NOT re-arm a rebuild, while a genuine move DOES (the BVH bakes world-space
-        // verts, so real moves MUST rebuild or the field traces stale geometry).
-        const q = quantStep > 1e-6 ? quantStep : 1;
         scene.traverseVisible((o) => {
             if (!o.isMesh && !o.isInstancedMesh) return;
             const p = o.geometry?.attributes?.position; if (!p) return;
             meshes++;
             prims += o.geometry.index ? o.geometry.index.count : p.count;
-            const e = o.matrixWorld?.elements;
-            if (e) hash += Math.round(e[12] / q) + Math.round(e[13] / q) * 1.7 + Math.round(e[14] / q) * 2.3 + p.count + (o.count || 1);
+            hash = ((hash * 31) + p.count + ((p.version | 0) * 7) + ((o.count || 1) * 3)) | 0;
         });
-        return `${meshes}:${prims}:${Math.round(hash)}`;
+        return `${meshes}:${prims}:${hash}`;
+    }
+    // TRANSFORM signature: quantized affine matrixWorld (rotation/scale at 1e-3,
+    // translation deadbanded to ~¼ cell so sub-perceptual sync jitter does not
+    // churn the TLAS) + InstancedMesh matrix version.
+    function xformSignature() {
+        const q = quantStep > 1e-6 ? quantStep : 1;
+        let h = 0;
+        scene.traverseVisible((o) => {
+            if (!o.isMesh && !o.isInstancedMesh) return;
+            if (!o.geometry?.attributes?.position) return;
+            const e = o.matrixWorld?.elements;
+            if (e) {
+                for (let k = 0; k < 12; k++) h = ((h * 33) + Math.round(e[k] * 1000)) | 0;
+                h = ((h * 33) + Math.round(e[12] / q)) | 0;
+                h = ((h * 33) + Math.round(e[13] / q)) | 0;
+                h = ((h * 33) + Math.round(e[14] / q)) | 0;
+            }
+            if (o.isInstancedMesh && o.instanceMatrix) h = ((h * 33) + (o.instanceMatrix.version | 0)) | 0;
+        });
+        return h;
+    }
+    // Moving-object fast path: rewrite the instance table + TLAS in place from
+    // the live matrixWorlds (spectral_scene updateTransforms) and re-upload the
+    // small materials buffer. No soup rewrite, no MeshBVH rebuild, no shader
+    // recompile — probes re-trace the moved geometry on the next solve pass.
+    // A null result means the instance set changed under us → full rebuild.
+    function refreshTransforms() {
+        const built = cachedBuilt;
+        if (!built?.updateTransforms || !casc[0].gpu) return;
+        let res = null;
+        try { res = built.updateTransforms(); } catch { res = null; }
+        if (!res) { requestRebuild(); return; }
+        for (const C of casc) {
+            const g = C.gpu; if (!g) continue;
+            g.buffers.materials.needsUpdate = true;
+        }
+        reactiveTicks = REACTIVE_TICKS;
     }
     // re-collect lights into EACH cascade's light buffer (no BVH rebuild). Count change →
     // full rebuild. Both cascades bind their own copy of the light soup, so update both.

@@ -5,6 +5,22 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- **Two-level BVH (TLAS/BLAS): moving objects now update GI instantly.**
+  Each unique geometry builds ONE local-space BLAS (instanced/shared meshes
+  are pooled once — the triangle cap now counts unique triangles); a TLAS
+  over instance world-AABBs plus the instance table ride in the tail of the
+  materials buffer (no extra storage bindings). Dragging an object is an
+  in-place instance/TLAS rewrite + tiny buffer re-upload — no soup rewrite,
+  no MeshBVH rebuild, no shader recompile, no frame hitch. Zero setup: the
+  field detects transform changes itself (checked every 2 ticks).
+- `buildTraversal` consumers: vertex data is LOCAL space now — hit shading
+  must use the new `instLocalRay` / `instNormalToWorld` helpers and pass a
+  `bestInst` out-var to `traverseClosest`. `U` gains `tlasNodeCount`,
+  `instBase`, `tlasBase` uint uniforms (all provided by `buildSpectralScene`).
+- Continuous solve now defaults ON at the field level — smooth GI while the
+  camera moves out of the box; `setContinuous(false)` restores strict
+  idle-gating.
+
 - Added a NIR (near-infrared) spectral layer to the shared scene modules:
   `spectral_scene.js` now emits a photocathode-facing `nirAlbedo` field
   (material slot [25], MAT_STRIDE unchanged at 28) and per-light emitter
