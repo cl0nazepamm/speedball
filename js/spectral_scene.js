@@ -526,6 +526,11 @@ export function collectLights(THREE, scene, camera = null) {
             // drives its 850 nm band (and it stays invisible in visible mode
             // because the band is far outside the sampled domain). Everything
             // else with a black colour genuinely emits nothing.
+            // NOTE the promotion below is for the PT's emitterAtLambda (max
+            // channel = the band's peak radiance). RGB-domain consumers (the GI
+            // probes' NEE) must NOT shade this white as-is — they gate class-4
+            // lights on the nirGate uniform (see gi_probes.js), so the light
+            // stays dark in the visible band and appears under NV.
             if (eclass !== 4) return;
             cr = cg = cb = k;
         }

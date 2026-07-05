@@ -657,6 +657,11 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         tempChangeSigma1: uniform(GI_TEMPORAL_CHANGE_SIGMA1), // delta (in σ) above which a change counts as REAL → snaps. lower = snappier
         tempChangeHDrop: uniform(GI_TEMPORAL_CHANGE_H_DROP),  // how much hysteresis drops on a real change. higher = harder snap
         tempClampSigma: uniform(GI_TEMPORAL_CLAMP_SIGMA),     // firefly clamp band (in σ). lower = tighter/steadier, more lag
+        // NIR band gate: 0 = visible band (IR illuminators, emitter class 4, are
+        // invisible — they emit outside the sampled domain), 1 = NIR sensing
+        // (white-phosphor NV): IR lights join NEE at their promoted (k,k,k).
+        // Mirrors the PT's emitterAtLambda 850 nm band collapsed to one scalar.
+        nirGate: uniform(0.0),
         // ── sky → probes (see the "sky → probes" block below + traceKernel miss branch) ──
         skyIntensity: uniform(1.0),   // scales the injected SH sky (0 = off)
         skySH: Array.from({ length: 9 }, () => uniform(new THREE.Vector3())), // radiance SH-9; all-zero = miss stays BLACK (the old invariant)
@@ -1034,13 +1039,18 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
 
                 // NEE over ALL lights (count small; loop avoids sampling noise).
                 Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
-                    // stride matches spectral_scene LIGHT_STRIDE (17: [16] is
-                    // the emitter class, unused here — probes are RGB-domain)
+                    // stride matches spectral_scene LIGHT_STRIDE (17: [16] is the
+                    // emitter class — probes are RGB-domain except for the band
+                    // gate below: class-4 IR illuminators only exist when the
+                    // imager senses NIR, so their promoted (k,k,k) is scaled by
+                    // U.nirGate (0 in the visible band, 1 under NV).
                     const lb = li.mul(uint(17)).toVar();
                     const ltype = lights.element(lb);
                     const lpos = loadLightVec3(lb, 1);
                     const ldir = loadLightVec3(lb, 4);
-                    const lcol = loadLightVec3(lb, 7);
+                    const eclass = lights.element(lb.add(uint(16)));
+                    const isIr = tslAbs(eclass.sub(float(4.0))).lessThan(float(0.25));
+                    const lcol = loadLightVec3(lb, 7).mul(select(isIr, U.nirGate, float(1.0)));
                     const lrange = lights.element(lb.add(uint(10)));
                     const ldecay = lights.element(lb.add(uint(11)));
                     const lcosAngle = lights.element(lb.add(uint(12)));
@@ -1051,7 +1061,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                     const dist = select(isDir, float(1e4), tslMax(length(toLight), float(1e-4)));
                     const wi = normalize(toLight);
                     const ndl = tslMax(dot(ng, wi), float(0.0));
-                    If(ndl.greaterThan(float(0.0)), () => {
+                    // fold the light's peak into the gate so band-gated (black) lights
+                    // skip the shadow ray entirely, not just shade to zero.
+                    const lpeak = tslMax(tslMax(lcol.x, lcol.y), lcol.z);
+                    If(ndl.mul(lpeak).greaterThan(float(0.0)), () => {
                         const blocked = traverseAny(hitPos, wi, dist.sub(traceBias));
                         If(blocked.lessThan(float(0.5)), () => {
                             const falloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
@@ -2198,6 +2211,18 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             reactiveTicks = REACTIVE_TICKS; // trace-side knob: fade the new level in (same reason as setRadianceClamp)
         },
         getSkyIntensity: () => U.skyIntensity.value,
+        // ── NIR band sensing (white-phosphor NV). Trace-side gate for emitter-class-4
+        // IR illuminators: 0 = visible band (IR lights dark, the physical truth),
+        // 1 = NIR (IR lights join NEE at white × intensity). Pair with
+        // setNirDirectSensing (gi_lights_node) so the DIRECT raster term flips too —
+        // installSpeedballGI's setNirSensing does both.
+        setNirSensing: (on) => {
+            const v = on ? 1.0 : 0.0;
+            if (U.nirGate.value === v) return;
+            U.nirGate.value = v;
+            reactiveTicks = REACTIVE_TICKS; // trace-side knob: fade the band switch in (same reason as setRadianceClamp)
+        },
+        getNirSensing: () => U.nirGate.value > 0.5,
         // ── adaptive-blend tuning (live; no recompile). Tune "stable continuous" by feel. ──
         setChangeThreshold: (v) => { if (Number.isFinite(v)) U.tempChangeSigma1.value = THREE.MathUtils.clamp(v, 0.5, 8); },   // σ delta to treat a change as REAL — lower = snappier
         setSnapAmount: (v) => { if (Number.isFinite(v)) U.tempChangeHDrop.value = THREE.MathUtils.clamp(v, 0, 0.9); },         // hysteresis drop on a real change — higher = harder snap

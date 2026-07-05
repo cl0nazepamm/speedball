@@ -44,6 +44,17 @@ All notable changes to Speedball GI are documented here. This project follows
   camera moves out of the box; `setContinuous(false)` restores strict
   idle-gating.
 
+- NIR band sensing for the raster path (`setNirSensing(on)` on the install
+  handle; granular: probe field `setNirSensing` + `setNirDirectSensing` from
+  `gi_lights_node`). Emitter-class-`'ir'` lights (RGB-black, intensity-driven)
+  are now simulated in both raster terms instead of leaking or vanishing:
+  - GI probes gate class-4 lights in NEE on a `nirGate` uniform — previously
+    the promoted white `(k,k,k)` lit the field even in the visible band.
+  - The direct term lifts IR lights off the batched `DynamicLightsNode` path
+    onto per-light nodes whose `colorNode` is the sensed color
+    (white × intensity × `nirGate`) — previously black × intensity = nothing,
+    so NV showed GI but no direct light. `light.color` is never mutated;
+    toggling the band is a uniform write (no recompile). Shadows still apply.
 - Added a NIR (near-infrared) spectral layer to the shared scene modules:
   `spectral_scene.js` now emits a photocathode-facing `nirAlbedo` field
   (material slot [25], MAT_STRIDE unchanged at 28) and per-light emitter

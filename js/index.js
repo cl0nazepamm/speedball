@@ -15,7 +15,10 @@ export { installSpeedballGI, excludeFromGI, prepareMaterialsForGI } from './inst
 export { createProbeField, getGiProbeNode, GiProbeNode } from './gi_probes.js';
 
 // Lights node that injects the GI term into every PBR material.
-export { giLights, default as GiLightsNode } from './gi_lights_node.js';
+// setNirDirectSensing flips the DIRECT term of emitter-class-'ir' lights between
+// bands (0 in visible, white × intensity under NV); pair it with the probe field's
+// setNirSensing — or use the install handle's setNirSensing, which does both.
+export { giLights, default as GiLightsNode, setNirDirectSensing, getNirDirectSensing } from './gi_lights_node.js';
 
 // Legacy surfel/lobe irradiance volume (kept for the non-BVH path).
 export { createIrradianceVolume, getGiVolumeNode, GiVolumeNode } from './gi_irradiance_volume.js';

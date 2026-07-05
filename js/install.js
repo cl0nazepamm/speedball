@@ -11,7 +11,7 @@
 
 import * as THREE from 'three/webgpu';
 import { createProbeField } from './gi_probes.js';
-import { giLights } from './gi_lights_node.js';
+import { giLights, setNirDirectSensing } from './gi_lights_node.js';
 
 // spectral_scene / gi_probes gate: userData.maxjsVisible === false → kept out of the
 // GI BVH and the auto-fit bounds. Wrapped here so callers never touch the raw flag.
@@ -167,6 +167,14 @@ export function installSpeedballGI({
 
         /** Treat "now" as an interaction, deferring the next solve (e.g. after a big edit). */
         markInteraction() { lastInteraction = _now(); },
+
+        /**
+         * NIR band sensing (white-phosphor NV filter on/off). One switch for BOTH terms
+         * of emitter-class-'ir' lights: the probes' NEE gate (GI) and the direct raster
+         * gate (gi_lights_node). Uniform writes only — no recompile, no scene mutation;
+         * light.color stays black, so the light never exists in the visible band.
+         */
+        setNirSensing(on) { gi.setNirSensing(on); setNirDirectSensing(on); },
 
         /** Recompile lit materials so GI folds in — call if you add meshes after install. */
         markMaterialsDirty,
