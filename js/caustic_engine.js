@@ -1,9 +1,15 @@
 // caustic_engine.js — reusable pure-WebGPU realtime metal-caustic engine.
 //
-// Master home for the GPU photon-caustic source (speedball). Self-contained:
-// imports only `three` (the importmap maps it to three.webgpu.js) + `three/tsl`.
-// It computes a reflective metal caustic entirely in TSL compute passes and
-// resolves it into a StorageTexture that any receiver plane can sample.
+// Master home for the GPU photon-caustic source (speedball). It computes a
+// reflective metal caustic entirely in TSL compute passes and resolves it into
+// a StorageTexture that any receiver plane can sample.
+//
+// PORTABILITY: this module imports ONLY `three/tsl` (build-agnostic) and takes
+// the THREE namespace as a parameter — so the SAME file vendors byte-identical
+// into any host build. Pass THREE from whatever your build exposes the WebGPU
+// classes under: `import * as THREE from 'three'` when an importmap maps three
+// to three.webgpu.js (speedball), or `import * as THREE from 'three/webgpu'`
+// under a bundler where bare `three` is the WebGL core (Vite / sigils).
 //
 // Pipeline (all on the GPU, no CPU readback):
 //   emit   : one compute thread per photon; samples the caster, reflects off the
@@ -27,7 +33,6 @@
 // spectral_scene.js buildSpectralScene). All photon-tracing lives here in
 // speedball; that is the canonical path.
 
-import * as THREE from 'three';
 import {
     Fn, If, Loop, Return, instanceIndex, uniform, storage, textureStore, texture, uv,
     atomicAdd, atomicLoad, atomicMax, atomicStore,
@@ -49,6 +54,7 @@ export const CAUSTIC_METALS = {
  * Create a GPU caustic engine bound to a WebGPURenderer.
  *
  * @param {object}  opts
+ * @param {object}  opts.THREE               the three namespace exposing WebGPU classes
  * @param {import('three').WebGPURenderer} opts.renderer
  * @param {number} [opts.grid=768]            caustic grid resolution (WxH)
  * @param {number} [opts.targetPhotons=3e6]   photons accumulated before "converged"
@@ -56,11 +62,13 @@ export const CAUSTIC_METALS = {
  * @returns engine handle: { overlayMesh, texture, uniforms, update(), setters, dispose() }
  */
 export function createCausticEngine({
+    THREE,
     renderer,
     grid = 768,
     targetPhotons = 3_000_000,
     floor = { width: 9, depth: 7, minX: -4.5, maxX: 4.5, minZ: -3.5, maxZ: 3.5 },
 } = {}) {
+    if (!THREE) throw new Error('createCausticEngine requires the THREE namespace (pass { THREE, renderer }).');
     const W = grid, H = grid, cells = W * H;
     const SCALE = 256.0;       // fixed-point scale for atomic energy deposit
     const MAXSCALE = 64.0;     // fixed-point scale for the atomicMax auto-exposure
