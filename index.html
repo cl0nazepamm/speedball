@@ -72,7 +72,7 @@
     "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.tsl.js",
     "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.0/examples/jsm/",
     "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.10/build/index.module.js",
-    "powershot-threejs": "https://cdn.jsdelivr.net/npm/powershot-threejs@0.3.1/src/index.js"
+    "powershot-threejs": "https://cdn.jsdelivr.net/npm/powershot-threejs@0.5.0/src/index.js"
   },
   "scopes": {
     "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.10/": { "three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.module.js" }
@@ -94,7 +94,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { positionWorld, normalWorld, pass, renderOutput } from 'three/tsl';
+import { positionWorld, normalWorld, pass } from 'three/tsl';
 import { FilmPipeline, FILM_PRESETS, FILM_PRESET_KEYS, applyFilmPreset, filmPass } from 'powershot-threejs';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
@@ -163,10 +163,10 @@ const params = {
   targetX: -3.2952, targetY: 4.4996, targetZ: -3.2815,
   // PowerShot film emulation (experimental — not persisted). Tuned baseline applies
   // after the Kodak stock preset so the sliders and shader uniforms agree on load.
-  filmEnabled: false, filmStock: 'kodak_500t', filmAmount: 1.0, filmExposure: -0.37, filmGamma: 0.93,
+  filmEnabled: false, filmStock: 'kodak_500t', filmAmount: 1.0, filmExposure: -0.5, filmGamma: 0.65,
   filmGrain: 1.2, filmGrainSize: 2.35, filmGrainSat: 0.8,
   filmHalation: 0.21, filmHalThreshold: 0.34, filmHalSoftness: 0.46, filmHalRadius: 1.8, filmHalColor: [1.0, 0.35, 0.08],
-  filmWeave: 0.73, filmFlicker: 0.17, filmPrintExposure: -0.21, filmPrintWarmth: 0, filmNegative: false,
+  filmWeave: 0.73, filmFlicker: 0.17, filmPrintExposure: 0, filmPrintWarmth: 0, filmNegative: false,
 };
 // Hosted Sponza always starts from these canonical values. Do not restore or persist
 // GUI tweaks here; a public demo should recover to the intended look on every reload.
@@ -224,12 +224,40 @@ function updateSun() {
   // warm the sun as it nears the horizon
   const warm = THREE.MathUtils.clamp(params.elevation / 18, 0, 1);
   sun.color.setRGB(1.0, 0.6 + 0.4 * warm, 0.35 + 0.65 * warm);
+  refreshSunConsumers();
   updateGiSky();
-  markInteraction();
+  markGiInteraction();
 }
 
 let lastInteractionMs = 0;
-const markInteraction = () => { lastInteractionMs = performance.now(); };
+let guiInteractionActive = false;
+let guiRestUntilMs = 0;
+let sunGiDirty = false;
+const GUI_REST_MS = 450;
+function markInteraction() { lastInteractionMs = performance.now(); }
+function markGiInteraction() { markInteraction(); gi?.markInteraction?.(); }
+function markGuiInteraction() {
+  const now = performance.now();
+  lastInteractionMs = now;
+  guiRestUntilMs = now + GUI_REST_MS;
+}
+function guiIsInteracting() {
+  return guiInteractionActive || performance.now() < guiRestUntilMs;
+}
+function flushSunGiRefresh() {
+  if (gi?.forceLightingRefresh) {
+    gi.forceLightingRefresh();
+    sunGiDirty = false;
+  } else {
+    sunGiDirty = true;
+  }
+}
+function refreshSunConsumers() {
+  sun.updateMatrixWorld(true);
+  sun.target.updateMatrixWorld(true);
+  sun.shadow.needsUpdate = true;
+  flushSunGiRefresh();
+}
 controls.addEventListener('change', markInteraction);
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -239,6 +267,17 @@ window.addEventListener('resize', () => {
 });
 
 const gui = new GUI({ title: 'SPEEDBALL GI · Sky' });
+function installGuiIdleGate(gui) {
+  const el = gui?.domElement;
+  if (!el) return;
+  const begin = () => { guiInteractionActive = true; markGuiInteraction(); };
+  const touch = () => { markGuiInteraction(); };
+  const end = () => { if (!guiInteractionActive) return; guiInteractionActive = false; markGuiInteraction(); };
+  for (const type of ['pointerdown', 'mousedown', 'touchstart']) el.addEventListener(type, begin, true);
+  for (const type of ['pointermove', 'mousemove', 'touchmove', 'wheel', 'input', 'change', 'keydown']) el.addEventListener(type, touch, true);
+  for (const type of ['pointerup', 'mouseup', 'touchend', 'touchcancel', 'blur']) window.addEventListener(type, end, true);
+}
+installGuiIdleGate(gui);
 const compactControls = window.matchMedia('(max-width: 700px), (max-height: 560px)');
 const fSky = gui.addFolder('Sky / Sun');
 fSky.add(params, 'azimuth', 0, 360, 1).name('azimuth°').onChange(updateSun);
@@ -290,27 +329,30 @@ gi.setSmoothness(1);                       // pinned (no slider)
 gi.setFilterStrength(1);   // denoise pinned on (no slider): redundant at these defaults, but harmless
 applyGiSettings(gi, params);
 updateGiSky();
+refreshSunConsumers();
 // The GI panel is shared helper code, but Sponza itself is intentionally not persisted:
 // visitors can experiment, then reload back to the release tuning.
-addGiPanel(gui, gi, params, { onInteract: markInteraction, onStructure: () => updateProbeHelpers() });
+addGiPanel(gui, gi, params, { onInteract: markGiInteraction, onStructure: () => updateProbeHelpers() });
 gui.add(params, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => { renderer.toneMappingExposure = v; });   // uncapped
 window.gi = gi; // console handle for poking
 window.gui = gui;
 window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = gi.markMaterialsDirty; // diagnostics
 
 // ── PowerShot film emulation (motion-picture negative→print chain) ──────────────
-// Runs as a post pass on the tone-mapped, sRGB-encoded scene: pass() → renderOutput()
-// gives the display-referred image the film shader expects; outputColorTransform=false
-// so the film's own sRGB output is presented verbatim (no double-encode). This is the
-// same "effect needs sRGB input" pattern three.js documents for FXAA.
+// The film is the IMAGER: it's fed SCENE-LINEAR radiance (pass() with NO renderOutput,
+// and the render loop puts the renderer in NoToneMapping while it's on) and owns the
+// ENTIRE transfer curve — H&D negative → print → display sRGB. Tone-mapping first would
+// stack two response curves (a camera doesn't photograph a tone-mapped JPEG of the world).
+// outputColorTransform=false so the film's own display-encoded sRGB is presented verbatim.
+// This mirrors how max.js drives the same physically-correct film.
 const film = new FilmPipeline(renderer);
 applyFilmPreset(film.ctx, FILM_PRESETS[params.filmStock]);
 const P = film.ctx.P;
 // Tuned baseline overrides. Apply after the stock preset so the initial Sponza look is
 // deterministic and the GUI numbers match the shader uniforms.
 film.ctx.power.value = params.filmAmount;        // 1.0 = full film, no blend with source
-P.exposure.value = params.filmExposure;
-P.inputGamma.value = params.filmGamma;           // 1.0 = gamma-correct (scene-linear source)
+P.exposure.value = params.filmExposure;          // photographic stops on the LINEAR input; −0.5 ≈ the scene's display exposure (0.7 = −0.5 stops) so mid-gray lands on the film's 0.18 reference
+P.inputGamma.value = params.filmGamma;           // pre-H&D exposure-domain shaping (film default 0.65), NOT an sRGB decode
 P.grainStrength.value = params.filmGrain;
 P.grainSize.value = params.filmGrainSize;
 P.grainSaturation.value = params.filmGrainSat;
@@ -321,12 +363,12 @@ P.halRadius.value = params.filmHalRadius;
 P.halColor.value.fromArray(params.filmHalColor);
 P.weave.value = params.filmWeave;
 P.flicker.value = params.filmFlicker;
-P.printExposure.value = params.filmPrintExposure;
+P.printExposure.value = params.filmPrintExposure * 0.301;   // slider is in stops → log10 density (matches max.js)
 P.printWarmth.value = params.filmPrintWarmth;
 P.negativeView.value = params.filmNegative ? 1 : 0;
 const post = new THREE.PostProcessing(renderer);
 post.outputColorTransform = false;               // film already emits display-encoded sRGB
-post.outputNode = filmPass(renderOutput(pass(scene, camera)), film);
+post.outputNode = filmPass(pass(scene, camera), film);   // SCENE-LINEAR in (no renderOutput) — the film owns the transfer
 window.film = film;
 
 // Every knob below is a point-op uniform → live, no recompile, no hitch.
@@ -368,7 +410,7 @@ filmCtrls.push(fHal.addColor(params, 'filmHalColor').name('color').onChange((v) 
 const fGate = fFilm.addFolder('Gate / Print');
 filmCtrls.push(fGate.add(params, 'filmWeave', 0, 3, 0.01).name('gate weave').onChange((v) => { P.weave.value = v; }));
 filmCtrls.push(fGate.add(params, 'filmFlicker', 0, 1, 0.01).name('flicker').onChange((v) => { P.flicker.value = v; }));
-fGate.add(params, 'filmPrintExposure', -1, 1, 0.01).name('print exposure').onChange((v) => { P.printExposure.value = v; });
+fGate.add(params, 'filmPrintExposure', -1, 1, 0.01).name('print exposure (stops)').onChange((v) => { P.printExposure.value = v * 0.301; });
 fGate.add(params, 'filmPrintWarmth', -1, 1, 0.01).name('print warmth').onChange((v) => { P.printWarmth.value = v; });
 if (compactControls.matches) gui.close();
 
@@ -460,13 +502,19 @@ function updateProbeHelpers() {
 
 renderer.setAnimationLoop((nowMs) => {
   controls.update();
+  if (sunGiDirty) flushSunGiRefresh();
   // SPEEDBALL GI self-gates on idle: the BVH build + GPU solve are held while orbiting
   // or dragging a slider (world-space GI is lossless held static), then converge
   // once the view rests — so a frame hitch can never land mid-interaction.
   gi?.update({ playing: false });   // idle-gated solve (camera-rest detection is built in)
   updateProbeHelpers();
-  if (params.filmEnabled) post.render();          // PowerShot film post-chain
-  else renderer.render(scene, camera);
+  if (params.filmEnabled) {
+    renderer.toneMapping = THREE.NoToneMapping;       // imager: the film owns the whole transfer curve (scene-linear in)
+    post.render();                                    // PowerShot film post-chain → display-encoded sRGB out
+  } else {
+    renderer.toneMapping = THREE.NeutralToneMapping;  // film off → switch back to the display tone-map (sRGB)
+    renderer.render(scene, camera);
+  }
 });
 </script>
 </body>
