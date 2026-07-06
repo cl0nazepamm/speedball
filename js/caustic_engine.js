@@ -58,7 +58,7 @@ export const CAUSTIC_METALS = {
  * @param {import('three').WebGPURenderer} opts.renderer
  * @param {number} [opts.grid=768]            caustic grid resolution (WxH)
  * @param {number} [opts.targetPhotons=3e6]   photons accumulated before "converged"
- * @param {object} [opts.floor]               receiver plane extents (world units)
+ * @param {object} [opts.receiver]            receiver plane extents (world units)
  * @returns engine handle: { overlayMesh, texture, uniforms, update(), setters, dispose() }
  */
 export function createCausticEngine({
@@ -66,14 +66,15 @@ export function createCausticEngine({
     renderer,
     grid = 768,
     targetPhotons = 3_000_000,
-    floor = { width: 9, depth: 7, minX: -4.5, maxX: 4.5, minZ: -3.5, maxZ: 3.5 },
+    // NOTE: not named `floor` — that would shadow the imported TSL floor() used in the kernels.
+    receiver = { width: 9, depth: 7, minX: -4.5, maxX: 4.5, minZ: -3.5, maxZ: 3.5 },
 } = {}) {
     if (!THREE) throw new Error('createCausticEngine requires the THREE namespace (pass { THREE, renderer }).');
     const W = grid, H = grid, cells = W * H;
     const SCALE = 256.0;       // fixed-point scale for atomic energy deposit
     const MAXSCALE = 64.0;     // fixed-point scale for the atomicMax auto-exposure
     const U32_MAX = 4.2e9;     // clamp ceiling below 2^32 to avoid atomic wrap
-    const FLOOR = floor;
+    const FLOOR = receiver;
 
     const params = {
         photonBudget: 300000,
