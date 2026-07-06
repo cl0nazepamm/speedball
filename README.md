@@ -75,12 +75,6 @@ tracer. Consume them via the `speedball-gi/spectral-scene` and
 `speedball-gi/spectral-traverse` subpath exports (or a CDN import map, e.g.
 jsDelivr) rather than copying the files.
 
-**Compatibility warning:** `three-mesh-bvh` must be `< 0.9.0`. The
-stackless-BVH flattener in `spectral_scene.js` reads MeshBVH's internal
-`_roots` byte layout, which changed in 0.9.x — using 0.9 produces corrupt
-traversal data and crashes the GPU process (browser tab dies with no JS
-error). The demos pin `three-mesh-bvh@0.8.3`.
-
 Light records are stride 17 floats (slot [16] = emitter class) and material
 records stride 28 (slot [25] = NIR albedo); these extra fields are inert for
 GI and exist for the night-vision render mode of downstream consumers.

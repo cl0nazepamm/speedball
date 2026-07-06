@@ -1925,6 +1925,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const q = lightQuant > 1e-6 ? lightQuant : 1;
         scene.traverseVisible((o) => {
             if (!o.isLight || o.isAmbientLight || o.isHemisphereLight) return;
+            o.updateWorldMatrix?.(true, false);
             o.getWorldPosition(_sigVec);
             const c = o.color;
             s += `${Math.round(_sigVec.x / q)},${Math.round(_sigVec.y / q)},${Math.round(_sigVec.z / q)}|`
@@ -2003,7 +2004,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     }
 
     function forceLightingRefresh() {
-        node._structGen++;
+        scene.updateMatrixWorld?.(true);
+        refreshLights();
+        lastLightSig = lightSignature();
+        reactiveTicks = REACTIVE_TICKS;
         touchGiUniforms();
     }
 

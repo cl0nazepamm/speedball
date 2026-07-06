@@ -43,7 +43,15 @@ import {
 
 const PI = Math.PI;
 
-// Metal presets: floor-tint (linear rgb 0..1) + a matching roughness.
+// Receiver-plane presets for createCausticEngine({ receiver }).
+//  - floor: horizontal y=y plane (the default).
+//  - wall:  vertical plane at z=z facing +Z (a backdrop BEHIND a sigil at z>zWall).
+export const causticReceiverFloor = ({ y = 0, width = 9, height = 7 } = {}) =>
+    ({ origin: [0, y, 0], normal: [0, 1, 0], uAxis: [1, 0, 0], vAxis: [0, 0, 1], width, height });
+export const causticReceiverWall = ({ z = -1.2, y = 0, width = 6, height = 6 } = {}) =>
+    ({ origin: [0, y, z], normal: [0, 0, 1], uAxis: [1, 0, 0], vAxis: [0, 1, 0], width, height });
+
+// Metal presets: tint (linear rgb 0..1) + a matching roughness.
 export const CAUSTIC_METALS = {
     chrome: { rgb: [238 / 255, 247 / 255, 255 / 255], roughness: 0.035 },
     gold: { rgb: [255 / 255, 208 / 255, 105 / 255], roughness: 0.045 },
@@ -66,15 +74,29 @@ export function createCausticEngine({
     renderer,
     grid = 768,
     targetPhotons = 3_000_000,
-    // NOTE: not named `floor` — that would shadow the imported TSL floor() used in the kernels.
-    receiver = { width: 9, depth: 7, minX: -4.5, maxX: 4.5, minZ: -3.5, maxZ: 3.5 },
+    // Receiver plane the caustic lands on. `null` = the classic floor (y=0).
+    // Otherwise a plane: { origin, normal (faces the incoming rays), uAxis, vAxis, width, height }.
+    // (Not named `floor` — that would shadow the imported TSL floor() used in the kernels.)
+    receiver = null,
 } = {}) {
     if (!THREE) throw new Error('createCausticEngine requires the THREE namespace (pass { THREE, renderer }).');
     const W = grid, H = grid, cells = W * H;
     const SCALE = 256.0;       // fixed-point scale for atomic energy deposit
     const MAXSCALE = 64.0;     // fixed-point scale for the atomicMax auto-exposure
     const U32_MAX = 4.2e9;     // clamp ceiling below 2^32 to avoid atomic wrap
-    const FLOOR = receiver;
+    // Normalized receiver frame (defaults reproduce the original floor exactly).
+    const R = (() => {
+        const d = receiver || {};
+        const v3 = (a, fb) => new THREE.Vector3(...(a || fb));
+        return {
+            origin: v3(d.origin, [0, 0, 0]),
+            normal: v3(d.normal, [0, 1, 0]).normalize(),
+            uAxis: v3(d.uAxis, [1, 0, 0]).normalize(),
+            vAxis: v3(d.vAxis, [0, 0, 1]).normalize(),
+            width: d.width ?? 9,
+            height: d.height ?? 7,
+        };
+    })();
 
     const params = {
         photonBudget: 300000,
@@ -158,6 +180,13 @@ export function createCausticEngine({
     // Shared: given a WORLD surface point + normal on the metal, reflect the
     // light off it, hit the floor plane, and splat the anisotropic streak.
     // Culls (Return) on back-face / up-going / off-floor — safe inside the kernel.
+    // receiver plane as compile-time constant vectors
+    const Ro = vec3(R.origin.x, R.origin.y, R.origin.z);
+    const Rn = vec3(R.normal.x, R.normal.y, R.normal.z);
+    const Ru = vec3(R.uAxis.x, R.uAxis.y, R.uAxis.z);
+    const Rv = vec3(R.vAxis.x, R.vAxis.y, R.vAxis.z);
+    const RhalfW = R.width * 0.5, RhalfH = R.height * 0.5;
+
     const emitTrace = (wp, wn, sourceGain) => {
         const toP = wp.sub(U.lightPos);
         const distSq = max(float(0.5), dot(toP, toP));
@@ -165,25 +194,28 @@ export function createCausticEngine({
         const ndl = max(float(0), dot(incident, wn).mul(-1));
         If(ndl.lessThanEqual(float(0.0001)), () => { Return(); });
         const reflected = normalize(reflect(incident, wn));
-        If(reflected.y.greaterThanEqual(float(-0.012)), () => { Return(); });
-        const t = wp.y.mul(-1).div(reflected.y);
+        // intersect the receiver plane; the reflected ray must enter its FRONT face
+        const denom = dot(reflected, Rn);
+        If(denom.greaterThanEqual(float(-0.012)), () => { Return(); });
+        const t = dot(Ro.sub(wp), Rn).div(denom);
         If(t.lessThanEqual(float(0)), () => { Return(); });
-        If(t.greaterThan(float(24)), () => { Return(); });
+        If(t.greaterThan(float(80)), () => { Return(); }); // allow grazing throws to distant receivers
         const hit = wp.add(reflected.mul(t));
-        If(hit.x.lessThan(float(FLOOR.minX)), () => { Return(); });
-        If(hit.x.greaterThan(float(FLOOR.maxX)), () => { Return(); });
-        If(hit.z.lessThan(float(FLOOR.minZ)), () => { Return(); });
-        If(hit.z.greaterThan(float(FLOOR.maxZ)), () => { Return(); });
+        const d = hit.sub(Ro);
+        const uu = dot(d, Ru);
+        const vv = dot(d, Rv);
+        If(abs(uu).greaterThan(float(RhalfW)), () => { Return(); });
+        If(abs(vv).greaterThan(float(RhalfH)), () => { Return(); });
 
-        const grazing = float(1).sub(min(float(1), abs(reflected.y)));
+        const grazing = float(1).sub(min(float(1), abs(denom)));
         const grazeGain = float(0.55).add(grazing.mul(1.5));
         const roughPenalty = max(float(0.12), float(1).sub(U.metalRoughness.mul(5.5)));
         const energy = ndl.mul(roughPenalty).mul(sourceGain).mul(grazeGain).mul(float(8).div(distSq));
 
-        const cx = hit.x.sub(FLOOR.minX).div(FLOOR.width).mul(float(W));
-        const cy = float(1).sub(hit.z.sub(FLOOR.minZ).div(FLOOR.depth)).mul(float(H));
-        const cdx0 = reflected.x.mul(W / FLOOR.width);
-        const cdy0 = reflected.z.mul(-1).mul(H / FLOOR.depth);
+        const cx = uu.div(R.width).add(0.5).mul(float(W));
+        const cy = float(0.5).sub(vv.div(R.height)).mul(float(H));
+        const cdx0 = dot(reflected, Ru).mul(W / R.width);
+        const cdy0 = dot(reflected, Rv).mul(-1).mul(H / R.height);
         const clen = max(sqrt(cdx0.mul(cdx0).add(cdy0.mul(cdy0))), float(1e-6));
         const cdx = cdx0.div(clen);
         const cdy = cdy0.div(clen);
@@ -391,10 +423,11 @@ export function createCausticEngine({
     overlayMat.depthWrite = false;
     overlayMat.toneMapped = false;
     overlayMat.opacity = params.strength;
-    const overlayGeo = new THREE.PlaneGeometry(FLOOR.width, FLOOR.depth);
+    const overlayGeo = new THREE.PlaneGeometry(R.width, R.height);
     const overlayMesh = new THREE.Mesh(overlayGeo, overlayMat);
-    overlayMesh.rotation.x = -Math.PI / 2;
-    overlayMesh.position.y = 0.012;
+    // Orient the plane to the receiver frame: local +X→uAxis, +Y→vAxis, +Z→normal.
+    overlayMesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(R.uAxis, R.vAxis, R.normal));
+    overlayMesh.position.copy(R.origin).addScaledVector(R.normal, 0.012);
     overlayMesh.renderOrder = 1000;
 
     // ── progressive dispatch ─────────────────────────────────────────
