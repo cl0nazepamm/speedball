@@ -119,6 +119,14 @@ export function createCausticEngine({
         tint: uniform(new THREE.Vector3(...params.tint)),
     };
 
+    // Caster-mesh emission state (populated by setCasterMesh; when 'mesh',
+    // photons are emitted off a real triangle mesh instead of the analytic
+    // door/wheels). Geometry is baked to WORLD space on upload.
+    let emitMode = 'analytic';
+    let meshPos = null, meshNrm = null, meshIdx = null, meshCdf = null;
+    let meshTriCount = 0, meshSearchIters = 1;
+    const meshAttrs = []; // StorageBufferAttributes to dispose on rebuild
+
     // ── RNG (PCG) ────────────────────────────────────────────────────
     const INV_U32 = 1.0 / 4294967296.0;
     const pcgHash = (x) => {
@@ -147,7 +155,60 @@ export function createCausticEngine({
         });
     };
 
-    // ── emit (ANALYTIC reference emitter — see EMISSION SEAM above) ───
+    // Shared: given a WORLD surface point + normal on the metal, reflect the
+    // light off it, hit the floor plane, and splat the anisotropic streak.
+    // Culls (Return) on back-face / up-going / off-floor — safe inside the kernel.
+    const emitTrace = (wp, wn, sourceGain) => {
+        const toP = wp.sub(U.lightPos);
+        const distSq = max(float(0.5), dot(toP, toP));
+        const incident = normalize(toP);
+        const ndl = max(float(0), dot(incident, wn).mul(-1));
+        If(ndl.lessThanEqual(float(0.0001)), () => { Return(); });
+        const reflected = normalize(reflect(incident, wn));
+        If(reflected.y.greaterThanEqual(float(-0.012)), () => { Return(); });
+        const t = wp.y.mul(-1).div(reflected.y);
+        If(t.lessThanEqual(float(0)), () => { Return(); });
+        If(t.greaterThan(float(24)), () => { Return(); });
+        const hit = wp.add(reflected.mul(t));
+        If(hit.x.lessThan(float(FLOOR.minX)), () => { Return(); });
+        If(hit.x.greaterThan(float(FLOOR.maxX)), () => { Return(); });
+        If(hit.z.lessThan(float(FLOOR.minZ)), () => { Return(); });
+        If(hit.z.greaterThan(float(FLOOR.maxZ)), () => { Return(); });
+
+        const grazing = float(1).sub(min(float(1), abs(reflected.y)));
+        const grazeGain = float(0.55).add(grazing.mul(1.5));
+        const roughPenalty = max(float(0.12), float(1).sub(U.metalRoughness.mul(5.5)));
+        const energy = ndl.mul(roughPenalty).mul(sourceGain).mul(grazeGain).mul(float(8).div(distSq));
+
+        const cx = hit.x.sub(FLOOR.minX).div(FLOOR.width).mul(float(W));
+        const cy = float(1).sub(hit.z.sub(FLOOR.minZ).div(FLOOR.depth)).mul(float(H));
+        const cdx0 = reflected.x.mul(W / FLOOR.width);
+        const cdy0 = reflected.z.mul(-1).mul(H / FLOOR.depth);
+        const clen = max(sqrt(cdx0.mul(cdx0).add(cdy0.mul(cdy0))), float(1e-6));
+        const cdx = cdx0.div(clen);
+        const cdy = cdy0.div(clen);
+        const streakPx = min(float(18), float(2).add(grazing.mul(15)).mul(U.causticWidth));
+        const steps = uint(max(float(1), ceil(streakPx)));
+        const stepsF = float(steps);
+        const ePer = energy.div(stepsF);
+
+        Loop({ start: uint(0), end: steps, type: 'uint', condition: '<' }, ({ i: s }) => {
+            const tt = select(steps.equal(uint(1)), float(0),
+                float(s).div(max(stepsF.sub(1), float(1))).sub(0.5));
+            const fx = cx.add(cdx.mul(streakPx).mul(tt)).sub(0.5);
+            const fy = cy.add(cdy.mul(streakPx).mul(tt)).sub(0.5);
+            const x0 = int(floor(fx));
+            const y0 = int(floor(fy));
+            const txf = fx.sub(float(x0));
+            const tyf = fy.sub(float(y0));
+            addTap(x0, y0, ePer.mul(float(1).sub(txf)).mul(float(1).sub(tyf)));
+            addTap(x0.add(int(1)), y0, ePer.mul(txf).mul(float(1).sub(tyf)));
+            addTap(x0, y0.add(int(1)), ePer.mul(float(1).sub(txf)).mul(tyf));
+            addTap(x0.add(int(1)), y0.add(int(1)), ePer.mul(txf).mul(tyf));
+        });
+    };
+
+    // ── ANALYTIC emitter (reference: curved door + torus wheels) ─────
     function buildEmit(count) {
         return Fn(() => {
             const pid = instanceIndex.toVar();
@@ -200,54 +261,49 @@ export function createCausticEngine({
                 sourceGain.assign(float(1.55));
             });
 
-            // reflect off metal, hit the floor plane
-            const toP = wp.sub(U.lightPos);
-            const distSq = max(float(0.5), dot(toP, toP));
-            const incident = normalize(toP);
-            const ndl = max(float(0), dot(incident, wn).mul(-1));
-            If(ndl.lessThanEqual(float(0.0001)), () => { Return(); });
-            const reflected = normalize(reflect(incident, wn));
-            If(reflected.y.greaterThanEqual(float(-0.012)), () => { Return(); });
-            const t = wp.y.mul(-1).div(reflected.y);
-            If(t.lessThanEqual(float(0)), () => { Return(); });
-            If(t.greaterThan(float(24)), () => { Return(); });
-            const hit = wp.add(reflected.mul(t));
-            If(hit.x.lessThan(float(FLOOR.minX)), () => { Return(); });
-            If(hit.x.greaterThan(float(FLOOR.maxX)), () => { Return(); });
-            If(hit.z.lessThan(float(FLOOR.minZ)), () => { Return(); });
-            If(hit.z.greaterThan(float(FLOOR.maxZ)), () => { Return(); });
+            emitTrace(wp, wn, sourceGain);
+        })().compute(count);
+    }
 
-            const grazing = float(1).sub(min(float(1), abs(reflected.y)));
-            const grazeGain = float(0.55).add(grazing.mul(1.5));
-            const roughPenalty = max(float(0.12), float(1).sub(U.metalRoughness.mul(5.5)));
-            const energy = ndl.mul(roughPenalty).mul(sourceGain).mul(grazeGain).mul(float(8).div(distSq));
+    // ── MESH emitter: sample the caster triangle mesh (world-space) ──
+    // Area-weighted triangle pick (binary-search the CDF) + barycentric point +
+    // interpolated normal, then the shared reflect/floor/splat. This is the
+    // "throw caustics off real geometry" path — emission only (no ray tracing);
+    // wiring the reflected ray to buildTraversal is the next upgrade.
+    function buildMeshEmit(count) {
+        const triCount = meshTriCount;
+        const iters = meshSearchIters;
+        const fetchP = (i) => { const b = i.mul(uint(3)); return vec3(meshPos.element(b), meshPos.element(b.add(uint(1))), meshPos.element(b.add(uint(2)))); };
+        const fetchN = (i) => { const b = i.mul(uint(3)); return vec3(meshNrm.element(b), meshNrm.element(b.add(uint(1))), meshNrm.element(b.add(uint(2)))); };
+        return Fn(() => {
+            const pid = instanceIndex.toVar();
+            If(pid.greaterThanEqual(uint(count)), () => { Return(); });
+            rngState.node = pcgHash(pid.bitXor(pcgHash(U.frameSeed))).toVar();
 
-            const cx = hit.x.sub(FLOOR.minX).div(FLOOR.width).mul(float(W));
-            const cy = float(1).sub(hit.z.sub(FLOOR.minZ).div(FLOOR.depth)).mul(float(H));
-            const cdx0 = reflected.x.mul(W / FLOOR.width);
-            const cdy0 = reflected.z.mul(-1).mul(H / FLOOR.depth);
-            const clen = max(sqrt(cdx0.mul(cdx0).add(cdy0.mul(cdy0))), float(1e-6));
-            const cdx = cdx0.div(clen);
-            const cdy = cdy0.div(clen);
-            const streakPx = min(float(18), float(2).add(grazing.mul(15)).mul(U.causticWidth));
-            const steps = uint(max(float(1), ceil(streakPx)));
-            const stepsF = float(steps);
-            const ePer = energy.div(stepsF);
-
-            Loop({ start: uint(0), end: steps, type: 'uint', condition: '<' }, ({ i: s }) => {
-                const tt = select(steps.equal(uint(1)), float(0),
-                    float(s).div(max(stepsF.sub(1), float(1))).sub(0.5));
-                const fx = cx.add(cdx.mul(streakPx).mul(tt)).sub(0.5);
-                const fy = cy.add(cdy.mul(streakPx).mul(tt)).sub(0.5);
-                const x0 = int(floor(fx));
-                const y0 = int(floor(fy));
-                const txf = fx.sub(float(x0));
-                const tyf = fy.sub(float(y0));
-                addTap(x0, y0, ePer.mul(float(1).sub(txf)).mul(float(1).sub(tyf)));
-                addTap(x0.add(int(1)), y0, ePer.mul(txf).mul(float(1).sub(tyf)));
-                addTap(x0, y0.add(int(1)), ePer.mul(float(1).sub(txf)).mul(tyf));
-                addTap(x0.add(int(1)), y0.add(int(1)), ePer.mul(txf).mul(tyf));
+            // area-weighted triangle via binary search over the cumulative CDF
+            const r = nextRand();
+            const lo = int(0).toVar();
+            const hi = int(triCount - 1).toVar();
+            Loop({ start: uint(0), end: uint(iters), type: 'uint', condition: '<' }, () => {
+                const mid = int(floor(float(lo.add(hi)).mul(0.5)));
+                If(meshCdf.element(uint(mid)).lessThan(r), () => { lo.assign(mid.add(int(1))); });
+                If(meshCdf.element(uint(mid)).greaterThanEqual(r), () => { hi.assign(mid); });
             });
+            const base = uint(lo).mul(uint(3));
+            const i0 = meshIdx.element(base);
+            const i1 = meshIdx.element(base.add(uint(1)));
+            const i2 = meshIdx.element(base.add(uint(2)));
+
+            // uniform barycentric (sqrt trick)
+            const su = sqrt(nextRand());
+            const r2 = nextRand();
+            const b0 = float(1).sub(su);
+            const b1 = su.mul(float(1).sub(r2));
+            const b2 = su.mul(r2);
+            const wp = fetchP(i0).mul(b0).add(fetchP(i1).mul(b1)).add(fetchP(i2).mul(b2)).toVar();
+            const wn = normalize(fetchN(i0).mul(b0).add(fetchN(i1).mul(b1)).add(fetchN(i2).mul(b2))).toVar();
+
+            emitTrace(wp, wn, float(1.0));
         })().compute(count);
     }
 
@@ -357,7 +413,10 @@ export function createCausticEngine({
     syncUniforms();
 
     function ensureEmit(count) {
-        if (emitCount !== count) { emit = buildEmit(count); emitCount = count; }
+        if (emitCount !== count) {
+            emit = emitMode === 'mesh' ? buildMeshEmit(count) : buildEmit(count);
+            emitCount = count;
+        }
         return emit;
     }
 
@@ -399,6 +458,63 @@ export function createCausticEngine({
         params.tint = p.rgb.slice(); params.roughness = p.roughness;
         syncUniforms(); markDirty();
     }
+    // Switch to MESH emission: bake `mesh` (a THREE.Mesh) to world space, build a
+    // per-triangle area CDF, upload geometry to storage, and emit photons off it.
+    // Re-call to update after the mesh moves or its geometry changes.
+    function setCasterMesh(mesh) {
+        const geo = mesh.geometry;
+        const posAttr = geo.getAttribute('position');
+        if (!posAttr) throw new Error('setCasterMesh: geometry has no position attribute');
+        mesh.updateMatrixWorld(true);
+        const m = mesh.matrixWorld;
+        const nm = new THREE.Matrix3().getNormalMatrix(m);
+        const nAttr = geo.getAttribute('normal');
+        const vCount = posAttr.count;
+        const wpos = new Float32Array(vCount * 3);
+        const wnrm = new Float32Array(vCount * 3);
+        const _v = new THREE.Vector3(), _n = new THREE.Vector3();
+        for (let i = 0; i < vCount; i++) {
+            _v.fromBufferAttribute(posAttr, i).applyMatrix4(m);
+            wpos[i * 3] = _v.x; wpos[i * 3 + 1] = _v.y; wpos[i * 3 + 2] = _v.z;
+            if (nAttr) _n.fromBufferAttribute(nAttr, i).applyMatrix3(nm).normalize(); else _n.set(0, 1, 0);
+            wnrm[i * 3] = _n.x; wnrm[i * 3 + 1] = _n.y; wnrm[i * 3 + 2] = _n.z;
+        }
+        const idxArr = geo.index
+            ? new Uint32Array(geo.index.array)
+            : Uint32Array.from({ length: vCount }, (_, i) => i);
+        const triCount = Math.floor(idxArr.length / 3);
+        if (triCount < 1) throw new Error('setCasterMesh: geometry has no triangles');
+
+        // cumulative, area-normalized CDF over triangles (world space)
+        const cdf = new Float32Array(triCount);
+        const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3(), e1 = new THREE.Vector3(), e2 = new THREE.Vector3();
+        let acc = 0;
+        for (let t = 0; t < triCount; t++) {
+            const i0 = idxArr[t * 3], i1 = idxArr[t * 3 + 1], i2 = idxArr[t * 3 + 2];
+            a.set(wpos[i0 * 3], wpos[i0 * 3 + 1], wpos[i0 * 3 + 2]);
+            b.set(wpos[i1 * 3], wpos[i1 * 3 + 1], wpos[i1 * 3 + 2]);
+            c.set(wpos[i2 * 3], wpos[i2 * 3 + 1], wpos[i2 * 3 + 2]);
+            acc += 0.5 * e1.subVectors(b, a).cross(e2.subVectors(c, a)).length();
+            cdf[t] = acc;
+        }
+        const inv = acc > 0 ? 1 / acc : 0;
+        for (let t = 0; t < triCount; t++) cdf[t] *= inv;
+        cdf[triCount - 1] = 1.0; // guard the search's upper bound
+
+        for (const at of meshAttrs) at?.dispose?.();
+        meshAttrs.length = 0;
+        const posA = makeStorage(wpos), nrmA = makeStorage(wnrm), idxA = makeStorage(idxArr), cdfA = makeStorage(cdf);
+        meshAttrs.push(posA, nrmA, idxA, cdfA);
+        meshPos = storage(posA, 'float', wpos.length);
+        meshNrm = storage(nrmA, 'float', wnrm.length);
+        meshIdx = storage(idxA, 'uint', idxArr.length);
+        meshCdf = storage(cdfA, 'float', triCount);
+        meshTriCount = triCount;
+        meshSearchIters = Math.max(1, Math.ceil(Math.log2(Math.max(2, triCount))) + 1);
+        emitMode = 'mesh';
+        emitCount = -1; // force ensureEmit to rebuild with the mesh emitter
+        markDirty();
+    }
     function setMetalTint(r, g, b) { params.tint = [r, g, b]; U.tint.value.set(r, g, b); }
     function setRoughness(v) { params.roughness = v; syncUniforms(); markDirty(); }
     function setSoftness(v) { params.softness = v; syncUniforms(); markDirty(); }
@@ -408,6 +524,7 @@ export function createCausticEngine({
 
     function dispose() {
         for (const a of storageAttrs) a?.value?.dispose?.();
+        for (const a of meshAttrs) a?.dispose?.();
         causticTex.dispose?.();
         overlayGeo.dispose(); overlayMat.dispose();
     }
@@ -417,7 +534,7 @@ export function createCausticEngine({
         texture: causticTex,
         uniforms: U,
         update,
-        setLight, setCasterMatrices, setMetal, setMetalTint,
+        setLight, setCasterMatrices, setCasterMesh, setMetal, setMetalTint,
         setRoughness, setSoftness, setBloom, setStrength, setPhotonBudget,
         markDirty, dispose,
         get accum() { return accum; },
