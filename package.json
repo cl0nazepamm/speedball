@@ -13,6 +13,7 @@
     "./spectral-scene": "./js/spectral_scene.js",
     "./spectral-traverse": "./js/spectral_traverse.js",
     "./spectral-tracer": "./js/spectral_tracer.js",
+    "./srgb-lut": "./js/srgb_lut.js",
     "./caustics": "./js/caustic_engine.js",
     "./package.json": "./package.json"
   },
