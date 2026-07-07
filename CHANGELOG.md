@@ -3,6 +3,29 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-07-07
+
+- **The spectral path tracer and the photon caustic engine now SHIP in the
+  npm package.** Speedball is the single source for all GPU light transport;
+  downstream apps (maxjs, powershot-threejs, sigils) import instead of
+  vendoring. New entry points:
+  - `speedball-gi/spectral-tracer` — `createSpectralTracer` (progressive
+    BVH-traced spectral path tracing, RGB/NV modes, embedded sRGB→reflectance
+    LUT — no sidecar files to host).
+  - `speedball-gi/caustics` — `createCausticEngine` + receiver/metal presets
+    (pure-WebGPU compute photon caustics).
+- Caustic engine upstreams (from the sigils fork):
+  - Soft t-cull: `setThrowFalloff(1/reach^2)` fades long grazing throws with
+    virtual-source divergence so the caustic hugs the geometry; `0` (default)
+    keeps the classic open throw.
+  - Overlay plane is double-sided and oriented by the full receiver basis
+    matrix (right- AND left-handed receiver frames stay valid).
+  - `setCasterMesh(mesh, { shaper })`: optional local-space vertex hook —
+    `{ position(v, i), normal(n, i) → bool }` — bakes displacement that the
+    render material only applies procedurally (e.g. a TSL height-field), so
+    photons emit off the same surface the camera sees. Sigil-specific height
+    baking now lives in sigils as a shaper, not in the engine.
+
 ## [0.4.0] — 2026-07-04
 
 - **Two-level BVH (TLAS/BLAS): moving objects now update GI instantly.**

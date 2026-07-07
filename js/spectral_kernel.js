@@ -20,7 +20,7 @@
 //               normalized by ∫S dλ, accumulates in the 4th channel as true
 //               electron flux. The blit then emits LINEAR flux (no tone map,
 //               no sRGB) for the image-intensifier stage
-//               (powershot_infrared.js, setInputMode("nir")).
+//               (powershot-threejs/infrared, setInputMode("nir")).
 //
 // The BVH traversal + JH-spectral/env/PBR shading emitters live in
 // spectral_traverse.js (shared byte-identically with the HALO-GI probe kernel).
@@ -524,7 +524,7 @@ export function buildKernels({
         if (isNV) {
             // LINEAR electron flux for the intensifier stage: sample-count
             // divide + exposure only. NO tone map, NO sRGB — the tube model
-            // (powershot_infrared.js, inputMode "nir") owns the transfer
+            // (powershot-threejs/infrared, inputMode "nir") owns the transfer
             // curve, and it reads the red channel raw.
             const flux = accum.element(o.add(uint(3))).mul(inv).mul(U.exposure).max(0.0);
             return vec4(flux, flux, flux, 1);

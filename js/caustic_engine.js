@@ -139,6 +139,9 @@ export function createCausticEngine({
         bloomSigma: uniform(12.0),
         bloomGain: uniform(params.bloom * 2.0),
         tint: uniform(new THREE.Vector3(...params.tint)),
+        // soft t-cull: energy *= 1/(1 + t^2*throwSoft). 0 disables (classic
+        // look); 1/reach^2 halves a photon's weight at throw distance `reach`.
+        throwSoft: uniform(0),
     };
 
     // Caster-mesh emission state (populated by setCasterMesh; when 'mesh',
@@ -210,7 +213,11 @@ export function createCausticEngine({
         const grazing = float(1).sub(min(float(1), abs(denom)));
         const grazeGain = float(0.55).add(grazing.mul(1.5));
         const roughPenalty = max(float(0.12), float(1).sub(U.metalRoughness.mul(5.5)));
-        const energy = ndl.mul(roughPenalty).mul(sourceGain).mul(grazeGain).mul(float(8).div(distSq));
+        // Soft t-cull: long grazing throws smear far from the caster and hijack
+        // the auto-exposure; fade them with the virtual-source divergence so the
+        // caustic hugs the geometry.
+        const throwAtten = float(1).div(t.mul(t).mul(U.throwSoft).add(1));
+        const energy = ndl.mul(roughPenalty).mul(sourceGain).mul(grazeGain).mul(throwAtten).mul(float(8).div(distSq));
 
         const cx = uu.div(R.width).add(0.5).mul(float(W));
         const cy = float(0.5).sub(vv.div(R.height)).mul(float(H));
@@ -423,11 +430,15 @@ export function createCausticEngine({
     overlayMat.depthWrite = false;
     overlayMat.toneMapped = false;
     overlayMat.opacity = params.strength;
+    overlayMat.side = THREE.DoubleSide;
     const overlayGeo = new THREE.PlaneGeometry(R.width, R.height);
     const overlayMesh = new THREE.Mesh(overlayGeo, overlayMat);
     // Orient the plane to the receiver frame: local +X→uAxis, +Y→vAxis, +Z→normal.
-    overlayMesh.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(R.uAxis, R.vAxis, R.normal));
-    overlayMesh.position.copy(R.origin).addScaledVector(R.normal, 0.012);
+    // Keep the full basis matrix instead of converting to a quaternion so both
+    // right- and left-handed receiver frames remain valid.
+    overlayMesh.matrixAutoUpdate = false;
+    overlayMesh.matrix.makeBasis(R.uAxis, R.vAxis, R.normal);
+    overlayMesh.matrix.setPosition(new THREE.Vector3().copy(R.origin).addScaledVector(R.normal, 0.012));
     overlayMesh.renderOrder = 1000;
 
     // ── progressive dispatch ─────────────────────────────────────────
@@ -494,7 +505,13 @@ export function createCausticEngine({
     // Switch to MESH emission: bake `mesh` (a THREE.Mesh) to world space, build a
     // per-triangle area CDF, upload geometry to storage, and emit photons off it.
     // Re-call to update after the mesh moves or its geometry changes.
-    function setCasterMesh(mesh) {
+    // `shaper` (optional) bakes a LOCAL-space vertex displacement that the render
+    // material only applies procedurally (e.g. a TSL height-field), so the photon
+    // emitter sees the same surface the camera does:
+    //   position(v, i)      — mutate the local-space position in place
+    //   normal(n, i) → bool — write a local-space normal and return true; the
+    //                         engine then transforms + renormalizes it
+    function setCasterMesh(mesh, { shaper = null } = {}) {
         const geo = mesh.geometry;
         const posAttr = geo.getAttribute('position');
         if (!posAttr) throw new Error('setCasterMesh: geometry has no position attribute');
@@ -507,9 +524,13 @@ export function createCausticEngine({
         const wnrm = new Float32Array(vCount * 3);
         const _v = new THREE.Vector3(), _n = new THREE.Vector3();
         for (let i = 0; i < vCount; i++) {
-            _v.fromBufferAttribute(posAttr, i).applyMatrix4(m);
+            _v.fromBufferAttribute(posAttr, i);
+            shaper?.position?.(_v, i);
+            _v.applyMatrix4(m);
             wpos[i * 3] = _v.x; wpos[i * 3 + 1] = _v.y; wpos[i * 3 + 2] = _v.z;
-            if (nAttr) _n.fromBufferAttribute(nAttr, i).applyMatrix3(nm).normalize(); else _n.set(0, 1, 0);
+            if (shaper?.normal?.(_n, i)) _n.applyMatrix3(nm).normalize();
+            else if (nAttr) _n.fromBufferAttribute(nAttr, i).applyMatrix3(nm).normalize();
+            else _n.set(0, 1, 0);
             wnrm[i * 3] = _n.x; wnrm[i * 3 + 1] = _n.y; wnrm[i * 3 + 2] = _n.z;
         }
         const idxArr = geo.index
@@ -554,6 +575,9 @@ export function createCausticEngine({
     function setBloom(v) { params.bloom = v; U.bloomGain.value = v * 2.0; }  // resolve-only; no restart
     function setStrength(v) { params.strength = v; overlayMat.opacity = v; }
     function setPhotonBudget(n) { params.photonBudget = n; }
+    // Soft t-cull strength (see U.throwSoft). Pass 1/reach^2 for a half-weight
+    // throw distance of `reach` world units; 0 restores the classic open throw.
+    function setThrowFalloff(v) { U.throwSoft.value = Math.max(0, v); markDirty(); }
 
     function dispose() {
         for (const a of storageAttrs) a?.value?.dispose?.();
@@ -568,7 +592,7 @@ export function createCausticEngine({
         uniforms: U,
         update,
         setLight, setCasterMatrices, setCasterMesh, setMetal, setMetalTint,
-        setRoughness, setSoftness, setBloom, setStrength, setPhotonBudget,
+        setRoughness, setSoftness, setBloom, setStrength, setPhotonBudget, setThrowFalloff,
         markDirty, dispose,
         get accum() { return accum; },
         get converged() { return converged; },
