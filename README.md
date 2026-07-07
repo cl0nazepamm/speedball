@@ -66,14 +66,28 @@ has already run, three has cached a non-GI lights node and GI will fail.
 - **Convergence is temporal** — loads, light edits, and geometry changes fade in
   over a few frames instead of snapping instantly. Similar to Lumen.
 
-## Spectral scene modules
+## Beyond DDGI: the full light-transport surface
 
-`js/spectral_scene.js` (scene → flat BVH/material/light buffers) and
-`js/spectral_traverse.js` (TSL traversal + spectral shading emitters) are the
-canonical home of the scene foundation shared with the maxjs spectral path
-tracer. Consume them via the `speedball-gi/spectral-scene` and
-`speedball-gi/spectral-traverse` subpath exports (or a CDN import map, e.g.
-jsDelivr) rather than copying the files.
+Speedball is the single source for all of its GPU light transport — downstream
+apps (maxjs, powershot-threejs, sigils) import these entry points rather than
+vendoring files:
+
+- **`speedball-gi/spectral-tracer`** — `createSpectralTracer`: progressive
+  BVH-traced spectral path tracing (RGB and NV/night-vision modes). The
+  sRGB→reflectance LUT ships embedded (`speedball-gi/srgb-lut`), so there are
+  no sidecar files to host.
+- **`speedball-gi/caustics`** — `createCausticEngine` plus receiver/metal
+  presets: pure-WebGPU compute photon caustics with analytic and mesh-emission
+  casters, soft t-cull (`setThrowFalloff`), and a `setCasterMesh(mesh,
+  { shaper })` hook for baking procedural vertex displacement into photon
+  emission.
+- **`speedball-gi/spectral-scene`** / **`speedball-gi/spectral-traverse`** —
+  the shared scene foundation (scene → flat BVH/material/light buffers; TSL
+  traversal + spectral shading emitters).
+
+All of these work from a plain CDN import map too (e.g. jsDelivr:
+`https://cdn.jsdelivr.net/npm/speedball-gi@0.5.0/js/index.js`) — that is how
+maxjs consumes them without being an npm package.
 
 Light records are stride 17 floats (slot [16] = emitter class) and material
 records stride 28 (slot [25] = NIR albedo); these extra fields are inert for
