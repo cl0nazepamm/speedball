@@ -9,7 +9,7 @@
 // Advanced users can still import createProbeField / giLights directly and wire it
 // by hand; this is the batteries-included path.
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { createProbeField } from './gi_probes.js';
 import { giLights } from './gi_lights_node.js';
 

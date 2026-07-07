@@ -5,7 +5,7 @@
 // material shading all stay on the WebGPU/TSL path. No cube-camera bake, no CPU
 // raycast/light solve, no readback.
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { LightingNode } from 'three/webgpu';
 import {
     Fn, If, Loop, Return,

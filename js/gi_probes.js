@@ -18,7 +18,7 @@
 //     sampling; the material's atlas binding is STABLE, so per-tick data writes
 //     never change the material cache key. Only grid resize / enable flips it.
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { LightingNode } from 'three/webgpu';
 import {
     Fn, If, Loop, Return, instanceIndex, storage, uniform, texture, textureLevel, sharedUniformGroup,

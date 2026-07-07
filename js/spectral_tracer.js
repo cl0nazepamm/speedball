@@ -11,7 +11,7 @@
 // old PT mode did). Scene/BVH build is CPU-side and debounced; accumulation
 // resets on camera move or scene-dirty.
 
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { buildSpectralScene } from './spectral_scene.js';
 import { buildKernels } from './spectral_kernel.js';
 import { decodeSpectralLut, SPECTRAL_LUT_RES } from './srgb_lut.js';
