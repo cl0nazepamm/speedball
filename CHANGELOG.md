@@ -3,6 +3,35 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-07-08
+
+- NIR band sensing for the raster path (`setNirSensing(on)` on the install
+  handle; granular: probe field `setNirSensing` + `setNirDirectSensing` from
+  `gi_lights_node`). Emitter-class-`'ir'` lights (RGB-black, intensity-driven)
+  are now simulated in both raster terms instead of leaking or vanishing:
+  - GI probes gate class-4 lights in NEE on a `nirGate` uniform — previously
+    the promoted white `(k,k,k)` lit the field even in the visible band.
+  - The direct term lifts IR lights off the batched `DynamicLightsNode` path
+    onto per-light nodes whose `colorNode` is the sensed color
+    (white × intensity × `nirGate`) — previously black × intensity = nothing,
+    so NV showed GI but no direct light. `light.color` is never mutated;
+    toggling the band is a uniform write (no recompile). Shadows still apply.
+- Spectral tracer: native-white → D65 correction. The kernel upsamples
+  equal-RGB to a flat spectrum (Illuminant E white), which the plain sRGB
+  matrix rendered warm; the exact native white is now Bradford-adapted to D65
+  and baked into the XYZ→sRGB blit, so equal-RGB scenes come out neutral.
+- Spectral tracer: `envBackground` option (setting + per-`setEnvironment`
+  override). When off, primary-miss rays return black — the environment stays
+  a light source for bounces but is never seen directly by the camera.
+- Spectral tracer: roughness 0 is no longer floored — it's a legal delta
+  mirror (the glossy lobe degenerates to the exact reflection direction).
+- New `speedball-gi/srgb-lut` subpath export — the spectral sRGB→reflectance
+  LUT decode for external NIR band consumers.
+- All modules import from `three/webgpu` instead of bare `three`: bundlers
+  resolve bare `three` to the WebGL core (no `QuadMesh`/`StorageTexture`),
+  which broke non-importmap consumers. Importmap consumers are unaffected
+  (both specifiers map to the same build).
+
 ## [0.5.0] — 2026-07-07
 
 - **The spectral path tracer and the photon caustic engine now SHIP in the
@@ -44,17 +73,6 @@ All notable changes to Speedball GI are documented here. This project follows
   camera moves out of the box; `setContinuous(false)` restores strict
   idle-gating.
 
-- NIR band sensing for the raster path (`setNirSensing(on)` on the install
-  handle; granular: probe field `setNirSensing` + `setNirDirectSensing` from
-  `gi_lights_node`). Emitter-class-`'ir'` lights (RGB-black, intensity-driven)
-  are now simulated in both raster terms instead of leaking or vanishing:
-  - GI probes gate class-4 lights in NEE on a `nirGate` uniform — previously
-    the promoted white `(k,k,k)` lit the field even in the visible band.
-  - The direct term lifts IR lights off the batched `DynamicLightsNode` path
-    onto per-light nodes whose `colorNode` is the sensed color
-    (white × intensity × `nirGate`) — previously black × intensity = nothing,
-    so NV showed GI but no direct light. `light.color` is never mutated;
-    toggling the band is a uniform write (no recompile). Shadows still apply.
 - Added a NIR (near-infrared) spectral layer to the shared scene modules:
   `spectral_scene.js` now emits a photocathode-facing `nirAlbedo` field
   (material slot [25], MAT_STRIDE unchanged at 28) and per-light emitter
