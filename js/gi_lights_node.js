@@ -43,7 +43,11 @@ export function getNirDirectSensing() { return _nirGate.value > 0.5; }
 // IR classifier — mirrors spectral_scene.js emitterClassValue's class-4 branch.
 // Kept inline (not imported): spectral_scene statically imports three-mesh-bvh and
 // this node must stay dependency-light for plain GI consumers.
-function isIrEmitter(light) {
+// Exported for hosts that install their OWN lights node (e.g. max.js MaxLightsNode
+// with per-mesh light-link masks): filter IR emitters out of the batched path with
+// isIrEmitter, then append getOrCreateIrLightNode(light, renderer.library) nodes —
+// they share this module's nirGate, so setNirDirectSensing stays the single switch.
+export function isIrEmitter(light) {
     const raw = light.userData?.emitterClass;
     if (raw === undefined || raw === null || light.isNode === true) return false;
     if (typeof raw === 'string') {
@@ -58,7 +62,7 @@ function isIrEmitter(light) {
 // NOT via light.colorNode, which SpotLightNode interprets as a projector FUNCTION.
 const _irLightNodes = new WeakMap();
 
-function getOrCreateIrLightNode(light, nodeLibrary) {
+export function getOrCreateIrLightNode(light, nodeLibrary) {
     let node = _irLightNodes.get(light);
     if (node !== undefined) return node;
 
