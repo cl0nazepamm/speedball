@@ -69,6 +69,41 @@ function cieZ(l) {
         .add(wymanG(l, 459.0, 0.0385, 0.0725).mul(0.681));
 }
 
+// ── native-white → D65 correction, folded into the blit matrix ─────
+// jhEmission upsamples equal-RGB to a FLAT spectrum, so the renderer's
+// native white is Illuminant E as seen through the fits above over
+// [LAMBDA_MIN, LAMBDA_MAX] — NOT the D65 white the plain sRGB matrix
+// assumes. Left uncorrected, neutral emitters/env render warm
+// (~(1.20, 0.95, 0.91) linear). Integrate the fits once at load,
+// Bradford-adapt that exact white to D65, and pre-multiply the result
+// into XYZ→sRGB so equal-RGB in = equal-RGB out.
+function wymanGJs(x, mu, s1, s2) {
+    const t = (x - mu) * (x < mu ? s1 : s2);
+    return Math.exp(-0.5 * t * t);
+}
+const XYZ_TO_SRGB_D65 = (() => {
+    const xF = (l) => wymanGJs(l, 599.8, 0.0264, 0.0323) * 1.056
+        + wymanGJs(l, 442.0, 0.0624, 0.0374) * 0.362
+        - wymanGJs(l, 501.1, 0.0490, 0.0382) * 0.065;
+    const yF = (l) => wymanGJs(l, 568.8, 0.0213, 0.0247) * 0.821
+        + wymanGJs(l, 530.9, 0.0613, 0.0322) * 0.286;
+    const zF = (l) => wymanGJs(l, 437.0, 0.0845, 0.0278) * 1.217
+        + wymanGJs(l, 459.0, 0.0385, 0.0725) * 0.681;
+    let X = 0, Y = 0, Z = 0;
+    for (let l = LAMBDA_MIN; l <= LAMBDA_MAX; l += 1) { X += xF(l); Y += yF(l); Z += zF(l); }
+    const white = [X / Y, 1, Z / Y];
+    const d65 = [0.95047, 1.0, 1.08883];
+    const B = [[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]];
+    const BI = [[0.9869929, -0.1470543, 0.1599627], [0.4323053, 0.5183603, 0.0492912], [-0.0085287, 0.0400428, 0.9684867]];
+    const mulV = (M, v) => M.map((r) => r[0] * v[0] + r[1] * v[1] + r[2] * v[2]);
+    const mulM = (A, C) => A.map((r) => [0, 1, 2].map((j) => r[0] * C[0][j] + r[1] * C[1][j] + r[2] * C[2][j]));
+    const cw = mulV(B, white);
+    const cd = mulV(B, d65);
+    const D = [[cd[0] / cw[0], 0, 0], [0, cd[1] / cw[1], 0], [0, 0, cd[2] / cw[2]]];
+    const SRGB = [[3.2406, -1.5372, -0.4986], [-0.9689, 1.8758, 0.0415], [0.0557, -0.2040, 1.0570]];
+    return mulM(SRGB, mulM(BI, mulM(D, B)));
+})();
+
 export function buildKernels({
     THREE, buffers, env, lut = null, lutRes = 0, maps = {}, width, height,
     // 'visible' | 'nv'. nvSampling 'uniform' exists only for A/B-validating
@@ -111,6 +146,10 @@ export function buildKernels({
         envIntensity: uniform(1.0),
         envRotation: uniform(0.0),
         hasEnv: uniform(env ? 1 : 0, 'uint'),
+        // 1 = env is the visible backdrop on primary miss (default);
+        // 0 = primary-miss rays return black — the env stays a LIGHT SOURCE
+        // for secondary bounces but is never seen directly by the camera.
+        envBackground: uniform(1, 'uint'),
         lightCount: uniform(buffers.lightCount >>> 0, 'uint'),
         nodeCount: uniform(buffers.nodeCount >>> 0, 'uint'),
         tlasNodeCount: uniform((buffers.tlasNodeCount ?? 0) >>> 0, 'uint'),
@@ -242,7 +281,12 @@ export function buildKernels({
             traverseClosest(ro, rd, bestT, bestTri, bestInst);
 
             If(bestTri.lessThan(int(0)), () => {
-                radiance.addAssign(clampGI(throughput.mul(envAtLambda(rd, lambda))));
+                // envBackground 0 blacks out the PRIMARY miss only (i==0):
+                // the camera sees void, while indirect rays keep collecting
+                // env light so materials stay lit by it.
+                const envVisible = select(i.greaterThan(uint(0)), float(1),
+                    select(U.envBackground.equal(uint(1)), float(1), float(0)));
+                radiance.addAssign(clampGI(throughput.mul(envAtLambda(rd, lambda))).mul(envVisible));
                 Break();
             });
 
@@ -348,7 +392,9 @@ export function buildKernels({
                 const s = srgbToLinear(sampleLayer(emissiveTex, uv, eL));
                 emissive.assign(emissive.mul(select(eL.greaterThan(float(-0.5)), s, vec3(1))));
             }
-            roughness.assign(clamp(roughness, float(0.02), float(1)));
+            // No floor: roughness 0 is a legal delta mirror (glossy lobe
+            // degenerates to the exact reflection direction below).
+            roughness.assign(clamp(roughness, float(0.0), float(1)));
             metalness.assign(clamp(metalness, float(0), float(1)));
 
             const isGlass = transmission.greaterThan(float(0.5));
@@ -531,11 +577,13 @@ export function buildKernels({
         }
         const xyz = vec3(accum.element(o), accum.element(o.add(uint(1))), accum.element(o.add(uint(2))));
         const c = xyz.mul(inv);
-        // XYZ (D65) → linear sRGB
+        // XYZ → linear sRGB with the native-white → D65 adaptation baked in
+        // (see XYZ_TO_SRGB_D65 above): equal-RGB scenes come out neutral.
+        const M = XYZ_TO_SRGB_D65;
         const rgb = vec3(
-            c.x.mul(3.2406).sub(c.y.mul(1.5372)).sub(c.z.mul(0.4986)),
-            c.x.mul(-0.9689).add(c.y.mul(1.8758)).add(c.z.mul(0.0415)),
-            c.x.mul(0.0557).sub(c.y.mul(0.2040)).add(c.z.mul(1.0570)),
+            c.x.mul(M[0][0]).add(c.y.mul(M[0][1])).add(c.z.mul(M[0][2])),
+            c.x.mul(M[1][0]).add(c.y.mul(M[1][1])).add(c.z.mul(M[1][2])),
+            c.x.mul(M[2][0]).add(c.y.mul(M[2][1])).add(c.z.mul(M[2][2])),
         );
         // neutralToneMapping is Fn([color, exposure]) — BOTH inputs are
         // required; omitting exposure makes it multiply by an undefined node

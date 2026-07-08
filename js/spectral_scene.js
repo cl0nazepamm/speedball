@@ -241,7 +241,7 @@ function materialToUber(material) {
     // name/colour classifier, else −1 (JH prior). Clamped roughness/metalness
     // values match what the classifier expects.
     const udNir = material.userData?.nirAlbedo;
-    const roughnessC = Math.min(1, Math.max(0.02, roughness));
+    const roughnessC = Math.min(1, Math.max(0, roughness)); // 0 = delta mirror, legal
     const metalnessC = Math.min(1, Math.max(0, metalness));
     const transmissionC = Math.min(1, Math.max(0, transmission));
     const nirAlbedo = Number.isFinite(udNir)
@@ -249,7 +249,7 @@ function materialToUber(material) {
         : classifyNir(material.name, r, g, b, roughnessC, metalnessC, transmissionC);
 
     return [r, g, b,
-        Math.min(1, Math.max(0.02, roughness)),
+        Math.min(1, Math.max(0, roughness)), // 0 = delta mirror, legal
         Math.min(1, Math.max(0, metalness)),
         Math.min(1, Math.max(0, transmission)),
         Math.max(1, ior),

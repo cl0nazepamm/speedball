@@ -124,6 +124,8 @@ export function createSpectralTracer({
     let sampleLimit = normalizeSampleLimit(settings.sampleLimit);
     let convergedNotified = false;
     let freezeSync = settings.freezeSync === true;
+    // false → primary-miss rays return black (env lights bounces only).
+    let envBackground = settings.envBackground !== false;
     // Camera post: thin-lens DOF + where tone mapping happens.
     let dofEnabled = false;
     let dofFocusDistance = 5;
@@ -302,6 +304,7 @@ export function createSpectralTracer({
         u.apertureRadius.value = dofEnabled ? Math.max(0, dofApertureRadius) : 0;
         u.focusDistance.value = Math.max(0.01, dofFocusDistance);
         u.toneMapEnabled.value = toneMapInBlit ? 1 : 0;
+        u.envBackground.value = envBackground ? 1 : 0;
     }
 
     // Push the live scene environment intensity/rotation into the kernel so the
@@ -499,6 +502,11 @@ export function createSpectralTracer({
             const n = options.freezeSync === true;
             changed = changed || n !== freezeSync; freezeSync = n;
         }
+        if (options.envBackground != null) {
+            const n = options.envBackground === true;
+            if (n !== envBackground) imageChanged = true;
+            changed = changed || n !== envBackground; envBackground = n;
+        }
         if (options.sampleLimit != null) {
             const n = normalizeSampleLimit(options.sampleLimit);
             if (n !== sampleLimit) {
@@ -511,7 +519,7 @@ export function createSpectralTracer({
         if (imageChanged) { applyUniformSettings(); resetAccumulation(); }
         return changed;
     }
-    function getSettings() { return { samplesPerFrame, giClamp, freezeSync, sampleLimit }; }
+    function getSettings() { return { samplesPerFrame, giClamp, freezeSync, sampleLimit, envBackground }; }
     function setDOF(opts = {}) {
         let changed = false;
         if (typeof opts.enabled === 'boolean' && opts.enabled !== dofEnabled) { dofEnabled = opts.enabled; changed = true; }
