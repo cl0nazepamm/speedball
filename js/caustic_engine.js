@@ -1,8 +1,8 @@
-// caustic_engine.js — reusable pure-WebGPU realtime metal-caustic engine.
+// caustic_engine.js — reusable pure-WebGPU realtime photon-caustic engine.
 //
 // Master home for the GPU photon-caustic source (speedball). It computes a
-// reflective metal caustic entirely in TSL compute passes and resolves it into
-// a StorageTexture that any receiver plane can sample.
+// reflective METAL or refractive GLASS caustic entirely in TSL compute passes
+// and resolves it into a StorageTexture that any receiver plane can sample.
 //
 // PORTABILITY: this module imports ONLY `three/tsl` (build-agnostic) and takes
 // the THREE namespace as a parameter — so the SAME file vendors byte-identical
@@ -12,14 +12,16 @@
 // under a bundler where bare `three` is the WebGL core (Vite / sigils).
 //
 // Pipeline (all on the GPU, no CPU readback):
-//   emit   : one compute thread per photon; samples the caster, reflects off the
-//            light, hits the receiver, atomic-splats fixed-point energy into a
-//            u32 density grid (WGSL has no float atomics -> u32 fixed point).
+//   emit   : one compute thread per photon; samples the caster, reflects OR
+//            refracts (thin-slab double bend) the light, hits the receiver,
+//            atomic-splats fixed-point energy into a u32 density grid
+//            (WGSL has no float atomics -> u32 fixed point). Glass mode uses
+//            3 channel grids so dispersion traces R/G/B to their refracted hits.
 //   convert: u32 grid -> float density buffer.
 //   blur   : separable Gaussian density estimation (crisp cusps).
 //   max    : atomicMax reduction of the blurred peak -> auto-exposure.
 //   bloom  : threshold the bright cores, wide Gaussian -> hot-cusp halo.
-//   resolve: gamma crush + bloom + metal tint + HDR tonemap -> RGBA16F StorageTexture.
+//   resolve: gamma crush + bloom + tint + HDR tonemap -> RGBA16F StorageTexture.
 //   overlay: caller adds `overlayMesh` and samples the texture additively.
 //
 // Progressive: the grid accumulates across frames (never cleared except on
@@ -28,17 +30,15 @@
 //
 // EMISSION SEAM: `buildEmit()` below is analytic (a curved door panel + two
 // torus wheels) — the reference emitter that validates the look. To throw
-// caustics off REAL geometry, replace buildEmit with one that traces the caster
-// mesh via this repo's BVH tracer (js/spectral_traverse.js buildTraversal +
-// spectral_scene.js buildSpectralScene). All photon-tracing lives here in
-// speedball; that is the canonical path.
+// caustics off REAL geometry, use setCasterMesh(). All photon-tracing lives
+// here in speedball; that is the canonical path.
 
 import {
     Fn, If, Loop, Return, instanceIndex, uniform, storage, textureStore, texture, uv,
     atomicAdd, atomicLoad, atomicMax, atomicStore,
     float, int, uint, vec3, vec4, uvec2,
     select, max, min, abs, sqrt, sin, cos, exp, pow, floor, ceil,
-    dot, normalize, reflect, clamp,
+    dot, normalize, reflect, clamp, cross,
 } from 'three/tsl';
 
 const PI = Math.PI;
@@ -67,6 +67,10 @@ export const CAUSTIC_METALS = {
  * @param {number} [opts.grid=768]            caustic grid resolution (WxH)
  * @param {number} [opts.targetPhotons=3e6]   photons accumulated before "converged"
  * @param {object} [opts.receiver]            receiver plane extents (world units)
+ * @param {'reflect'|'refract'} [opts.mode='reflect']  metal reflection vs glass refraction
+ * @param {number} [opts.ior=1.5]             glass index of refraction (refract mode)
+ * @param {number} [opts.dispersion=0]        Abbe-style IOR spread across R/G/B (refract)
+ * @param {number} [opts.thickness=0.55]      thin-slab travel distance inside glass (refract)
  * @returns engine handle: { overlayMesh, texture, uniforms, update(), setters, dispose() }
  */
 export function createCausticEngine({
@@ -78,8 +82,13 @@ export function createCausticEngine({
     // Otherwise a plane: { origin, normal (faces the incoming rays), uAxis, vAxis, width, height }.
     // (Not named `floor` — that would shadow the imported TSL floor() used in the kernels.)
     receiver = null,
+    mode = 'reflect',
+    ior = 1.5,
+    dispersion = 0,
+    thickness = 0.55,
 } = {}) {
     if (!THREE) throw new Error('createCausticEngine requires the THREE namespace (pass { THREE, renderer }).');
+    const isGlass = mode === 'refract';
     const W = grid, H = grid, cells = W * H;
     const SCALE = 256.0;       // fixed-point scale for atomic energy deposit
     const MAXSCALE = 64.0;     // fixed-point scale for the atomicMax auto-exposure
@@ -100,25 +109,37 @@ export function createCausticEngine({
 
     const params = {
         photonBudget: 300000,
-        strength: 2.2,         // overlay additive opacity
-        softness: 0.9,         // streak footprint + density-estimate bandwidth
-        bloom: 0.7,
-        roughness: 0.035,
-        tint: CAUSTIC_METALS.chrome.rgb.slice(),
+        strength: isGlass ? 4.2 : 2.2,         // overlay additive opacity
+        softness: isGlass ? 1.15 : 0.9,         // streak footprint + density-estimate bandwidth
+        bloom: isGlass ? 0.25 : 0.7,
+        roughness: isGlass ? 0.02 : 0.035,
+        tint: isGlass ? [1.0, 1.0, 1.0] : CAUSTIC_METALS.chrome.rgb.slice(),
         light: [-2.2, 3.4, -1.45],
+        ior: Math.max(1.01, ior),
+        dispersion: Math.max(0, dispersion),
+        thickness: Math.max(0.02, thickness),
     };
 
     const makeStorage = (array) => new THREE.StorageBufferAttribute(array, 1);
 
     // ── storage ──────────────────────────────────────────────────────
-    const grid_ = storage(makeStorage(new Uint32Array(cells)), 'uint', cells).toAtomic();
+    // Metal: one luminance grid. Glass: three channel grids so dispersion can
+    // land R/G/B at different receiver hits (rainbow caustic).
+    const gridR = storage(makeStorage(new Uint32Array(cells)), 'uint', cells).toAtomic();
+    const gridG = isGlass ? storage(makeStorage(new Uint32Array(cells)), 'uint', cells).toAtomic() : gridR;
+    const gridB = isGlass ? storage(makeStorage(new Uint32Array(cells)), 'uint', cells).toAtomic() : gridR;
     const maxB = storage(makeStorage(new Uint32Array(1)), 'uint', 1).toAtomic();
     const densF = storage(makeStorage(new Float32Array(cells)), 'float', cells);
+    const densG = isGlass ? storage(makeStorage(new Float32Array(cells)), 'float', cells) : densF;
+    const densB = isGlass ? storage(makeStorage(new Float32Array(cells)), 'float', cells) : densF;
     const tmpB = storage(makeStorage(new Float32Array(cells)), 'float', cells);
     const sharpB = storage(makeStorage(new Float32Array(cells)), 'float', cells);
+    const sharpG = isGlass ? storage(makeStorage(new Float32Array(cells)), 'float', cells) : sharpB;
+    const sharpBb = isGlass ? storage(makeStorage(new Float32Array(cells)), 'float', cells) : sharpB;
     const brightB = storage(makeStorage(new Float32Array(cells)), 'float', cells);
     const bloomB = storage(makeStorage(new Float32Array(cells)), 'float', cells);
-    const storageAttrs = [grid_, maxB, densF, tmpB, sharpB, brightB, bloomB];
+    const storageAttrs = [gridR, maxB, densF, tmpB, sharpB, brightB, bloomB];
+    if (isGlass) storageAttrs.push(gridG, gridB, densG, densB, sharpG, sharpBb);
 
     // RGBA16F: storage-capable + HDR. sRGB storage formats are NOT storage-capable
     // in WebGPU, so keep it LINEAR and store linear values directly.
@@ -142,6 +163,9 @@ export function createCausticEngine({
         // soft t-cull: energy *= 1/(1 + t^2*throwSoft). 0 disables (classic
         // look); 1/reach^2 halves a photon's weight at throw distance `reach`.
         throwSoft: uniform(0),
+        ior: uniform(params.ior),
+        dispersion: uniform(params.dispersion),
+        thickness: uniform(params.thickness),
     };
 
     // Caster-mesh emission state (populated by setCasterMesh; when 'mesh',
@@ -169,19 +193,19 @@ export function createCausticEngine({
         return float(res).mul(INV_U32);
     };
 
-    // bilinear 4-tap atomic deposit
-    const addTap = (ix, iy, amt) => {
+    // bilinear 4-tap atomic deposit into a chosen channel grid
+    const addTap = (grid, ix, iy, amt) => {
         const inb = ix.greaterThanEqual(int(0)).and(ix.lessThan(int(W)))
             .and(iy.greaterThanEqual(int(0))).and(iy.lessThan(int(H)));
         If(inb, () => {
             const cell = uint(iy).mul(uint(W)).add(uint(ix));
             const q = uint(clamp(amt.mul(float(SCALE)), float(0), float(U32_MAX)));
-            atomicAdd(grid_.element(cell), q);
+            atomicAdd(grid.element(cell), q);
         });
     };
 
-    // Shared: given a WORLD surface point + normal on the metal, reflect the
-    // light off it, hit the floor plane, and splat the anisotropic streak.
+    // Shared: given a WORLD surface point + normal on the caster, bounce the
+    // light (reflect metal / refract glass), hit the receiver, splat streak.
     // Culls (Return) on back-face / up-going / off-floor — safe inside the kernel.
     // receiver plane as compile-time constant vectors
     const Ro = vec3(R.origin.x, R.origin.y, R.origin.z);
@@ -190,62 +214,114 @@ export function createCausticEngine({
     const Rv = vec3(R.vAxis.x, R.vAxis.y, R.vAxis.z);
     const RhalfW = R.width * 0.5, RhalfH = R.height * 0.5;
 
-    const emitTrace = (wp, wn, sourceGain) => {
+    // Snell refraction: I = incident (points toward surface), N = outward normal,
+    // eta = n_in / n_out. Returns zero vector on TIR.
+    const snellRefract = (I, N, eta) => {
+        const cosi = clamp(dot(I, N).mul(-1), float(0), float(1));
+        const k = float(1).sub(eta.mul(eta).mul(float(1).sub(cosi.mul(cosi))));
+        const ok = k.greaterThan(float(0));
+        const dir = I.mul(eta).add(N.mul(eta.mul(cosi).sub(sqrt(max(k, float(0))))));
+        return select(ok, normalize(dir), vec3(0));
+    };
+
+    const splatStreak = (grid, dir, hitOrigin, energy) => {
+        // Nested If (no Return) so glass RGB bands can each land independently.
+        const denom = dot(dir, Rn);
+        If(denom.lessThan(float(-0.012)), () => {
+            const t = dot(Ro.sub(hitOrigin), Rn).div(denom);
+            If(t.greaterThan(float(0)).and(t.lessThan(float(80))), () => {
+                const hit = hitOrigin.add(dir.mul(t));
+                const d = hit.sub(Ro);
+                const uu = dot(d, Ru);
+                const vv = dot(d, Rv);
+                If(abs(uu).lessThanEqual(float(RhalfW)).and(abs(vv).lessThanEqual(float(RhalfH))), () => {
+                    const grazing = float(1).sub(min(float(1), abs(denom)));
+                    const grazeGain = float(0.55).add(grazing.mul(1.5));
+                    const roughPenalty = max(float(0.12), float(1).sub(U.metalRoughness.mul(5.5)));
+                    const throwAtten = float(1).div(t.mul(t).mul(U.throwSoft).add(1));
+                    const e = energy.mul(grazeGain).mul(roughPenalty).mul(throwAtten);
+
+                    const cx = uu.div(R.width).add(0.5).mul(float(W));
+                    const cy = float(0.5).add(vv.div(R.height)).mul(float(H));
+                    const cdx0 = dot(dir, Ru).mul(W / R.width);
+                    const cdy0 = dot(dir, Rv).mul(H / R.height);
+                    const clen = max(sqrt(cdx0.mul(cdx0).add(cdy0.mul(cdy0))), float(1e-6));
+                    const cdx = cdx0.div(clen);
+                    const cdy = cdy0.div(clen);
+                    const streakPx = min(float(18), float(2).add(grazing.mul(15)).mul(U.causticWidth));
+                    const steps = uint(max(float(1), ceil(streakPx)));
+                    const stepsF = float(steps);
+                    const ePer = e.div(stepsF);
+
+                    Loop({ start: uint(0), end: steps, type: 'uint', condition: '<' }, ({ i: s }) => {
+                        const tt = select(steps.equal(uint(1)), float(0),
+                            float(s).div(max(stepsF.sub(1), float(1))).sub(0.5));
+                        const fx = cx.add(cdx.mul(streakPx).mul(tt)).sub(0.5);
+                        const fy = cy.add(cdy.mul(streakPx).mul(tt)).sub(0.5);
+                        const x0 = int(floor(fx));
+                        const y0 = int(floor(fy));
+                        const txf = fx.sub(float(x0));
+                        const tyf = fy.sub(float(y0));
+                        addTap(grid, x0, y0, ePer.mul(float(1).sub(txf)).mul(float(1).sub(tyf)));
+                        addTap(grid, x0.add(int(1)), y0, ePer.mul(txf).mul(float(1).sub(tyf)));
+                        addTap(grid, x0, y0.add(int(1)), ePer.mul(float(1).sub(txf)).mul(tyf));
+                        addTap(grid, x0.add(int(1)), y0.add(int(1)), ePer.mul(txf).mul(tyf));
+                    });
+                });
+            });
+        });
+    };
+
+    // Glass: point deposit only (no metal streak smear). Shape comes from
+    // focusing of many photons + the density-estimate blur, not from stretching
+    // each photon into a beam along the floor.
+    // lightTravel = normalize(entry - light): reject floor hits that land back
+    // toward the light (the classic "inverted caustic" failure mode).
+    const splatPoint = (grid, dir, hitOrigin, energy, lightTravel) => {
+        const denom = dot(dir, Rn);
+        If(denom.lessThan(float(-0.02)), () => {
+            const t = dot(Ro.sub(hitOrigin), Rn).div(denom);
+            // Skip near-contact hits (hotspots glued to the object base) and
+            // absurdly long throws.
+            If(t.greaterThan(float(0.04)).and(t.lessThan(float(40))), () => {
+                const hit = hitOrigin.add(dir.mul(t));
+                If(dot(hit.sub(hitOrigin), lightTravel).greaterThan(float(0.0)), () => {
+                    const d = hit.sub(Ro);
+                    const uu = dot(d, Ru);
+                    const vv = dot(d, Rv);
+                    If(abs(uu).lessThanEqual(float(RhalfW)).and(abs(vv).lessThanEqual(float(RhalfH))), () => {
+                        const cosHit = abs(denom);
+                        const throwAtten = float(1).div(t.mul(t).mul(U.throwSoft).add(1));
+                        const e = energy.mul(cosHit).mul(throwAtten);
+                        const fx = uu.div(R.width).add(0.5).mul(float(W)).sub(0.5);
+                    const fy = float(0.5).add(vv.div(R.height)).mul(float(H)).sub(0.5);
+                        const x0 = int(floor(fx));
+                        const y0 = int(floor(fy));
+                        const txf = fx.sub(float(x0));
+                        const tyf = fy.sub(float(y0));
+                        addTap(grid, x0, y0, e.mul(float(1).sub(txf)).mul(float(1).sub(tyf)));
+                        addTap(grid, x0.add(int(1)), y0, e.mul(txf).mul(float(1).sub(tyf)));
+                        addTap(grid, x0, y0.add(int(1)), e.mul(float(1).sub(txf)).mul(tyf));
+                        addTap(grid, x0.add(int(1)), y0.add(int(1)), e.mul(txf).mul(tyf));
+                    });
+                });
+            });
+        });
+    };
+
+    const emitTraceMetal = (wp, wn, sourceGain) => {
         const toP = wp.sub(U.lightPos);
         const distSq = max(float(0.5), dot(toP, toP));
         const incident = normalize(toP);
         const ndl = max(float(0), dot(incident, wn).mul(-1));
         If(ndl.lessThanEqual(float(0.0001)), () => { Return(); });
+        const baseEnergy = ndl.mul(sourceGain).mul(float(8).div(distSq));
         const reflected = normalize(reflect(incident, wn));
-        // intersect the receiver plane; the reflected ray must enter its FRONT face
-        const denom = dot(reflected, Rn);
-        If(denom.greaterThanEqual(float(-0.012)), () => { Return(); });
-        const t = dot(Ro.sub(wp), Rn).div(denom);
-        If(t.lessThanEqual(float(0)), () => { Return(); });
-        If(t.greaterThan(float(80)), () => { Return(); }); // allow grazing throws to distant receivers
-        const hit = wp.add(reflected.mul(t));
-        const d = hit.sub(Ro);
-        const uu = dot(d, Ru);
-        const vv = dot(d, Rv);
-        If(abs(uu).greaterThan(float(RhalfW)), () => { Return(); });
-        If(abs(vv).greaterThan(float(RhalfH)), () => { Return(); });
-
-        const grazing = float(1).sub(min(float(1), abs(denom)));
-        const grazeGain = float(0.55).add(grazing.mul(1.5));
-        const roughPenalty = max(float(0.12), float(1).sub(U.metalRoughness.mul(5.5)));
-        // Soft t-cull: long grazing throws smear far from the caster and hijack
-        // the auto-exposure; fade them with the virtual-source divergence so the
-        // caustic hugs the geometry.
-        const throwAtten = float(1).div(t.mul(t).mul(U.throwSoft).add(1));
-        const energy = ndl.mul(roughPenalty).mul(sourceGain).mul(grazeGain).mul(throwAtten).mul(float(8).div(distSq));
-
-        const cx = uu.div(R.width).add(0.5).mul(float(W));
-        const cy = float(0.5).sub(vv.div(R.height)).mul(float(H));
-        const cdx0 = dot(reflected, Ru).mul(W / R.width);
-        const cdy0 = dot(reflected, Rv).mul(-1).mul(H / R.height);
-        const clen = max(sqrt(cdx0.mul(cdx0).add(cdy0.mul(cdy0))), float(1e-6));
-        const cdx = cdx0.div(clen);
-        const cdy = cdy0.div(clen);
-        const streakPx = min(float(18), float(2).add(grazing.mul(15)).mul(U.causticWidth));
-        const steps = uint(max(float(1), ceil(streakPx)));
-        const stepsF = float(steps);
-        const ePer = energy.div(stepsF);
-
-        Loop({ start: uint(0), end: steps, type: 'uint', condition: '<' }, ({ i: s }) => {
-            const tt = select(steps.equal(uint(1)), float(0),
-                float(s).div(max(stepsF.sub(1), float(1))).sub(0.5));
-            const fx = cx.add(cdx.mul(streakPx).mul(tt)).sub(0.5);
-            const fy = cy.add(cdy.mul(streakPx).mul(tt)).sub(0.5);
-            const x0 = int(floor(fx));
-            const y0 = int(floor(fy));
-            const txf = fx.sub(float(x0));
-            const tyf = fy.sub(float(y0));
-            addTap(x0, y0, ePer.mul(float(1).sub(txf)).mul(float(1).sub(tyf)));
-            addTap(x0.add(int(1)), y0, ePer.mul(txf).mul(float(1).sub(tyf)));
-            addTap(x0, y0.add(int(1)), ePer.mul(float(1).sub(txf)).mul(tyf));
-            addTap(x0.add(int(1)), y0.add(int(1)), ePer.mul(txf).mul(tyf));
-        });
+        splatStreak(gridR, reflected, wp, baseEnergy);
     };
+
+    // Metal path keeps emitTrace name for analytic/mesh callers below.
+    const emitTrace = emitTraceMetal;
 
     // ── ANALYTIC emitter (reference: curved door + torus wheels) ─────
     function buildEmit(count) {
@@ -306,14 +382,54 @@ export function createCausticEngine({
 
     // ── MESH emitter: sample the caster triangle mesh (world-space) ──
     // Area-weighted triangle pick (binary-search the CDF) + barycentric point +
-    // interpolated normal, then the shared reflect/floor/splat. This is the
-    // "throw caustics off real geometry" path — emission only (no ray tracing);
-    // wiring the reflected ray to buildTraversal is the next upgrade.
+    // interpolated normal, then reflect (metal) or refract-through (glass).
     function buildMeshEmit(count) {
         const triCount = meshTriCount;
         const iters = meshSearchIters;
         const fetchP = (i) => { const b = i.mul(uint(3)); return vec3(meshPos.element(b), meshPos.element(b.add(uint(1))), meshPos.element(b.add(uint(2)))); };
         const fetchN = (i) => { const b = i.mul(uint(3)); return vec3(meshNrm.element(b), meshNrm.element(b.add(uint(1))), meshNrm.element(b.add(uint(2)))); };
+
+        // Brute-force closest-hit against the caster mesh along a ray.
+        // Fine for demo-scale glass (a few thousand tris); not a BVH.
+        const meshIntersect = (ro, rd, tMin, tMaxOut, hitP, hitN) => {
+            const bestT = float(tMaxOut).toVar();
+            const found = float(0).toVar();
+            Loop({ start: uint(0), end: uint(triCount), type: 'uint', condition: '<' }, ({ i: t }) => {
+                const base = t.mul(uint(3));
+                const a = fetchP(meshIdx.element(base));
+                const b = fetchP(meshIdx.element(base.add(uint(1))));
+                const c = fetchP(meshIdx.element(base.add(uint(2))));
+                const e1 = b.sub(a);
+                const e2 = c.sub(a);
+                const pvec = cross(rd, e2);
+                const det = dot(e1, pvec);
+                // Skip near-parallel; allow either winding (glass is double-sided).
+                If(abs(det).greaterThan(float(1e-6)), () => {
+                    const invDet = float(1).div(det);
+                    const tvec = ro.sub(a);
+                    const u = dot(tvec, pvec).mul(invDet);
+                    If(u.greaterThanEqual(float(0)).and(u.lessThanEqual(float(1))), () => {
+                        const qvec = cross(tvec, e1);
+                        const v = dot(rd, qvec).mul(invDet);
+                        If(v.greaterThanEqual(float(0)).and(u.add(v).lessThanEqual(float(1))), () => {
+                            const tt = dot(e2, qvec).mul(invDet);
+                            If(tt.greaterThan(tMin).and(tt.lessThan(bestT)), () => {
+                                bestT.assign(tt);
+                                found.assign(float(1));
+                                const na = fetchN(meshIdx.element(base));
+                                const nb = fetchN(meshIdx.element(base.add(uint(1))));
+                                const nc = fetchN(meshIdx.element(base.add(uint(2))));
+                                const w0 = float(1).sub(u).sub(v);
+                                hitP.assign(ro.add(rd.mul(tt)));
+                                hitN.assign(normalize(na.mul(w0).add(nb.mul(u)).add(nc.mul(v))));
+                            });
+                        });
+                    });
+                });
+            });
+            return found;
+        };
+
         return Fn(() => {
             const pid = instanceIndex.toVar();
             If(pid.greaterThanEqual(uint(count)), () => { Return(); });
@@ -342,7 +458,78 @@ export function createCausticEngine({
             const wp = fetchP(i0).mul(b0).add(fetchP(i1).mul(b1)).add(fetchP(i2).mul(b2)).toVar();
             const wn = normalize(fetchN(i0).mul(b0).add(fetchN(i1).mul(b1)).add(fetchN(i2).mul(b2))).toVar();
 
-            emitTrace(wp, wn, float(1.0));
+            if (!isGlass) {
+                emitTrace(wp, wn, float(1.0));
+                return;
+            }
+
+            // ── Glass: light → entry face → through volume → exit face → floor ──
+            const toP = wp.sub(U.lightPos);
+            const distSq = max(float(0.5), dot(toP, toP));
+            const incident = normalize(toP);
+            // Front-lit entry only (authored outward normals). Do NOT flip back
+            // faces into entry — that would start photons on the exit side and
+            // produce the base hotspots / streak artifacts.
+            const ndl = max(float(0), dot(incident, wn).mul(-1));
+            If(ndl.lessThanEqual(float(0.08)), () => { Return(); });
+            const nEntry = wn;
+            const baseEnergy = ndl.mul(float(14).div(distSq));
+
+            // Trace each color band through the actual mesh. The UI dispersion
+            // value is art-facing, so map it to a small physical IOR spread:
+            // blue bends slightly more than green, red slightly less.
+            const nCenter = max(U.ior, float(1.01));
+            const iorSpread = U.dispersion.mul(float(0.035));
+            const nRed = max(float(1.01), nCenter.sub(iorSpread));
+            const nGreen = nCenter;
+            const nBlue = nCenter.add(iorSpread);
+
+            const traceGlassBand = (grid, nGlass) => {
+                const etaIn = float(1).div(nGlass);
+                const inside = snellRefract(incident, nEntry, etaIn);
+                If(float(dot(inside, inside)).greaterThan(float(0.5)), () => {
+                    // Inside ray must keep traveling with the light (into the volume).
+                    If(dot(inside, incident).greaterThan(float(0.15)), () => {
+                        const ro = wp.add(inside.mul(float(0.01)));
+                        const hitP = vec3(0).toVar();
+                        const hitN = vec3(0, 1, 0).toVar();
+                        // Skip past the entry shell — tiny tMin re-hits the lit face
+                        // and throws caustics back toward the light.
+                        const hit = meshIntersect(ro, inside, float(0.08), float(8), hitP, hitN);
+                        If(hit.greaterThan(float(0.5)), () => {
+                            // True far face: outward normal points along the inside ray,
+                            // and the exit is farther from the light than the entry.
+                            const nOutward = select(dot(hitN, inside).greaterThan(float(0)), hitN, hitN.mul(-1));
+                            const isFarFace = dot(nOutward, inside).greaterThan(float(0.15))
+                                .and(dot(hitP.sub(wp), incident).greaterThan(float(0.05)));
+                            If(isFarFace, () => {
+                                // glass→air: snellRefract wants N opposing I (= -outward).
+                                const nForSnell = nOutward.mul(-1);
+                                const out = snellRefract(inside, nForSnell, nGlass);
+                                If(float(dot(out, out)).greaterThan(float(0.5)), () => {
+                                    // Keep traveling into the shadow hemisphere.
+                                    If(dot(out, incident).greaterThan(float(0.0)), () => {
+                                        const cosi1 = clamp(dot(incident, nEntry).mul(-1), float(0), float(1));
+                                        const r0 = nGlass.sub(float(1)).div(nGlass.add(float(1)));
+                                        const R0 = r0.mul(r0);
+                                        const om1 = float(1).sub(cosi1);
+                                        const F1 = R0.add(float(1).sub(R0).mul(om1.mul(om1).mul(om1).mul(om1).mul(om1)));
+                                        const cosi2 = clamp(dot(inside, nForSnell).mul(-1), float(0), float(1));
+                                        const om2 = float(1).sub(cosi2);
+                                        const F2 = R0.add(float(1).sub(R0).mul(om2.mul(om2).mul(om2).mul(om2).mul(om2)));
+                                        const T = float(1).sub(F1).mul(float(1).sub(F2));
+                                        splatPoint(grid, out, hitP, baseEnergy.mul(T), incident);
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            };
+
+            traceGlassBand(gridR, nRed);
+            traceGlassBand(gridG, nGreen);
+            traceGlassBand(gridB, nBlue);
         })().compute(count);
     }
 
@@ -350,13 +537,21 @@ export function createCausticEngine({
     const clearGrid = Fn(() => {
         const idx = instanceIndex.toVar();
         If(idx.greaterThanEqual(uint(cells)), () => { Return(); });
-        atomicStore(grid_.element(idx), uint(0));
+        atomicStore(gridR.element(idx), uint(0));
+        if (isGlass) {
+            atomicStore(gridG.element(idx), uint(0));
+            atomicStore(gridB.element(idx), uint(0));
+        }
     })().compute(cells);
 
     const convert = Fn(() => {
         const idx = instanceIndex.toVar();
         If(idx.greaterThanEqual(uint(cells)), () => { Return(); });
-        densF.element(idx).assign(float(atomicLoad(grid_.element(idx))).div(float(SCALE)));
+        densF.element(idx).assign(float(atomicLoad(gridR.element(idx))).div(float(SCALE)));
+        if (isGlass) {
+            densG.element(idx).assign(float(atomicLoad(gridG.element(idx))).div(float(SCALE)));
+            densB.element(idx).assign(float(atomicLoad(gridB.element(idx))).div(float(SCALE)));
+        }
     })().compute(cells);
 
     const makeBlur = (src, dst, horizontal, sigmaU) => Fn(() => {
@@ -384,6 +579,11 @@ export function createCausticEngine({
 
     const sharpH = makeBlur(densF, tmpB, true, U.sharpSigma);
     const sharpV = makeBlur(tmpB, sharpB, false, U.sharpSigma);
+    // Glass: blur G/B through the same tmp buffer sequentially (after R is done).
+    const sharpHG = isGlass ? makeBlur(densG, tmpB, true, U.sharpSigma) : null;
+    const sharpVG = isGlass ? makeBlur(tmpB, sharpG, false, U.sharpSigma) : null;
+    const sharpHB = isGlass ? makeBlur(densB, tmpB, true, U.sharpSigma) : null;
+    const sharpVB = isGlass ? makeBlur(tmpB, sharpBb, false, U.sharpSigma) : null;
     const bloomH = makeBlur(brightB, tmpB, true, U.bloomSigma);
     const bloomV = makeBlur(tmpB, bloomB, false, U.bloomSigma);
 
@@ -392,7 +592,11 @@ export function createCausticEngine({
     const reduceMax = Fn(() => {
         const idx = instanceIndex.toVar();
         If(idx.greaterThanEqual(uint(cells)), () => { Return(); });
-        const q = uint(clamp(sharpB.element(idx).mul(float(MAXSCALE)), float(0), float(U32_MAX)));
+        // Peak over luminance so auto-exposure stays stable across RGB fans.
+        const lum = isGlass
+            ? max(sharpB.element(idx), max(sharpG.element(idx), sharpBb.element(idx)))
+            : sharpB.element(idx);
+        const q = uint(clamp(lum.mul(float(MAXSCALE)), float(0), float(U32_MAX)));
         atomicMax(maxB.element(uint(0)), q);
     })().compute(cells);
 
@@ -400,7 +604,10 @@ export function createCausticEngine({
         const idx = instanceIndex.toVar();
         If(idx.greaterThanEqual(uint(cells)), () => { Return(); });
         const invMax = float(MAXSCALE).div(max(float(atomicLoad(maxB.element(uint(0)))), float(1)));
-        const nd = sharpB.element(idx).mul(invMax);
+        const lum = isGlass
+            ? max(sharpB.element(idx), max(sharpG.element(idx), sharpBb.element(idx)))
+            : sharpB.element(idx);
+        const nd = lum.mul(invMax);
         brightB.element(idx).assign(max(float(0), nd.sub(float(0.4))));
     })().compute(cells);
 
@@ -410,15 +617,32 @@ export function createCausticEngine({
         const px = idx.mod(uint(W));
         const py = idx.div(uint(W));
         const invMax = float(MAXSCALE).div(max(float(atomicLoad(maxB.element(uint(0)))), float(1)));
-        const nd = max(sharpB.element(idx).mul(invMax), float(0));
-        const core = pow(nd, float(2.6));                     // contrast crush -> dark wash, bright cusps
-        const I = core.add(bloomB.element(idx).mul(U.bloomGain));
-        const v = float(1).sub(exp(I.mul(-1.6)));             // soft HDR saturation
-        const hot = max(float(0), v.sub(float(0.75)).div(float(0.25))); // hot cores -> white
-        const rr = v.mul(U.tint.x.add(float(1).sub(U.tint.x).mul(hot)));
-        const gg = v.mul(U.tint.y.add(float(1).sub(U.tint.y).mul(hot)));
-        const bb = v.mul(U.tint.z.add(float(1).sub(U.tint.z).mul(hot)));
-        textureStore(causticTex, uvec2(px, py), vec4(rr, gg, bb, float(1)));
+        if (isGlass) {
+            const nr = max(sharpB.element(idx).mul(invMax), float(0));
+            const ng = max(sharpG.element(idx).mul(invMax), float(0));
+            const nb = max(sharpBb.element(idx).mul(invMax), float(0));
+            // Soft crush; keep RGB ratios (no per-channel white-hot).
+            const cr = pow(nr, float(1.25));
+            const cg = pow(ng, float(1.25));
+            const cb = pow(nb, float(1.25));
+            const bloom = bloomB.element(idx).mul(U.bloomGain).mul(0.25);
+            const vr = float(1).sub(exp(cr.add(bloom).mul(-1.0)));
+            const vg = float(1).sub(exp(cg.add(bloom).mul(-1.0)));
+            const vb = float(1).sub(exp(cb.add(bloom).mul(-1.0)));
+            textureStore(causticTex, uvec2(px, py), vec4(
+                vr.mul(U.tint.x), vg.mul(U.tint.y), vb.mul(U.tint.z), float(1),
+            ));
+        } else {
+            const nd = max(sharpB.element(idx).mul(invMax), float(0));
+            const core = pow(nd, float(2.6));
+            const I = core.add(bloomB.element(idx).mul(U.bloomGain));
+            const v = float(1).sub(exp(I.mul(-1.6)));
+            const hot = max(float(0), v.sub(float(0.75)).div(float(0.25)));
+            const rr = v.mul(U.tint.x.add(float(1).sub(U.tint.x).mul(hot)));
+            const gg = v.mul(U.tint.y.add(float(1).sub(U.tint.y).mul(hot)));
+            const bb = v.mul(U.tint.z.add(float(1).sub(U.tint.z).mul(hot)));
+            textureStore(causticTex, uvec2(px, py), vec4(rr, gg, bb, float(1)));
+        }
     })().compute(cells);
 
     // ── overlay plane (caller adds this to a scene) ──────────────────
@@ -480,6 +704,10 @@ export function createCausticEngine({
         renderer.compute(e);
         renderer.compute(convert);
         renderer.compute(sharpH); renderer.compute(sharpV);
+        if (isGlass) {
+            renderer.compute(sharpHG); renderer.compute(sharpVG);
+            renderer.compute(sharpHB); renderer.compute(sharpVB);
+        }
         renderer.compute(clearMax); renderer.compute(reduceMax);
         renderer.compute(threshold);
         renderer.compute(bloomH); renderer.compute(bloomV);
@@ -578,6 +806,21 @@ export function createCausticEngine({
     // Soft t-cull strength (see U.throwSoft). Pass 1/reach^2 for a half-weight
     // throw distance of `reach` world units; 0 restores the classic open throw.
     function setThrowFalloff(v) { U.throwSoft.value = Math.max(0, v); markDirty(); }
+    function setIor(v) {
+        params.ior = Math.max(1.01, v);
+        U.ior.value = params.ior;
+        markDirty();
+    }
+    function setDispersion(v) {
+        params.dispersion = Math.max(0, v);
+        U.dispersion.value = params.dispersion;
+        markDirty();
+    }
+    function setThickness(v) {
+        params.thickness = Math.max(0.02, v);
+        U.thickness.value = params.thickness;
+        markDirty();
+    }
 
     function dispose() {
         for (const a of storageAttrs) a?.value?.dispose?.();
@@ -590,9 +833,11 @@ export function createCausticEngine({
         overlayMesh,
         texture: causticTex,
         uniforms: U,
+        mode: isGlass ? 'refract' : 'reflect',
         update,
         setLight, setCasterMatrices, setCasterMesh, setMetal, setMetalTint,
         setRoughness, setSoftness, setBloom, setStrength, setPhotonBudget, setThrowFalloff,
+        setIor, setDispersion, setThickness,
         markDirty, dispose,
         get accum() { return accum; },
         get converged() { return converged; },
