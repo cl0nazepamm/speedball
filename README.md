@@ -14,9 +14,11 @@ With slow machines or very large grids it converges as fast as it can without di
 
 The live demo exposes a **normalize hysteresis** switch so you can turn the normalization off and compare against the raw per-update value.
 
-## Launch live Sponza demo
+## Launch live demos
 
-**[▶ cl0nazepamm.github.io/speedball](https://cl0nazepamm.github.io/speedball/)**
+**[▶ Sponza GI](https://cl0nazepamm.github.io/speedball/)** · **[▶ Glass dispersion](https://cl0nazepamm.github.io/speedball/dispersion.html)**
+
+Locally: `npm start` then open `http://127.0.0.1:8777/` or `/dispersion.html`.
 
 Requires a WebGPU-capable browser (Chrome/Edge stable; Safari 26+).
 
@@ -80,7 +82,9 @@ vendoring files:
   presets: pure-WebGPU compute photon caustics with analytic and mesh-emission
   casters, soft t-cull (`setThrowFalloff`), and a `setCasterMesh(mesh,
   { shaper })` hook for baking procedural vertex displacement into photon
-  emission.
+  emission. Pass `mode: 'refract'` (plus `ior` / `dispersion` / `thickness`)
+  for glass caustics — same splat pipeline, Snell thin-slab bend, chromatic
+  R/G/B grids so dispersion fans on the receiver.
 - **`speedball-gi/spectral-scene`** / **`speedball-gi/spectral-traverse`** —
   the shared scene foundation (scene → flat BVH/material/light buffers; TSL
   traversal + spectral shading emitters).
