@@ -15,6 +15,7 @@ import * as THREE from 'three/webgpu';
 import { buildSpectralScene } from './spectral_scene.js';
 import { buildKernels } from './spectral_kernel.js';
 import { decodeSpectralLut, SPECTRAL_LUT_RES } from './srgb_lut.js';
+import { disposeComputeNodes, disposeStorageAttributes } from './webgpu_cleanup.js';
 
 // RGB→reflectance LUT as 3 Data3DTextures (one per argmax slab), built once and
 // shared across scene rebuilds. The packed module stores depth = slab*res+zi,
@@ -131,7 +132,7 @@ export function createSpectralTracer({
     let dofFocusDistance = 5;
     let dofApertureRadius = 0;
     let toneMapInBlit = true; // false → emit linear HDR for an external post stack
-    // 'visible' (XYZ→sRGB, default) or 'nv' (true photocathode flux, linear).
+    // 'visible' (XYZ→sRGB, default) or 'nv' (relative photocathode response, linear).
     // NV mode is meant to feed the image-intensifier model: point nvTarget at
     // a HalfFloat RenderTarget and hand its .texture to
     // powershotInfrared.setInputMode('nir') + renderTexture(...). With no
@@ -202,9 +203,8 @@ export function createSpectralTracer({
 
     function disposeGPU() {
         if (!gpu) return;
-        for (const key of ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights', 'accum']) {
-            gpu.buffers[key]?.dispose?.();
-        }
+        disposeComputeNodes(gpu.kernels, ['traceKernel', 'clearKernel']);
+        disposeStorageAttributes(renderer, gpu.buffers, ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights', 'accum']);
         // Per-scene PBR map array textures (the shared spectral LUT is NOT
         // disposed here — it persists across rebuilds).
         if (gpu.maps) for (const t of Object.values(gpu.maps)) t?.dispose?.();
@@ -556,7 +556,7 @@ export function createSpectralTracer({
         if (renderMode === v) return false;
         renderMode = v;
         requestSceneRebuild({ immediate: true });
-        onStatus(`max.js - Path tracer mode: ${v === 'nv' ? 'night-vision (photocathode flux)' : 'visible'}`);
+        onStatus(`max.js - Path tracer mode: ${v === 'nv' ? 'night-vision (photocathode response)' : 'visible'}`);
         return true;
     }
     function getRenderMode() { return renderMode; }

@@ -3,6 +3,17 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.4] — 2026-07-13
+
+- Fixed unbounded WebGPU storage growth after settled animated-scene rebuilds.
+  HALO-GI now disposes obsolete compute nodes before releasing their bindings,
+  and explicitly evicts standalone `StorageBufferAttribute` resources from the
+  Three r185 attribute manager so GPU buffers and renderer memory bookkeeping
+  are actually released.
+- Applied the same compute/storage teardown to the spectral path tracer.
+- Added a cleanup smoke test and included the shared teardown helper in the npm
+  package.
+
 ## [0.6.0] — 2026-07-08
 
 - NIR band sensing for the raster path (`setNirSensing(on)` on the install

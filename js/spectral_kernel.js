@@ -10,16 +10,18 @@
 //
 // Buffer strides come from spectral_scene.js: bvhNodes u32×8, triIndex u32×3,
 // vertexData f32×8 (pos+normal+uv), triMaterial u32×1, materials f32×28,
-// lights f32×17, accum f32×4 (XYZ + NIR photocathode flux). PBR maps arrive
+// lights f32×17, accum f32×4 (XYZ + relative NIR photocathode response).
+// PBR maps arrive
 // as DataArrayTextures (one per type) sampled at the hit UV.
 //
 // Render modes (buildKernels `mode`):
 //   'visible' — λ ∈ [380,720] uniform, Wyman XYZ accumulation (unchanged).
 //   'nv'      — λ ∈ [550,900] importance-sampled against the Gen-3 GaAs
 //               photocathode response; the path's radiance × S(λ)/pdf(λ),
-//               normalized by ∫S dλ, accumulates in the 4th channel as true
-//               electron flux. The blit then emits LINEAR flux (no tone map,
-//               no sRGB) for the image-intensifier stage
+//               normalized by ∫S dλ, accumulates in the 4th channel as a
+//               relative sensor response. The blit emits that LINEAR response
+//               without tone mapping or sRGB encoding for the intensifier
+//               stage
 //               (powershot-threejs/infrared, setInputMode("nir")).
 //
 // The BVH traversal + JH-spectral/env/PBR shading emitters live in
@@ -115,9 +117,9 @@ export function buildKernels({
     // Per-mode λ domain. Visible keeps [380,720] — byte-identical behaviour.
     const lambdaMin = isNV ? NV_LAMBDA_MIN : LAMBDA_MIN;
     const lambdaRange = (isNV ? NV_LAMBDA_MAX : LAMBDA_MAX) - lambdaMin;
-    // NV λ sampler: 64-entry inverse-CDF LUT + ∫S dλ (flux normalization —
+    // NV λ sampler: 64-entry inverse-CDF LUT + ∫S dλ (response normalization —
     // the analogue of CIE_Y_INTEGRAL: a unit-radiance flat-spectrum scene
-    // lands near flux 1.0).
+    // lands near response 1.0).
     const pcSampler = isNV ? buildPhotocathodeSampler() : null;
     const pcLutNode = nvImportance ? uniformArray(Array.from(pcSampler.lut), 'float') : null;
     const pcLutN = pcSampler ? pcSampler.lut.length : 0;
@@ -518,7 +520,7 @@ export function buildKernels({
 
         const o = pix.mul(uint(4));
         if (isNV) {
-            // NV mode: true photocathode electron flux in the 4th channel.
+            // NV mode: relative photocathode response in the 4th channel.
             // Estimator: radiance · S(λ) / (pdf(λ) · ∫S dλ). With importance
             // sampling pdf(λ) = S(λ)/∫S, so the weight collapses to exactly 1
             // — treating the inverse-CDF draw as exact, standard practice.
@@ -568,7 +570,7 @@ export function buildKernels({
         const o = idx.mul(uint(4));
         const inv = float(1).div(max(U.sampleCount, float(1)));
         if (isNV) {
-            // LINEAR electron flux for the intensifier stage: sample-count
+            // LINEAR relative response for the intensifier stage: sample-count
             // divide + exposure only. NO tone map, NO sRGB — the tube model
             // (powershot-threejs/infrared, inputMode "nir") owns the transfer
             // curve, and it reads the red channel raw.

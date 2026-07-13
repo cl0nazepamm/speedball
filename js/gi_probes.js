@@ -36,6 +36,7 @@ let _collectLights = null;       // cheap light re-collect for reactivity (no BV
 let _LIGHT_STRIDE = 16;
 import { buildTraversal, T_MAX, RAY_EPS, PI } from './spectral_traverse.js';
 import { octEncodeNode, octDecodeNode } from './gi_oct.js';
+import { disposeComputeNodes, disposeStorageAttribute, disposeStorageAttributes } from './webgpu_cleanup.js';
 
 // namespace injected into the octahedral node builders (gi_oct.js).
 const TSL = { float, vec2, vec3, abs: tslAbs, select, max: tslMax, normalize };
@@ -98,6 +99,8 @@ const GEO_SETTLE_INTERVALS = 2;    // structure must be stable this many checks 
 // during motion is visually lossless; it resumes and converges once the view rests.
 const GI_IDLE_MS = 200;            // ms of camera/sync quiet before GI work resumes
 const REBUILD_BACKOFF_TICKS = 45;  // ticks to wait after a failed/empty rebuild before retrying
+const PROBE_COMPUTE_KEYS = ['traceKernel', 'blendKernel', 'uploadKernel', 'clearAtlasKernel', 'classifyKernel', 'uploadStateKernel'];
+const PROBE_BVH_BUFFER_KEYS = ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights'];
 // ── denoise uplift (CORE, docs/GI_SPEEDBALL_design.md §11) tunables ──
 const GI_FILTER_K = 8.0;           // spatial filter: variance→edge-stop bandwidth
 const GI_FILTER_EPS = 0.001;       // spatial filter luma² absolute floor (avoids /0 on black)
@@ -760,8 +763,9 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
     // material binding stable → no recompile).
     function disposeBVHOnly(g) {
         if (!g) return;
-        for (const k of ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights']) g.buffers?.[k]?.dispose?.();
-        g.rayBuffer?.dispose?.();
+        disposeComputeNodes(g, PROBE_COMPUTE_KEYS);
+        disposeStorageAttributes(renderer, g.buffers, PROBE_BVH_BUFFER_KEYS);
+        disposeStorageAttribute(renderer, g.rayBuffer);
         if (g.maps) for (const t of Object.values(g.maps)) t?.dispose?.();
     }
 
@@ -771,11 +775,12 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const C = casc[c];
         const g = C.gpu;
         if (g) {
-            for (const k of ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights']) g.buffers[k]?.dispose?.();
-            g.irrBuffer?.dispose?.();
-            g.depthBuffer?.dispose?.();
-            g.stateBuffer?.dispose?.();
-            g.rayBuffer?.dispose?.();
+            disposeComputeNodes(g, PROBE_COMPUTE_KEYS);
+            disposeStorageAttributes(renderer, g.buffers, PROBE_BVH_BUFFER_KEYS);
+            disposeStorageAttribute(renderer, g.irrBuffer);
+            disposeStorageAttribute(renderer, g.depthBuffer);
+            disposeStorageAttribute(renderer, g.stateBuffer);
+            disposeStorageAttribute(renderer, g.rayBuffer);
             g.atlas?.dispose?.();
             g.depthAtlas?.dispose?.();
             g.stateAtlas?.dispose?.();

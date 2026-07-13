@@ -1,6 +1,6 @@
 {
   "name": "speedball-gi",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "Real-time BVH-traced dynamic diffuse global illumination (DDGI), GPU spectral path tracing, and photon caustics for three.js WebGPU — octahedral irradiance probes, infinite bounce, idle-gated, one-call setup.",
   "type": "module",
   "license": "MIT",
@@ -18,7 +18,8 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "start": "python3 -m http.server 8777 --bind 127.0.0.1"
+    "start": "python3 -m http.server 8777 --bind 127.0.0.1",
+    "test": "node scripts/webgpu-cleanup-smoke.mjs"
   },
   "repository": {
     "type": "git",
@@ -41,6 +42,7 @@
     "js/spectral_tracer.js",
     "js/spectral_traverse.js",
     "js/srgb_lut.js",
+    "js/webgpu_cleanup.js",
     "LICENSE",
     "README.md"
   ],
