@@ -125,9 +125,18 @@ export default class GiLightsNode extends DynamicLightsNode {
                 if (node !== null) lightNodes.push(node);
             }
         }
+        const probe = getGiProbeNode();
+        // DynamicLightsNode replaces (rather than extends) Three's stock light list.
+        // Restore ONLY material-owned EnvironmentNode for the opt-in reflection graph,
+        // first so the probe can composite local radiance over PMREM. Pulling unrelated
+        // AO/light-map nodes into this feature would widen its image/perf contract.
+        // The legacy roughReflections:false graph remains on the exact old path.
+        if (probe.roughReflectionsReady) {
+            const environments = (builder.context.materialLightings || []).filter((node) => node?.type === 'EnvironmentNode');
+            lightNodes = [ ...environments, ...lightNodes ];
+        }
         // Indirect bounce into builder.context.irradiance — global, unmasked, only
         // when active (same contract as MaxLightsNode's GI push).
-        const probe = getGiProbeNode();
         if (probe.active) lightNodes.push(probe);
         const vol = getGiVolumeNode();
         if (vol.active) lightNodes.push(vol);

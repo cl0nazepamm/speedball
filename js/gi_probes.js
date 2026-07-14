@@ -21,11 +21,12 @@
 import * as THREE from 'three/webgpu';
 import { LightingNode } from 'three/webgpu';
 import {
-    Fn, If, Loop, Return, instanceIndex, storage, uniform, texture, textureLevel, sharedUniformGroup,
+    Fn, If, Loop, Return, instanceIndex, storage, uniform, texture, textureLevel, sharedUniformGroup, struct,
     float, int, uint, vec2, vec3, vec4, uvec2,
     max as tslMax, min as tslMin, mix, clamp, floor, normalize, dot, cross, length,
-    abs as tslAbs, sqrt, cos, sin, pow, exp, textureStore,
+    abs as tslAbs, sqrt, cos, sin, pow, exp, smoothstep, textureStore,
     positionWorld, normalWorld, normalWorldGeometry, normalLocal, modelNormalMatrix, select,
+    positionViewDirection, cameraWorldMatrix, roughness,
 } from 'three/tsl';
 
 // buildSpectralScene (pulls three-mesh-bvh) is lazy-loaded in rebuild() so
@@ -40,10 +41,24 @@ import { disposeComputeNodes, disposeStorageAttribute, disposeStorageAttributes 
 
 // namespace injected into the octahedral node builders (gi_oct.js).
 const TSL = { float, vec2, vec3, abs: tslAbs, select, max: tslMax, normalize };
+const ProbeLightingSample = struct({
+    irradiance: 'vec3',
+    roughRadiance: 'vec4',
+}, 'SpeedballProbeLightingSample');
 
 const OCT_RES = 6;                 // interior octahedral resolution per probe
 const BORDER = 1;                  // 1px gutter on every side
 const TILE = OCT_RES + 2 * BORDER; // 8×8 atlas tile
+// Broad local-reflection lobe. Power 4 is intentionally rough: at the default
+// 64 rays/probe it stays stable, reads like Lumen's probe reflections, and leaves
+// sharp/mirror reflections to PMREM/SSR/PT. Evaluated as (d²)² in the blend loop.
+const ROUGH_SPECULAR_POWER = 4;
+const ROUGH_REFLECTION_FADE_START = 0.4;
+const ROUGH_REFLECTION_FADE_END = 0.6;
+// Negative hitT encoding: -1 remains a true miss; -(distance + 2) marks geometry
+// that must occlude DDGI depth but has no Lambert/emissive radiance for the rough
+// atlas (pure metal/glass). It therefore cannot black-out the PMREM fallback.
+const ROUGH_UNSHADED_T_BIAS = 2.0;
 const RAYS_PER_PROBE_DEFAULT = 64; // MVP ray budget (doc target 144). LOCKED baseline:
                                    // divisions=12 → 624 probes is tuned at 64 rays. Live via setRays().
 const RAYS_MIN = 32, RAYS_MAX = 256;
@@ -161,6 +176,7 @@ export class GiProbeNode extends LightingNode {
         // Per-cascade atlas triplets (index 0 = C0 coarse, 1 = C1 fine). SEPARATE atlases
         // per cascade (not a shared pack): each runs the existing atlas-fit math verbatim.
         this._atlas = [null, null];
+        this._roughSpecularAtlas = [null, null];
         this._depthAtlas = [null, null];
         this._stateAtlas = [null, null];
         this._enabled = false;
@@ -194,6 +210,10 @@ export class GiProbeNode extends LightingNode {
 
         // Cascade-invariant look uniforms (single instance).
         this.intensityNode = uniform(1.0);
+        // Rough-reflection strength is a coverage/composite weight, not a radiance
+        // multiplier. 0 preserves stock PMREM exactly; 1 lets local probe hits replace
+        // PMREM in their broad reflected lobe. The field is opt-in at allocation time.
+        this.reflectionIntensityNode = uniform(1.0);
         // Runtime enable gate. The graph membership below is still the authoritative
         // on/off switch; this uniform remains as a cheap extra guard for compiled graphs.
         this.enabledNode = uniform(1.0);
@@ -219,7 +239,7 @@ export class GiProbeNode extends LightingNode {
             ...this.normalBiasNode, ...this.chebyBiasNode,
             this.samplePositionScaleNode, this.sampleNormalMixNode, this.sampleBiasScaleNode, this.sampleObjectNormalNode,
             this.detailStrengthNode,
-            this.intensityNode, this.enabledNode, this.cascadeCountNode, this.borderBandNode,
+            this.intensityNode, this.reflectionIntensityNode, this.enabledNode, this.cascadeCountNode, this.borderBandNode,
             this.chebyStrengthNode, this.classifyStrengthNode,
         ]) u.setGroup(GI_UNIFORM_GROUP);
     }
@@ -242,6 +262,11 @@ export class GiProbeNode extends LightingNode {
     // Gating active on _enabled/intensity reintroduces the original bug — toggling them
     // only flips the cacheToken, which never forces a recompile, so GI silently drops out.
     get active() { return this._ready; }
+    get roughReflectionsReady() {
+        const count = Math.round(this.cascadeCountNode.value) || 1;
+        for (let c = 0; c < count; c++) if (!this._roughSpecularAtlas[c]) return false;
+        return true;
+    }
     // structure-only token: data writes (textureStore) do NOT change this, so
     // materials never recompile on a probe tick — only on resize / first data.
     get cacheToken() { return `gi-speedball-probes:${this._structGen}`; }
@@ -250,6 +275,10 @@ export class GiProbeNode extends LightingNode {
     setIntensity(v) {
         this.intensity = Number.isFinite(v) ? Math.max(0, v) : 0;
         this.intensityNode.value = this.intensity;
+        touchGiUniforms();
+    }
+    setReflectionIntensity(v) {
+        this.reflectionIntensityNode.value = Number.isFinite(v) ? THREE.MathUtils.clamp(v, 0, 1) : 0;
         touchGiUniforms();
     }
     setChebyStrength(v) { if (Number.isFinite(v)) { this.chebyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); touchGiUniforms(); } }
@@ -263,8 +292,9 @@ export class GiProbeNode extends LightingNode {
         touchGiUniforms();
         this._structGen++;   // shader tap count changes → one recompile
     }
-    setAtlases(c, atlas, depthAtlas, stateAtlas) {
+    setAtlases(c, atlas, depthAtlas, stateAtlas, roughSpecularAtlas = null) {
         this._atlas[c] = atlas || null;
+        this._roughSpecularAtlas[c] = roughSpecularAtlas || null;
         this._depthAtlas[c] = depthAtlas || null;
         this._stateAtlas[c] = stateAtlas || null;
         this._structGen++;
@@ -294,8 +324,13 @@ export class GiProbeNode extends LightingNode {
 
     // tile-local atlas uv for probe (col,row) at octahedral coord octUV in cascade c.
     _tileUV(col, row, octUV, c) {
-        const ox = col.mul(float(TILE)).add(float(BORDER)).add(octUV.x.mul(float(OCT_RES))).add(0.5);
-        const oy = row.mul(float(TILE)).add(float(BORDER)).add(octUV.y.mul(float(OCT_RES))).add(0.5);
+        // Interior texels are generated at (i + 0.5) / OCT_RES. Mapping that
+        // coordinate back to texel space is therefore BORDER + uv * OCT_RES;
+        // adding another half texel shifts the fold endpoints asymmetrically into
+        // an interior texel on one side and the gutter on the other, producing the
+        // world-normal quadrant cross on smooth surfaces.
+        const ox = col.mul(float(TILE)).add(float(BORDER)).add(octUV.x.mul(float(OCT_RES)));
+        const oy = row.mul(float(TILE)).add(float(BORDER)).add(octUV.y.mul(float(OCT_RES)));
         return vec2(ox.div(this.atlasDimNode[c].x), oy.div(this.atlasDimNode[c].y));
     }
 
@@ -364,7 +399,8 @@ export class GiProbeNode extends LightingNode {
         const stateEff = mix(float(1.0), stateV, this.classifyStrengthNode);
         const w = wTri.mul(wrapW).mul(visW).mul(stateEff);
         const eD = fetch(this._atlas[c], this._tileUV(col, row, octN, c)).xyz;
-        const e = octNs ? mix(fetch(this._atlas[c], this._tileUV(col, row, octNs, c)).xyz, eD, this.detailStrengthNode) : eD;
+        const eS = octNs ? fetch(this._atlas[c], this._tileUV(col, row, octNs, c)).xyz : null;
+        const e = eS ? mix(eS, eD, this.detailStrengthNode) : eD;
         return { e, w };
     }
 
@@ -439,6 +475,82 @@ export class GiProbeNode extends LightingNode {
                 wsum.addAssign(w);
             });
             return acc.div(wsum.max(float(1e-4)));
+        })();
+    }
+
+    // Opt-in physical receiver: gather diffuse irradiance and rough local radiance
+    // together. State/depth/visibility are evaluated ONCE per probe; rough pixels add
+    // only the RGBA atlas fetch. Smooth pixels take the same loop with that fetch
+    // dynamically skipped, while roughReflections:false never emits this path at all.
+    _sampleCombinedCascadeLooped(P, Nvis, Ndir, Rdir, roughWeight, c, dualDetail = false) {
+        return Fn(() => {
+            const res = this.resNode[c];
+            const cell = this.gridSizeNode[c].div(res.sub(1.0).max(vec3(1.0)));
+            const gridF = P.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
+            const baseF = gridF.floor().clamp(vec3(0.0), res.sub(2.0).max(vec3(0.0)));
+            const frac = gridF.sub(baseF).clamp(0.0, 1.0);
+            const Nn = Nvis.normalize();
+            const octN = octEncodeNode(Ndir.normalize(), TSL);
+            const octNs = dualDetail ? octEncodeNode(Nn, TSL) : null;
+            const octR = octEncodeNode(Rdir.normalize(), TSL);
+            const acc = vec3(0.0).toVar();
+            const roughAcc = vec4(0.0).toVar();
+            const wsum = float(0.0).toVar();
+            Loop({ start: uint(0), end: uint(8), type: 'uint', condition: '<' }, ({ i }) => {
+                const dx = i.bitAnd(uint(1)).toFloat();
+                const dy = i.shiftRight(uint(1)).bitAnd(uint(1)).toFloat();
+                const dz = i.shiftRight(uint(2)).bitAnd(uint(1)).toFloat();
+                const px = baseF.x.add(dx);
+                const py = baseF.y.add(dy);
+                const pz = baseF.z.add(dz);
+                const wx = mix(float(1.0).sub(frac.x), frac.x, dx);
+                const wy = mix(float(1.0).sub(frac.y), frac.y, dy);
+                const wz = mix(float(1.0).sub(frac.z), frac.z, dz);
+                const wTri = wx.mul(wy).mul(wz).add(1e-4);
+                const { e, w } = this._tapEW(c, P, Nn, octN, octNs, px, py, pz, wTri, true);
+                acc.addAssign(e.mul(w));
+                wsum.addAssign(w);
+                If(roughWeight.greaterThan(float(0.0)), () => {
+                    const row = pz.mul(res.y).add(py);
+                    const s = textureLevel(this._roughSpecularAtlas[c], this._tileUV(px, row, octR, c), float(0.0));
+                    roughAcc.addAssign(s.mul(w));
+                });
+            });
+            const den = wsum.max(float(1e-4));
+            return ProbeLightingSample({
+                irradiance: acc.div(den),
+                roughRadiance: roughAcc.div(den),
+            });
+        })();
+    }
+
+    sampleIrradianceAndRough(P, Nvis, Ndir, Rdir, roughWeight, dualDetail = false) {
+        const useFine = Math.round(this.cascadeCountNode.value) >= 2
+            && !!this._atlas[1] && !!this._roughSpecularAtlas[1]
+            && !!this._depthAtlas[1] && !!this._stateAtlas[1];
+        if (!useFine) return this._sampleCombinedCascadeLooped(P, Nvis, Ndir, Rdir, roughWeight, 0, dualDetail);
+
+        return Fn(() => {
+            const f = P.sub(this.gridMinNode[1]).div(this.gridSizeNode[1].max(vec3(1e-6)));
+            const fLo = tslMin(tslMin(f.x, f.y), f.z);
+            const fHi = tslMin(tslMin(float(1.0).sub(f.x), float(1.0).sub(f.y)), float(1.0).sub(f.z));
+            const edge = tslMin(fLo, fHi);
+            const wIn = clamp(edge.div(this.borderBandNode.max(float(1e-4))), float(0.0), float(1.0));
+            const gate = this.cascadeCountNode.sub(1.0).clamp(float(0.0), float(1.0));
+            const wFine = wIn.mul(gate).toVar();
+            const E = vec3(0.0).toVar();
+            const S = vec4(0.0).toVar();
+            If(wFine.lessThan(float(1.0)), () => {
+                const coarse = this._sampleCombinedCascadeLooped(P, Nvis, Ndir, Rdir, roughWeight, 0);
+                E.assign(coarse.get('irradiance'));
+                S.assign(coarse.get('roughRadiance'));
+            });
+            If(wFine.greaterThan(float(0.0)), () => {
+                const fine = this._sampleCombinedCascadeLooped(P, Nvis, Ndir, Rdir, roughWeight, 1);
+                E.assign(mix(E, fine.get('irradiance'), wFine));
+                S.assign(mix(S, fine.get('roughRadiance'), wFine));
+            });
+            return ProbeLightingSample({ irradiance: E, roughRadiance: S });
         })();
     }
 
@@ -518,8 +630,43 @@ export class GiProbeNode extends LightingNode {
         // strength is linear in the visible contrast.
         const detailNormal = stableTBN ? viewDerivedNormal : stableNormal;
         const P = positionWorld.mul(this.samplePositionScaleNode).add(stableNormal.mul(this.normalBiasNode[0]).mul(this.sampleBiasScaleNode));
-        const E = this.sampleIrradiance(P, stableNormal, detailNormal, stableTBN).max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
-        builder.context.irradiance.addAssign(E);
+
+        // Optional Lumen-style rough reflections. The probe is appended AFTER Three's
+        // EnvironmentNode (see GiLightsNode), so context.radiance already contains the
+        // material/scene PMREM. The rough atlas stores only LOCAL hits: RGB is premultiplied
+        // by hit coverage and A is coverage. Composite it over PMREM rather than adding it,
+        // which preserves the authored environment on probe-ray misses and avoids double
+        // counting the SH sky used by the diffuse solve.
+        //
+        // Only Physical/Standard materials expose a finite roughness scalar. Phong/Lambert
+        // keep their exact old path, and the runtime branch skips all atlas taps below the
+        // broad-lobe range or at reflection intensity 0.
+        if (this.roughReflectionsReady && Number.isFinite(material?.roughness) && builder.context.radiance) {
+            const roughWeight = smoothstep(
+                float(ROUGH_REFLECTION_FADE_START),
+                float(ROUGH_REFLECTION_FADE_END),
+                roughness,
+            ).mul(this.reflectionIntensityNode).mul(this.enabledNode).clamp(0.0, 1.0).toVar();
+            // Orthographic-safe view direction, transformed to the same stable world
+            // space as detailNormal. Match Three's EnvironmentNode roughness bend so
+            // very rough lobes cannot gather radiance from behind the tangent plane.
+            const V = positionViewDirection.transformDirection(cameraWorldMatrix);
+            const mirror = V.negate().reflect(detailNormal);
+            const rough4 = pow(roughness, float(4.0));
+            const R = normalize(mix(mirror, detailNormal, rough4));
+            const sample = this.sampleIrradianceAndRough(P, stableNormal, detailNormal, R, roughWeight, stableTBN);
+            const E = sample.get('irradiance').max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
+            builder.context.irradiance.addAssign(E);
+            If(roughWeight.greaterThan(float(0.0)), () => {
+                const local = sample.get('roughRadiance').max(vec4(0.0)).toVar();
+                const covered = local.w.clamp(0.0, 1.0).mul(roughWeight);
+                builder.context.radiance.mulAssign(float(1.0).sub(covered));
+                builder.context.radiance.addAssign(local.rgb.mul(roughWeight));
+            });
+        } else {
+            const E = this.sampleIrradiance(P, stableNormal, detailNormal, stableTBN).max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
+            builder.context.irradiance.addAssign(E);
+        }
     }
 }
 
@@ -535,9 +682,22 @@ function computeGridResolution(size, targetLongAxis = TARGET_PROBES_LONG_AXIS) {
     return new THREE.Vector3(axis(size.x), axis(size.y), axis(size.z));
 }
 
-export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis = 0.95, onRebuilt = null, divisions = TARGET_PROBES_LONG_AXIS } = {}) {
+export function createProbeField({
+    renderer,
+    scene,
+    intensity = 1.0,
+    hysteresis = 0.95,
+    onRebuilt = null,
+    divisions = TARGET_PROBES_LONG_AXIS,
+    roughReflections = false,
+    reflectionIntensity = 1.0,
+} = {}) {
     const node = getGiProbeNode();
     node.setIntensity(intensity);
+    node.setReflectionIntensity(reflectionIntensity);
+    // Structural, creation-time v1 option: false keeps the historical allocation,
+    // compute graph, material graph, and image byte-for-byte unchanged.
+    const roughReflectionsEnabled = roughReflections === true;
     // Live grid density: probes along the longest axis. setDivisions() updates it and
     // requests a (resize) rebuild; per-axis counts derive from it so cells stay ~cubic.
     let targetLongAxis = THREE.MathUtils.clamp(Math.round(divisions) || TARGET_PROBES_LONG_AXIS, 2, MAX_PROBES_PER_AXIS);
@@ -778,17 +938,19 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             disposeComputeNodes(g, PROBE_COMPUTE_KEYS);
             disposeStorageAttributes(renderer, g.buffers, PROBE_BVH_BUFFER_KEYS);
             disposeStorageAttribute(renderer, g.irrBuffer);
+            disposeStorageAttribute(renderer, g.roughSpecularBuffer);
             disposeStorageAttribute(renderer, g.depthBuffer);
             disposeStorageAttribute(renderer, g.stateBuffer);
             disposeStorageAttribute(renderer, g.rayBuffer);
             g.atlas?.dispose?.();
+            g.roughSpecularAtlas?.dispose?.();
             g.depthAtlas?.dispose?.();
             g.stateAtlas?.dispose?.();
             if (g.maps) for (const t of Object.values(g.maps)) t?.dispose?.();
         }
         C.gpu = null;
         C.prevAtlasW = C.prevAtlasH = C.prevProbeTotal = 0; // next rebuild takes the full (resize) path
-        node.setAtlases(c, null, null, null);
+        node.setAtlases(c, null, null, null, null);
     }
 
     function disposeGPU() {
@@ -883,6 +1045,15 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         const irr = storage(irrBuffer, 'float', irrBuffer.count);
         const irrRead = storage(irrBuffer, 'float', irrBuffer.count).toReadOnly();
 
+        // Optional broad local-radiance history: RGB is premultiplied by directional
+        // local-hit coverage, A is coverage. It is derived from the SAME ray scratch in
+        // the existing blend dispatch — no extra trace, BVH, NEE, or dispatch.
+        const roughSpecularBuffer = roughReflectionsEnabled
+            ? (reuse?.roughSpecularBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * TILE * TILE * 4)), 1))
+            : null;
+        const roughSpecular = roughSpecularBuffer ? storage(roughSpecularBuffer, 'float', roughSpecularBuffer.count) : null;
+        const roughSpecularRead = roughSpecularBuffer ? storage(roughSpecularBuffer, 'float', roughSpecularBuffer.count).toReadOnly() : null;
+
         // write-only sampled atlas (HW bilinear) — uploaded from irrBuffer. Reused
         // verbatim on a same-dim rebuild so the material's binding stays stable
         // (churn-free) and the live irradiance history survives the geometry edit.
@@ -894,6 +1065,17 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
             return t;
         })();
+
+        // Same tile packing as irradiance so receiver placement/cascade math stays
+        // identical. No mips: the power-4 gather is already the roughness filter.
+        const roughSpecularAtlas = roughReflectionsEnabled ? (reuse?.roughSpecularAtlas || (() => {
+            const t = new THREE.StorageTexture(atlasW, atlasH);
+            t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
+            t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
+            t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
+            t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
+            return t;
+        })()) : null;
 
         // depth-moment STATE (read_write): 2 floats per probe texel (meanR, meanR²),
         // + a sampled depth atlas for the Chebyshev visibility test (leak-free).
@@ -950,8 +1132,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const w = wx.mul(wy).mul(wz).add(1e-4);
                 const col = px;
                 const row = pz.mul(float(U.resY)).add(py);
-                const ox = col.mul(float(TILE)).add(float(BORDER)).add(octUV.x.mul(float(OCT_RES))).add(0.5);
-                const oy = row.mul(float(TILE)).add(float(BORDER)).add(octUV.y.mul(float(OCT_RES))).add(0.5);
+                // Same centre convention as GiProbeNode._tileUV above. Do not add
+                // another 0.5 here: octUV already addresses texel-centred samples.
+                const ox = col.mul(float(TILE)).add(float(BORDER)).add(octUV.x.mul(float(OCT_RES)));
+                const oy = row.mul(float(TILE)).add(float(BORDER)).add(octUV.y.mul(float(OCT_RES)));
                 const uv = vec2(ox.div(U.atlasDim.x), oy.div(U.atlasDim.y));
                 acc.addAssign(texture(atlas, uv).level(0).xyz.mul(w));
                 wsum.addAssign(w);
@@ -1041,6 +1225,14 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 const metal = matFloat(matId, 4);
                 const transm = matFloat(matId, 5);
                 const kd = clamp(baseColor.mul(U.debugAlbedoScale).mul(float(1.0).sub(metal)).mul(float(1.0).sub(transm)), vec3(0.0), vec3(0.95)).toVar();
+                if (roughReflectionsEnabled) {
+                    const diffuseEnergy = float(1.0).sub(metal).mul(float(1.0).sub(transm));
+                    const emissivePeak = tslMax(tslMax(emissive.x, emissive.y), emissive.z);
+                    const roughShadeable = diffuseEnergy.greaterThan(float(0.02)).or(emissivePeak.greaterThan(float(1e-6)));
+                    If(roughShadeable.not(), () => {
+                        hitT.assign(bestT.add(float(ROUGH_UNSHADED_T_BIAS)).negate());
+                    });
+                }
 
                 // NEE over ALL lights (count small; loop avoids sampling noise).
                 Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
@@ -1150,24 +1342,40 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const dwsum = float(0.0).toVar();
             const lAcc = float(0.0).toVar();
             const lAcc2 = float(0.0).toVar();
+            const sAcc = roughReflectionsEnabled ? vec3(0.0).toVar() : null;
+            const sHit = roughReflectionsEnabled ? float(0.0).toVar() : null;
+            const sWsum = roughReflectionsEnabled ? float(0.0).toVar() : null;
             const LUMA = vec3(0.2126, 0.7152, 0.0722);
             Loop({ start: uint(0), end: uint(raysPerProbe), type: 'uint', condition: '<' }, ({ i: k }) => {
                 const rb = slot.mul(uint(raysPerProbe)).add(k).mul(uint(4));
                 const rrgb = vec3(rayData.element(rb), rayData.element(rb.add(uint(1))), rayData.element(rb.add(uint(2))));
                 const hitT = rayData.element(rb.add(uint(3)));
                 const rdir = normalize(rayDir(k, U.frameJitter));
-                const cw = pow(tslMax(dot(dir, rdir), float(0.0)), U.debugCosinePower.max(float(1e-4)));
+                const cd = tslMax(dot(dir, rdir), float(0.0));
+                const cw = pow(cd, U.debugCosinePower.max(float(1e-4)));
                 acc.addAssign(rrgb.mul(cw));
                 wsum.addAssign(cw);
                 const rl = dot(rrgb, LUMA);
                 lAcc.addAssign(rl.mul(cw));
                 lAcc2.addAssign(rl.mul(rl).mul(cw));
                 // depth moments: miss → "far" so the probe stays visible that way.
-                const rdist = select(hitT.lessThan(float(0.0)), U.maxDist, hitT);
+                const roughUnshaded = hitT.lessThan(float(-1.5));
+                const decodedHitT = select(roughUnshaded, hitT.negate().sub(float(ROUGH_UNSHADED_T_BIAS)), hitT);
+                const rdist = select(hitT.equal(float(-1.0)), U.maxDist, decodedHitT);
                 const dw = pow(cw, U.depthSharpness);
                 dAcc.addAssign(rdist.mul(dw));
                 dAcc2.addAssign(rdist.mul(rdist).mul(dw));
                 dwsum.addAssign(dw);
+                if (roughReflectionsEnabled) {
+                    // Fixed power-4 lobe as (d²)²: materially cheaper than another
+                    // dynamic pow and intentionally independent of the diffuse debug knob.
+                    const cd2 = cd.mul(cd);
+                    const sw = cd2.mul(cd2);
+                    const hit = select(hitT.greaterThanEqual(float(0.0)), float(1.0), float(0.0));
+                    sAcc.addAssign(rrgb.mul(sw).mul(hit));
+                    sHit.addAssign(sw.mul(hit));
+                    sWsum.addAssign(sw);
+                }
             });
             const meanRad = acc.div(wsum.max(float(1e-4)));
             const curL = lAcc.div(wsum.max(float(1e-4)));
@@ -1214,6 +1422,27 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const m2 = mix(curM2, prevM2, h);
             irr.element(ib.add(uint(3))).assign(m2);
 
+            if (roughReflectionsEnabled) {
+                // Same temporal cadence/hysteresis as diffuse: the signal comes from the
+                // same ray set, so a second variance/history policy would only add knobs.
+                const sb = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(4)).toVar();
+                const sPrev = vec4(
+                    roughSpecular.element(sb), roughSpecular.element(sb.add(uint(1))),
+                    roughSpecular.element(sb.add(uint(2))), roughSpecular.element(sb.add(uint(3))),
+                );
+                const sDen = sWsum.max(float(1e-4));
+                const sCur = vec4(sAcc.div(sDen), sHit.div(sDen).clamp(0.0, 1.0));
+                const sWasEmpty = dot(sPrev, vec4(1.0)).lessThan(float(1e-6));
+                // Rough history owns its initialization gate. Reusing diffuse `h`
+                // would reset valid specular history anywhere diffuse RGB is black.
+                const sh = select(sWasEmpty, float(0.0), hEff);
+                const sBlended = mix(sCur, sPrev, sh);
+                roughSpecular.element(sb).assign(sBlended.x);
+                roughSpecular.element(sb.add(uint(1))).assign(sBlended.y);
+                roughSpecular.element(sb.add(uint(2))).assign(sBlended.z);
+                roughSpecular.element(sb.add(uint(3))).assign(sBlended.w);
+            }
+
             // depth moments: same hysteresis; fill instantly when unseeded.
             const db = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(2)).toVar();
             const dprev = vec2(depthS.element(db), depthS.element(db.add(uint(1))));
@@ -1239,6 +1468,9 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const tx = col.mul(uint(TILE)).add(lx);
             const ty = row.mul(uint(TILE)).add(ly);
             textureStore(atlas, uvec2(tx, ty), vec4(0.0, 0.0, 0.0, 1.0)).toWriteOnly();
+            if (roughReflectionsEnabled) {
+                textureStore(roughSpecularAtlas, uvec2(tx, ty), vec4(0.0)).toWriteOnly();
+            }
             textureStore(depthAtlas, uvec2(tx, ty), vec4(0.0, 0.0, 0.0, 1.0)).toWriteOnly();
         })().compute(probeTotal * TILE * TILE);
 
@@ -1257,19 +1489,45 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             const row = probeIndex.div(U.resX.mul(U.resY)).mul(U.resY).add(probeIndex.div(U.resX).mod(U.resY));
             const tx = col.mul(uint(TILE)).add(lx);
             const ty = row.mul(uint(TILE)).add(ly);
+            // Canonical octahedral gutter: mirror final INTERIOR edge/corner texels
+            // into the 1px border. Evaluating out-of-range oct coordinates produces a
+            // close direction, but not the exact opposite-edge sample; worse, that raw
+            // border disagrees with the filtered interior and exposes the lower-
+            // hemisphere fold as a world-axis cross.
+            const edge = uint(TILE - 1);
+            const lo = uint(BORDER);
+            const hi = uint(BORDER + OCT_RES - 1);
+            const onLeft = lx.equal(uint(0));
+            const onRight = lx.equal(edge);
+            const onTop = ly.equal(uint(0));
+            const onBottom = ly.equal(edge);
+            const onColumnBorder = onLeft.or(onRight);
+            const onRowBorder = onTop.or(onBottom);
+            const onCorner = onColumnBorder.and(onRowBorder);
+            const sx = select(
+                onCorner,
+                select(onLeft, hi, lo),
+                select(onRowBorder, edge.sub(lx), select(onColumnBorder, select(onLeft, lo, hi), lx)),
+            ).toVar();
+            const sy = select(
+                onCorner,
+                select(onTop, hi, lo),
+                select(onRowBorder, select(onTop, lo, hi), select(onColumnBorder, edge.sub(ly), ly)),
+            ).toVar();
             // ── intra-tile variance/edge-stopped spatial filter (CORE splotch killer).
             // Reads the read-only irrBuffer and writes the write-only atlas, so the
             // denoised result never feeds back into history (no over-blur, no RAW
-            // hazard). Interior texels only; the 1px octahedral gutter is copied raw.
-            // Taps stay inside THIS probe's tile → cannot mix radiance across a wall.
+            // hazard). Border threads filter the mirrored interior source, making the
+            // gutter identical to its final edge texel. Taps stay inside THIS probe's
+            // tile → cannot mix radiance across a wall.
             const LUMA = vec3(0.2126, 0.7152, 0.0722);
             const probeBase = probeIndex.mul(uint(TILE * TILE)).toVar();
-            const probeTexel = probeBase.add(local).toVar();
+            const probeTexel = probeBase.add(sy.mul(uint(TILE))).add(sx).toVar();
             const ib = probeTexel.mul(uint(4));
             const eC = vec3(irrRead.element(ib), irrRead.element(ib.add(uint(1))), irrRead.element(ib.add(uint(2)))).toVar();
             const lumaC = dot(eC, LUMA);
             const varC = tslMax(irrRead.element(ib.add(uint(3))).sub(lumaC.mul(lumaC)), float(0.0));
-            const lxI = int(lx); const lyI = int(ly);
+            const sxI = int(sx); const syI = int(sy);
             const facc = vec3(0.0).toVar();
             const fwsum = float(0.0).toVar();
             // UI "Smoothness" (U.filterSmooth) widens the variance-adaptive edge stop so more
@@ -1281,8 +1539,8 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             for (let jy = -1; jy <= 1; jy++) {
                 for (let jx = -1; jx <= 1; jx++) {
                     const gw = Math.exp(-(jx * jx + jy * jy) * 0.5); // separable 3×3 gaussian (JS const)
-                    const nx = lxI.add(int(jx)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
-                    const ny = lyI.add(int(jy)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
+                    const nx = sxI.add(int(jx)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
+                    const ny = syI.add(int(jy)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
                     const nIb = probeBase.add(ny.mul(uint(TILE))).add(nx).mul(uint(4));
                     const en = vec3(irrRead.element(nIb), irrRead.element(nIb.add(uint(1))), irrRead.element(nIb.add(uint(2))));
                     const dLum = dot(en, LUMA).sub(lumaC);
@@ -1295,10 +1553,18 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
                 }
             }
             const filtered = facc.div(fwsum.max(float(1e-4)));
-            const isInterior = lx.greaterThanEqual(uint(BORDER)).and(lx.lessThanEqual(uint(BORDER + OCT_RES - 1)))
-                .and(ly.greaterThanEqual(uint(BORDER))).and(ly.lessThanEqual(uint(BORDER + OCT_RES - 1)));
-            const outE = select(isInterior, mix(eC, filtered, U.filterStrength), eC);
+            const outE = mix(eC, filtered, U.filterStrength);
             textureStore(atlas, uvec2(tx, ty), vec4(outE, float(1.0))).toWriteOnly();
+            if (roughReflectionsEnabled) {
+                // The power-4 solve + temporal history + HW bilinear are already a broad
+                // filter. Copy directly so local silhouettes do not get blurred twice.
+                const sb = probeTexel.mul(uint(4));
+                const s = vec4(
+                    roughSpecularRead.element(sb), roughSpecularRead.element(sb.add(uint(1))),
+                    roughSpecularRead.element(sb.add(uint(2))), roughSpecularRead.element(sb.add(uint(3))),
+                );
+                textureStore(roughSpecularAtlas, uvec2(tx, ty), s).toWriteOnly();
+            }
             const db = probeTexel.mul(uint(2));
             const dd = vec2(depthRead.element(db), depthRead.element(db.add(uint(1))));
             textureStore(depthAtlas, uvec2(tx, ty), vec4(dd.x, dd.y, float(0.0), float(1.0))).toWriteOnly();
@@ -1371,7 +1637,12 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
             )).toWriteOnly();
         })().compute(probeTotal);
 
-        return { buffers, traceKernel, blendKernel, uploadKernel, clearAtlasKernel, classifyKernel, uploadStateKernel, atlas, depthAtlas, stateAtlas, irrBuffer, depthBuffer, stateBuffer, rayBuffer, maps: built.maps, lightCount: built.lightCount };
+        return {
+            buffers, traceKernel, blendKernel, uploadKernel, clearAtlasKernel, classifyKernel, uploadStateKernel,
+            atlas, roughSpecularAtlas, depthAtlas, stateAtlas,
+            irrBuffer, roughSpecularBuffer, depthBuffer, stateBuffer, rayBuffer,
+            maps: built.maps, lightCount: built.lightCount,
+        };
     }
 
     function totalUnionProbes() {
@@ -1526,8 +1797,10 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         if (sameDim) {
             const prev = C.gpu;
             const reuse = {
-                atlas: prev.atlas, depthAtlas: prev.depthAtlas, stateAtlas: prev.stateAtlas,
-                irrBuffer: prev.irrBuffer, depthBuffer: prev.depthBuffer, stateBuffer: prev.stateBuffer,
+                atlas: prev.atlas, roughSpecularAtlas: prev.roughSpecularAtlas,
+                depthAtlas: prev.depthAtlas, stateAtlas: prev.stateAtlas,
+                irrBuffer: prev.irrBuffer, roughSpecularBuffer: prev.roughSpecularBuffer,
+                depthBuffer: prev.depthBuffer, stateBuffer: prev.stateBuffer,
             };
             C.gpu = buildKernels(built, C, reuse);
             disposeBVHOnly(prev);   // free ONLY the old BVH storages + ray scratch + maps
@@ -1558,7 +1831,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         C.U.maxDist.value = gridSize.length();
         C.U.cellMin.value = Math.max(1e-4, minCell);
         C.U.relocClamp.value = 0.45 * minCell;
-        node.setAtlases(c, C.gpu.atlas, C.gpu.depthAtlas, C.gpu.stateAtlas);
+        node.setAtlases(c, C.gpu.atlas, C.gpu.depthAtlas, C.gpu.stateAtlas, C.gpu.roughSpecularAtlas);
         node.setGrid(c, gridMin, gridSize, res, atlasW, atlasH, normalBias, chebyBias);
         C.prevAtlasW = atlasW; C.prevAtlasH = atlasH; C.prevProbeTotal = probeTotal;
         C.probeCursor = 0;
@@ -2145,6 +2418,11 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         tick,
         setEnabled,
         setIntensity: (v) => node.setIntensity(v),
+        // Uniform/live. The structural atlas allocation is chosen once with
+        // createProbeField({ roughReflections }) to keep the disabled path zero-cost.
+        setReflectionIntensity: (v) => node.setReflectionIntensity(v),
+        getReflectionIntensity: () => node.reflectionIntensityNode.value,
+        hasRoughReflections: () => roughReflectionsEnabled,
         setChebyStrength: (v) => node.setChebyStrength(v),
         setNormalDetail: (v) => node.setDetailStrength(v),  // GI normal-map detail on trusted materials (0 = smooth, 1 = full)
         setClassifyStrength: (v) => {
@@ -2260,11 +2538,17 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         hasData: () => node._ready === true,
         // getStats/getResolution/getBounds/_debug* take an optional cascade index
         // (default 0 = coarse, preserving current callers).
-        getStats: (ci = 0) => { const C = casc[ci] || casc[0]; return { probes: C.probeTotal, res: C.res.clone(), atlas: [C.atlasW, C.atlasH], rays: raysPerProbe, oct: OCT_RES, tile: TILE, active: node.active, cascades, cascade: ci, budgetRays: tickBudgetRays }; },
+        getStats: (ci = 0) => { const C = casc[ci] || casc[0]; return {
+            probes: C.probeTotal, res: C.res.clone(), atlas: [C.atlasW, C.atlasH],
+            rays: raysPerProbe, oct: OCT_RES, tile: TILE, active: node.active,
+            roughReflections: roughReflectionsEnabled, roughSpecularPower: roughReflectionsEnabled ? ROUGH_SPECULAR_POWER : 0,
+            cascades, cascade: ci, budgetRays: tickBudgetRays,
+        }; },
         getResolution: (ci = 0) => (casc[ci] || casc[0]).res.clone(),
         getBounds: (ci = 0) => { const C = casc[ci] || casc[0]; return new THREE.Box3(C.gridMin.clone(), C.gridMin.clone().add(C.gridSize)); },
         _debugUpload: async (ci = 0) => { const g = casc[ci]?.gpu; if (g && !disposed) { try { await renderer.computeAsync(g.uploadKernel); } catch (e) { /* harness-only */ } } },
         _debugAtlas: (ci = 0) => casc[ci]?.gpu?.atlas || null,
+        _debugRoughSpecularAtlas: (ci = 0) => casc[ci]?.gpu?.roughSpecularAtlas || null,
         _debugDepthAtlas: (ci = 0) => casc[ci]?.gpu?.depthAtlas || null,
         _debugStateAtlas: (ci = 0) => casc[ci]?.gpu?.stateAtlas || null,
         _debugStateBuffer: (ci = 0) => casc[ci]?.gpu?.stateBuffer || null,
@@ -2306,6 +2590,7 @@ export function createProbeField({ renderer, scene, intensity = 1.0, hysteresis 
         _debugRead: async (which, ci = 0) => {
             const g = casc[ci]?.gpu;
             const buf = which === 'irr' ? g?.irrBuffer
+                : which === 'spec' ? g?.roughSpecularBuffer
                 : which === 'mat' ? g?.buffers?.materials
                 : which === 'lights' ? g?.buffers?.lights
                 : which === 'state' ? g?.stateBuffer : null;

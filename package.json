@@ -19,7 +19,7 @@
   },
   "scripts": {
     "start": "python3 -m http.server 8777 --bind 127.0.0.1",
-    "test": "node scripts/webgpu-cleanup-smoke.mjs"
+    "test": "node scripts/webgpu-cleanup-smoke.mjs && node scripts/rough-reflections-smoke.mjs && node scripts/gi-oct-seam-smoke.mjs"
   },
   "repository": {
     "type": "git",

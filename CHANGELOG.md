@@ -3,6 +3,17 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- Added opt-in rough DDGI reflections. A compact RGBA radiance/coverage atlas is
+  filtered from the existing probe rays inside the existing blend/upload passes:
+  no extra BVH traversal, ray budget, or compute dispatch. Rough PBR materials
+  share the diffuse receiver's visibility/depth gather and composite local probe
+  hits over Three's PMREM environment through the native `context.radiance` path,
+  preserving physical Fresnel/metalness handling and the distant environment on
+  misses. Unsupported pure-metal/glass probe hits fall back to PMREM rather than
+  blacking it out.
+
 ## [0.6.4] — 2026-07-13
 
 - Fixed unbounded WebGPU storage growth after settled animated-scene rebuilds.

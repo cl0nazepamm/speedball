@@ -11,7 +11,7 @@ export const GI_DEFAULTS = {
     giEnabled: true, giIntensity: 10, giDivisions: 16, giRays: 64,
     giCascades: 1, giContinuous: true, showProbes: false,
     giHysteresis: 0.6, giHysteresisNormalize: true, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 40,
-    giLeak: 0.5, giSolid: 0, giSky: 1, giNormalDetail: 1,
+    giLeak: 0.5, giSolid: 0, giSky: 1, giNormalDetail: 1, giReflectionIntensity: 1,
     giChangeThreshold: 2.5, giSnapAmount: 0.30, giFireflyClamp: 6.0,
 };
 
@@ -79,6 +79,9 @@ export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure
     if (typeof gi.setNormalDetail === 'function') {
         fQ.add(params, 'giNormalDetail', 0, 1, 0.05).name('normal detail').onChange((v) => { gi.setNormalDetail(v); onInteract(); });
     }
+    if (gi.hasRoughReflections?.() && typeof gi.setReflectionIntensity === 'function') {
+        fQ.add(params, 'giReflectionIntensity', 0, 1, 0.05).name('rough reflections').onChange((v) => { gi.setReflectionIntensity(v); onInteract(); });
+    }
     // solid-scene (classify) stays hidden + pinned to 0 — a backface test misreads thin
     // two-sided geometry (Sponza curtains), so it's opt-in for enclosed solids only.
     // Adaptive temporal blend is pinned below. Hysteresis remains the one public
@@ -104,6 +107,7 @@ export function applyGiSettings(gi, s) {
     gi.setClassifyStrength(cfg.giSolid);
     gi.setSkyIntensity?.(cfg.giSky);
     gi.setNormalDetail?.(cfg.giNormalDetail);
+    gi.setReflectionIntensity?.(cfg.giReflectionIntensity);
     gi.setChangeThreshold(cfg.giChangeThreshold);
     gi.setSnapAmount(cfg.giSnapAmount);
     gi.setFireflyClamp(cfg.giFireflyClamp);

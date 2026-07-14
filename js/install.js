@@ -96,6 +96,8 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @param {number}  [opts.intensity=10]        canonical demo tuning (Sponza)
  * @param {number}  [opts.divisions=16]        probes along the longest grid axis
  * @param {number}  [opts.hysteresis=0.9]      temporal stability (higher = steadier / slower)
+ * @param {boolean} [opts.roughReflections=false] reuse DDGI rays for broad local reflections; opt-in keeps legacy path allocation-free
+ * @param {number}  [opts.reflectionIntensity=1] local-vs-environment rough-reflection blend, 0..1
  * @param {object}  [opts.lights]              max light counts for the batched lights node
  * @param {boolean} [opts.installLightsNode=true]  set false if you install your own GI-aware lights node
  * @param {boolean} [opts.prepareMaterials=false]  run prepareMaterialsForGI(scene) on install
@@ -110,6 +112,8 @@ export function installSpeedballGI({
     intensity = 10,
     divisions = 16,
     hysteresis = 0.9,
+    roughReflections = false,
+    reflectionIntensity = 1,
     lights = { maxDirectionalLights: 4, maxPointLights: 16, maxSpotLights: 16, maxHemisphereLights: 2 },
     installLightsNode = true,
     prepareMaterials = false,
@@ -137,7 +141,16 @@ export function installSpeedballGI({
 
     // 2. Probe field, with the material-dirty pass wired as onRebuilt (footgun handled).
     const markMaterialsDirty = makeMaterialDirtier(scene);
-    const gi = createProbeField({ renderer, scene, intensity, hysteresis, divisions, onRebuilt: markMaterialsDirty });
+    const gi = createProbeField({
+        renderer,
+        scene,
+        intensity,
+        hysteresis,
+        divisions,
+        roughReflections,
+        reflectionIntensity,
+        onRebuilt: markMaterialsDirty,
+    });
     if (enabled) gi.setEnabled(true);
 
     // 3. Idle tracking off the camera transform → works with any controls (or none):
