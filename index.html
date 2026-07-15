@@ -324,6 +324,9 @@ gi = installSpeedballGI({
   hysteresis: 0.95,
   roughReflections: true,
   reflectionIntensity: params.giReflectionIntensity,
+  // This demo has a procedural SkyMesh but no PMREM environment. Let probe miss
+  // rays provide its explicit distant-specular layer; SSR can still composite later.
+  reflectionSkyFallback: true,
 });
 if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', true);
 // Push the canonical settings so the GUI and the GI uniforms agree on first paint.
@@ -436,13 +439,11 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
   const radius = Math.max(size.x, size.y, size.z) * 0.5;
   applyCamera();
 
-  // A camera-framed PBR target makes the optional dual-lobe local-reflection field
-  // immediately inspectable in the hosted Sponza view. Keep a small diffuse
-  // component so DDGI rays can shade it instead of treating it as a pure-metal
-  // PMREM-only fallback surface.
+  // A receiver-only pure metal target makes local reflection fidelity inspectable
+  // without letting the diagnostic sphere contaminate its own probe capture.
   const metalBall = new THREE.Mesh(
     new THREE.SphereGeometry(0.4, 48, 32),
-    new THREE.MeshStandardMaterial({ color: 0xc6d0d8, metalness: 0.82, roughness: 0 }),
+    new THREE.MeshStandardMaterial({ color: 0xc6d0d8, metalness: 1, roughness: 0 }),
   );
   metalBall.name = 'Rough Reflection Metal Ball';
   const ballDirection = controls.target.clone().sub(camera.position).normalize();
@@ -451,6 +452,7 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
     .add(new THREE.Vector3(0, -0.3, 0));
   metalBall.castShadow = true;
   metalBall.receiveShadow = true;
+  excludeFromGI(metalBall);
   scene.add(metalBall);
 
   camera.near = radius * 0.01; camera.far = radius * 30; camera.updateProjectionMatrix();

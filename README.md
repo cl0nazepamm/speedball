@@ -37,6 +37,7 @@ import { installSpeedballGI } from 'speedball-gi';
 const gi = installSpeedballGI({
   renderer, scene, camera,
   roughReflections: true, // optional glossy + rough local reflections; reuses DDGI rays
+  // reflectionSkyFallback: true, // only when setSky() should replace a missing environment map
 });
 
 // In your render loop, once per frame:
@@ -61,19 +62,37 @@ has already run, three has cached a non-GI lights node and GI will fail.
 
 Pass **`roughReflections: true`** at creation time to build rough and glossy
 local-radiance lobes from the rays Speedball already traces. It adds no reflection
-rays, BVH work, or compute dispatches. The physical receiver shares the diffuse
-gather's probe visibility work, uses the existing directional depth moments for
-parallax correction, and samples the lobe(s) needed by the material roughness.
-Standard/Physical materials use the field for local objects while Three's existing
-PMREM remains visible wherever the probe lobe misses, so
-`scene.environment` / `material.envMap` keeps supplying the distant environment.
+rays or BVH traversal. Diffuse, depth, and the stable power-8 rough lobe keep the
+compact 6x6 octahedral cache; smooth materials use a separate 16x16, power-64
+glossy cache with support-aware temporal history. That high-resolution resolve is
+one additional dispatch per steady probe solve while the opt-in feature is enabled;
+new atlas allocations also receive a one-time clear.
 
-The feature is opt-in so existing integrations keep their exact GPU-allocation,
-shader, performance, and image path. Its live blend is
-`gi.setReflectionIntensity(0..1)`. A power-16 glossy lobe preserves local silhouettes
-on smooth materials and blends toward the stable power-8 rough lobe as roughness rises.
-`setSky()` continues to drive diffuse probe misses—use a normal Three environment map
-when the distant sky/HDRI should also appear in reflections.
+The physical receiver reuses the diffuse gather's probe visibility, applies
+depth-moment parallax correction to each reflection lookup, and samples only the
+lobe(s) required by material roughness. The result stays in Three's native
+`context.radiance` path, so Standard/Physical BRDF, metallic F0, Fresnel, and DFG
+remain Three's responsibility.
+
+Reflection layers stay explicit and composable:
+
+1. `scene.environment` / `material.envMap` supplies distant radiance through
+   Three's EnvironmentNode.
+2. Speedball composites local DDGI coverage over that radiance.
+3. An SSR pass can overlay its screen-space hits afterward using its own confidence.
+
+By default, true probe-ray misses leave the prior radiance unchanged, so PMREM stays
+visible there and a later SSR pass can independently overlay its own hits. For a
+scene that calls `setSky()` but deliberately has no environment map, pass
+**`reflectionSkyFallback: true`** (or call
+`gi.setReflectionSkyFallback(true)`) to fill those misses from the same SH-9 sky.
+Keep it off when PMREM or another reflection layer owns the distant environment.
+Changing this ownership at runtime reconverges through the normal temporal history;
+set it at creation when the layer boundary must be established before first solve.
+
+The whole feature is opt-in, so existing integrations keep their allocation,
+shader, and image path. Its live contribution is
+`gi.setReflectionIntensity(0..1)`.
 
 ## Limitations
 
