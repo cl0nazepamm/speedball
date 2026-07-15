@@ -436,7 +436,7 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
   const radius = Math.max(size.x, size.y, size.z) * 0.5;
   applyCamera();
 
-  // A camera-framed PBR target makes the optional broad local-reflection field
+  // A camera-framed PBR target makes the optional dual-lobe local-reflection field
   // immediately inspectable in the hosted Sponza view. Keep a small diffuse
   // component so DDGI rays can shade it instead of treating it as a pure-metal
   // PMREM-only fallback surface.

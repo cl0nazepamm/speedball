@@ -36,7 +36,7 @@ import { installSpeedballGI } from 'speedball-gi';
 // At SETUP before the first render / renderer.setAnimationLoop():
 const gi = installSpeedballGI({
   renderer, scene, camera,
-  roughReflections: true, // optional broad local reflections; reuses the DDGI rays
+  roughReflections: true, // optional glossy + rough local reflections; reuses DDGI rays
 });
 
 // In your render loop, once per frame:
@@ -57,22 +57,23 @@ has already run, three has cached a non-GI lights node and GI will fail.
   all-metal import reads as black GI. Opt-in; mutates materials in place. You can
   also pass `prepareMaterials: true` to `installSpeedballGI`.
 
-## Rough DDGI reflections
+## Local DDGI reflections
 
-Pass **`roughReflections: true`** at creation time to build a broad local-radiance
-atlas from the rays Speedball already traces. It adds no reflection rays, BVH work,
-or compute dispatches. The physical receiver shares the diffuse gather's probe
-visibility/depth work, adding only one RGBA atlas fetch per probe on rough pixels.
-Rough Standard/Physical materials use the field for local objects while Three's
-existing PMREM remains visible wherever the probe lobe misses, so
+Pass **`roughReflections: true`** at creation time to build rough and glossy
+local-radiance lobes from the rays Speedball already traces. It adds no reflection
+rays, BVH work, or compute dispatches. The physical receiver shares the diffuse
+gather's probe visibility work, uses the existing directional depth moments for
+parallax correction, and samples the lobe(s) needed by the material roughness.
+Standard/Physical materials use the field for local objects while Three's existing
+PMREM remains visible wherever the probe lobe misses, so
 `scene.environment` / `material.envMap` keeps supplying the distant environment.
 
 The feature is opt-in so existing integrations keep their exact GPU-allocation,
 shader, performance, and image path. Its live blend is
-`gi.setReflectionIntensity(0..1)`;
-smooth surfaces remain on PMREM/SSR/path tracing because the probe lobe is deliberately
-broad. `setSky()` continues to drive diffuse probe misses—use a normal Three environment
-map when the distant sky/HDRI should also appear in reflections.
+`gi.setReflectionIntensity(0..1)`. A power-16 glossy lobe preserves local silhouettes
+on smooth materials and blends toward the stable power-8 rough lobe as roughness rises.
+`setSky()` continues to drive diffuse probe misses—use a normal Three environment map
+when the distant sky/HDRI should also appear in reflections.
 
 ## Limitations
 
@@ -82,10 +83,12 @@ map when the distant sky/HDRI should also appear in reflections.
   representation. Standard PBR-ish materials are the target; exotic node graphs,
   alpha/transmission edge cases, and tiny normal-map detail won't all bounce
   exactly like final shading. 
-- **Rough reflections are deliberately low-frequency** — they target broad local
-  reflection and environment occlusion, not mirror surfaces or transmission. Pure
-  metal/glass hits cannot be shaded by the Lambert DDGI ray, so they leave PMREM
-  visible instead of becoming black local occluders; use SSR/PT for those objects.
+- **Probe reflections are approximate** — the glossy lobe is parallax-corrected and
+  stable off-screen, but its angular/probe resolution is not a pixel-accurate mirror
+  or transmission path. Non-emissive pure metal/glass *hits inside the traced
+  scene* cannot be shaded by the Lambert DDGI ray, so they leave PMREM visible
+  instead of becoming black local occluders; use SSR/PT when exact mirror detail
+  is required.
 - **Best for small to medium scale scenes** — very large worlds or many separated islands
   can waste probes unless bounds and cascades are curated.
 - **Cascades:** — Don't even bother with cascades if you are not using Chromium. Additionally cascaded grid will require higher ray count to look as smooth as single grid probes.

@@ -80,7 +80,7 @@ export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure
         fQ.add(params, 'giNormalDetail', 0, 1, 0.05).name('normal detail').onChange((v) => { gi.setNormalDetail(v); onInteract(); });
     }
     if (gi.hasRoughReflections?.() && typeof gi.setReflectionIntensity === 'function') {
-        fQ.add(params, 'giReflectionIntensity', 0, 1, 0.05).name('rough reflections').onChange((v) => { gi.setReflectionIntensity(v); onInteract(); });
+        fQ.add(params, 'giReflectionIntensity', 0, 1, 0.05).name('local reflections').onChange((v) => { gi.setReflectionIntensity(v); onInteract(); });
     }
     // solid-scene (classify) stays hidden + pinned to 0 — a backface test misreads thin
     // two-sided geometry (Sponza curtains), so it's opt-in for enclosed solids only.

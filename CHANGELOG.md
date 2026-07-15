@@ -5,14 +5,15 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
-- Added opt-in rough DDGI reflections. A compact RGBA radiance/coverage atlas is
-  filtered from the existing probe rays inside the existing blend/upload passes:
-  no extra BVH traversal, ray budget, or compute dispatch. Rough PBR materials
-  share the diffuse receiver's visibility/depth gather and composite local probe
-  hits over Three's PMREM environment through the native `context.radiance` path,
-  preserving physical Fresnel/metalness handling and the distant environment on
-  misses. Unsupported pure-metal/glass probe hits fall back to PMREM rather than
-  blacking it out.
+- Added opt-in local DDGI reflections. Power-16 glossy and power-8 rough
+  radiance/coverage lobes are filtered from the existing probe rays inside the
+  existing blend/upload passes: no extra BVH traversal, ray budget, or compute
+  dispatch. Standard/Physical receivers reuse the diffuse visibility gather,
+  depth-moment parallax-correct each probe lookup, blend the lobes by material
+  roughness, sharpen only the reflection probe-blend weights, and composite local
+  hits over Three's PMREM through the native
+  `context.radiance` path. Distant environment misses and unsupported pure-metal/
+  glass probe hits still fall back to PMREM rather than blacking it out.
 
 ## [0.6.4] — 2026-07-13
 

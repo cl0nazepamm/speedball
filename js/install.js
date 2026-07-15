@@ -96,8 +96,8 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @param {number}  [opts.intensity=10]        canonical demo tuning (Sponza)
  * @param {number}  [opts.divisions=16]        probes along the longest grid axis
  * @param {number}  [opts.hysteresis=0.9]      temporal stability (higher = steadier / slower)
- * @param {boolean} [opts.roughReflections=false] reuse DDGI rays for broad local reflections; opt-in keeps legacy path allocation-free
- * @param {number}  [opts.reflectionIntensity=1] local-vs-environment rough-reflection blend, 0..1
+ * @param {boolean} [opts.roughReflections=false] reuse DDGI rays for glossy + rough local reflections; opt-in keeps legacy path allocation-free
+ * @param {number}  [opts.reflectionIntensity=1] local-vs-environment reflection coverage blend, 0..1
  * @param {object}  [opts.lights]              max light counts for the batched lights node
  * @param {boolean} [opts.installLightsNode=true]  set false if you install your own GI-aware lights node
  * @param {boolean} [opts.prepareMaterials=false]  run prepareMaterialsForGI(scene) on install
