@@ -5,6 +5,17 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Fixed hysteresis normalization across render rates. Adaptive diffuse and depth
+  policies are formed in the 60 Hz reference domain before their final retention
+  is time-normalized. Rough and glossy reflections now share a dedicated steady /
+  noisy reference retention that remains a true elapsed-time semigroup instead of
+  inheriting diffuse's nonlinear change detector. Glossy numerator/support use the
+  same coefficient, and zero-coverage rough texels no longer re-arm as uninitialized
+  and bypass history on the next sparse hit. Each cascade uses its own accepted
+  solve cadence and fractional probe revisit rate, removing the near-full-batch
+  discontinuity that made high-throughput machines flicker more. The reactive fade
+  is elapsed-time based, and normalization no longer clamps either high-refresh or
+  sparse-revisit exponents.
 - Added opt-in local DDGI reflections without adding reflection rays or BVH
   traversal. The power-8 rough lobe stays in the existing 6x6 probe blend, while
   smooth materials use a separately packed 16x16 power-64 glossy cache. Its

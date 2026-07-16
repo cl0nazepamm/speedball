@@ -153,9 +153,33 @@ const GI_TEMPORAL_VAR_REL = 0.0025;    // relative floor: lum^2 * this
 const GI_TEMPORAL_CHANGE_SIGMA0 = 0.75;
 const GI_TEMPORAL_CHANGE_SIGMA1 = 2.5;
 const GI_TEMPORAL_CLAMP_SIGMA = 6.0;
-const HYSTERESIS_DT_REF_MS = 1000 / 60; // the slider is calibrated at 60 fps, full-pass-per-tick
-const HYSTERESIS_EXP_MIN = 0.25;        // 240 Hz floor — a fast display must not over-smooth
-const HYSTERESIS_EXP_MAX = 4;           // cap on history dropped per update — the anti-boil bound
+export const HYSTERESIS_DT_REF_MS = 1000 / 60; // slider values are reference-rate retentions at 60 Hz
+
+// Average revisit cadence for one probe. Fractional pass lengths are intentional:
+// round-robin batches alternate floor/ceil revisit counts, and their long-term temporal
+// rate is probeTotal / probesPerTick. Keeping the average continuous also prevents a
+// ray-budget change from stepping the history coefficient at every ceil() boundary.
+export function probeUpdateIntervalTicks(probeTotal, probesPerTick, solveEveryTicks = 1) {
+    const total = Math.max(0, Number(probeTotal) || 0);
+    const cap = Math.max(1, Number(probesPerTick) || 1);
+    const schedule = Math.max(1, Number(solveEveryTicks) || 1);
+    return schedule * Math.max(1, total / cap);
+}
+
+export function hysteresisExponentForInterval(updateDtMs, normalize = true) {
+    if (!normalize) return 1;
+    const dt = Number.isFinite(updateDtMs) ? Math.max(0, updateDtMs) : HYSTERESIS_DT_REF_MS;
+    // No clamps: h^(dt/ref) must approach 1 as update frequency rises and must keep
+    // growing for sparse revisits. Either clamp changes history authority per second
+    // with FPS; the slider itself is the noise/convergence tradeoff.
+    return dt / HYSTERESIS_DT_REF_MS;
+}
+
+export function advanceReactiveTicks(remaining, acceptedDtMs) {
+    const ticks = Math.max(0, Number(remaining) || 0);
+    const dt = Number.isFinite(acceptedDtMs) ? Math.max(0, acceptedDtMs) : HYSTERESIS_DT_REF_MS;
+    return Math.max(0, ticks - dt / HYSTERESIS_DT_REF_MS);
+}
 
 let _node = null;
 
@@ -860,6 +884,8 @@ export function createProbeField({
             gpu: null,
             U: makeCascadeU(),
             probeCursor: 0,
+            lastSolveAt: 0,
+            solveDtEma: 0,
             refreshStarted: false,
             ticksSinceRot: 0,
             prevAtlasW: 0, prevAtlasH: 0, prevGlossyAtlasW: 0, prevGlossyAtlasH: 0, prevProbeTotal: 0,
@@ -891,6 +917,9 @@ export function createProbeField({
     let tickBudgetRays = RAYS_PER_TICK;
     let lastTickAt = 0;
     let tickDtEma = 0;
+    // Temporal cadence must survive auto-throttle's deliberate tickDtEma resets.
+    // Otherwise every budget adjustment injects a one-frame 60 Hz history jump.
+    let hysteresisTickDtEma = 0;
     let budgetCooldown = 0;   // ticks to hold after a shrink before growing again (damps sawtooth)
     let inFlight = false;
     let disposed = false;
@@ -923,7 +952,10 @@ export function createProbeField({
     const U = {
         lightCount: uniform(0, 'uint'),
         frameJitter: uniform(0.0),
+        // Raw 60 Hz reference-rate retention. Adaptive signal-specific weights are
+        // derived from this first, then normalized once with hysteresisExponent.
         hysteresis: uniform(THREE.MathUtils.clamp(hysteresis, 0, 0.99)),
+        hysteresisExponent: uniform(1.0),
         depthSharpness: uniform(50.0),  // cosine power → depth tracks nearest occluder crisply
         radianceClamp: uniform(8.0),    // cap the multibounce feedback term (anti-runaway)
         classifyStrength: uniform(0.0), // gates relocation APPLY (mirrors node.classifyStrengthNode)
@@ -1568,9 +1600,23 @@ export function createProbeField({
             const s0 = sigma.mul(U.debugTempChangeSigma0);
             const s1 = sigma.mul(U.tempChangeSigma1.max(U.debugTempChangeSigma0.add(0.01)));
             const changeW = clamp(absDelta.sub(s0).div(s1.sub(s0).max(float(1e-6))), float(0.0), float(1.0));
-            const noiseH = U.hysteresis.add(float(1.0).sub(U.hysteresis).mul(U.debugTempNoiseHBoost));
-            const changeH = tslMax(U.hysteresis.sub(U.tempChangeHDrop), U.debugTempMinChangeH);
-            const hEff = mix(noiseH, changeH, changeW);
+            // Build every signal policy in the slider's 60 Hz reference domain, then
+            // normalize the FINAL retention for this probe's real update interval.
+            // Normalizing U.hysteresis first and subtracting a fixed change drop after it
+            // made that drop happen once per frame: 120/240 Hz therefore admitted much
+            // more fresh jitter per second than 60 Hz, which presented as FPS flicker.
+            const rawNoiseH = U.hysteresis.add(float(1.0).sub(U.hysteresis).mul(U.debugTempNoiseHBoost));
+            const rawChangeH = tslMax(U.hysteresis.sub(U.tempChangeHDrop), U.debugTempMinChangeH);
+            const rawHEff = mix(rawNoiseH, rawChangeH, changeW);
+            const hEff = pow(rawHEff.clamp(1e-6, 1.0), U.hysteresisExponent);
+            // Reflection history must remain a true time semigroup. Reusing the
+            // diffuse changeW here made rough reflections frame-rate dependent:
+            // changeW is recomputed from evolving diffuse moments on every render
+            // substep, so 30 and 240 Hz followed different nonlinear trajectories.
+            // Known scene edits already lower U.hysteresis through the global
+            // reactive ramp; between edits, both reflection lobes use the steady /
+            // noisy reference policy and normalize it exactly once by elapsed time.
+            const steadyReflectionH = pow(rawNoiseH.clamp(1e-6, 1.0), U.hysteresisExponent);
             const h = select(wasBlack, float(0.0), hEff);
             const band = sigma.mul(U.tempClampSigma);
             const clampScale = tslMin(float(1.0), band.div(absDelta.max(float(1e-6))));
@@ -1587,9 +1633,18 @@ export function createProbeField({
             const m2 = mix(curM2, prevM2, h);
             irr.element(ib.add(uint(3))).assign(m2);
 
+            // Depth is written for every solved probe texel and is strictly positive
+            // after its first update (a miss stores maxDist). It is therefore the
+            // existing allocation-free initialization sentinel shared by diffuse,
+            // rough reflection, and depth history. Reflection RGBA cannot serve this
+            // purpose: zero coverage is a valid converged state when PMREM owns misses.
+            const db = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(2)).toVar();
+            const dprev = vec2(depthS.element(db), depthS.element(db.add(uint(1))));
+            const dWasZero = dprev.x.lessThan(float(1e-6));
+
             if (roughReflectionsEnabled) {
-                // Same temporal cadence/hysteresis as diffuse: the signal comes from the
-                // same ray set, so a second variance/history policy would only add knobs.
+                // Same accepted cadence as diffuse, but deliberately independent of its
+                // nonlinear per-texel change detector (see steadyReflectionH above).
                 const sb = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(4)).toVar();
                 const sPrev = vec4(
                     roughSpecular.element(sb), roughSpecular.element(sb.add(uint(1))),
@@ -1597,10 +1652,9 @@ export function createProbeField({
                 );
                 const sDen = sWsum.max(float(1e-4));
                 const sCur = vec4(sAcc.div(sDen), sHit.div(sDen).clamp(0.0, 1.0));
-                const sWasEmpty = dot(sPrev, vec4(1.0)).lessThan(float(1e-6));
-                // Rough history owns its initialization gate. Reusing diffuse `h`
-                // would reset valid specular history anywhere diffuse RGB is black.
-                const sh = select(sWasEmpty, float(0.0), hEff);
+                // Never infer initialization from sPrev energy. Transparent black is
+                // a valid reflection sample and must retain history across sparse hits.
+                const sh = select(dWasZero, float(0.0), steadyReflectionH);
                 const sBlended = mix(sCur, sPrev, sh);
                 roughSpecular.element(sb).assign(sBlended.x);
                 roughSpecular.element(sb.add(uint(1))).assign(sBlended.y);
@@ -1609,10 +1663,9 @@ export function createProbeField({
             }
 
             // depth moments: same hysteresis; fill instantly when unseeded.
-            const db = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(2)).toVar();
-            const dprev = vec2(depthS.element(db), depthS.element(db.add(uint(1))));
-            const dWasZero = dprev.x.lessThan(float(1e-6));
-            const dh = select(dWasZero, float(0.0), U.hysteresis.mul(U.debugDepthHistoryScale).clamp(0.0, 0.999));
+            const rawDepthH = U.hysteresis.mul(U.debugDepthHistoryScale).clamp(0.0, 0.999);
+            const depthH = pow(rawDepthH.max(float(1e-6)), U.hysteresisExponent);
+            const dh = select(dWasZero, float(0.0), depthH);
             const dblended = mix(vec2(meanR, meanR2), dprev, dh);
             depthS.element(db).assign(dblended.x);
             depthS.element(db.add(uint(1))).assign(dblended.y);
@@ -1697,7 +1750,16 @@ export function createProbeField({
             const curNum = vec4(gAcc, gHit).mul(invRayCount);
             const curDen = gWsum.mul(invRayCount);
             const empty = prevDen.lessThan(float(1e-6));
-            const gh = select(empty, float(0.0), U.hysteresis);
+            // Match the rough cache's steady/noisy reference retention. A dedicated
+            // glossy change detector is intentionally avoided: power-64 support is
+            // sparse, so rotating ray sets would repeatedly look like real changes.
+            // Numerator and support MUST share this exact coefficient or the resolved
+            // colour/coverage ratio pumps as cadence changes.
+            const glossyReferenceH = U.hysteresis.add(
+                float(1.0).sub(U.hysteresis).mul(U.debugTempNoiseHBoost),
+            );
+            const glossyH = pow(glossyReferenceH.clamp(1e-6, 1.0), U.hysteresisExponent);
+            const gh = select(empty, float(0.0), glossyH);
             const num = mix(curNum, prevNum, gh).toVar();
             const den = mix(curDen, prevDen, gh).max(float(1e-6)).toVar();
             glossySpecular.element(gb).assign(num.x);
@@ -1933,8 +1995,7 @@ export function createProbeField({
         // divided by the live ray count, ceilinged at MAX_PROBES_PER_TICK. GPU cost per
         // tick is ~constant regardless of rays/probe, and the ray scratch stays bounded
         // (≈ RAYS_PER_TICK × 16 B). Small/medium grids fit whole → every probe updates
-        // EVERY tick, so the field converges in ~1 s at the same hysteresis (steady-state
-        // stability depends only on h per update, not on update rate — the old
+        // EVERY tick; the cadence exponent keeps their wall-time stability unchanged. The old
         // union/4-with-128-ceiling cap made each texel wait ~10 frames per update, which
         // is why re-convergence took ~10 s and low hysteresis was the only way to speed
         // it up... at the price of flicker). Also sizes the per-cascade ray scratch —
@@ -2122,6 +2183,8 @@ export function createProbeField({
                 normalBias, chebyBias,
             );
             C.probeCursor = 0;
+            C.lastSolveAt = 0;
+            C.solveDtEma = 0;
             C.refreshStarted = false;
             C.needsClear = false;             // reuse the live atlas history (no black flash)
             C.needsClassify = true;           // refresh per-probe state for the new geometry
@@ -2150,6 +2213,8 @@ export function createProbeField({
         C.prevGlossyAtlasW = C.glossyAtlasW; C.prevGlossyAtlasH = C.glossyAtlasH;
         C.prevProbeTotal = probeTotal;
         C.probeCursor = 0;
+        C.lastSolveAt = 0;
+        C.solveDtEma = 0;
         C.refreshStarted = false;
         C.needsClear = true;      // fresh StorageTextures aren't guaranteed zeroed
         C.needsClassify = true;
@@ -2324,6 +2389,34 @@ export function createProbeField({
             return;
         }
 
+        // Measure this accepted solve tick before deriving any temporal coefficient or
+        // mutating the live ray budget. Calls dropped by inFlight never reach here, so
+        // this is the cadence the history buffers actually see (not raw display FPS).
+        // Long idle/motion gaps are discarded: resuming after a pause must not turn one
+        // Monte-Carlo sample into a multi-second catch-up jump.
+        const tNow = _nowMs();
+        if (lastTickAt > 0) {
+            const dt = tNow - lastTickAt;
+            if (dt > 0 && dt < 100) {
+                hysteresisTickDtEma = hysteresisTickDtEma > 0 ? hysteresisTickDtEma * 0.8 + dt * 0.2 : dt;
+                tickDtEma = tickDtEma > 0 ? tickDtEma * 0.8 + dt * 0.2 : dt;
+                if (budgetCooldown > 0) budgetCooldown--;
+                if (tickDtEma > 18.5 && tickBudgetRays > RAYS_PER_TICK_MIN) {
+                    tickBudgetRays = Math.max(RAYS_PER_TICK_MIN, Math.floor(tickBudgetRays * 0.7));
+                    tickDtEma = 0;        // re-measure only the budget controller at the new cap
+                    budgetCooldown = 120; // hold ~2 s before growing again — a render-bound
+                                          // scene that misses 60 fps at ANY budget otherwise
+                                          // saw-tooths between floor and max
+                } else if (budgetCooldown === 0 && tickDtEma < 17.2 && tickBudgetRays < RAYS_PER_TICK) {
+                    tickBudgetRays = Math.min(RAYS_PER_TICK, tickBudgetRays + 2048);
+                }
+            } else {
+                tickDtEma = 0;
+                hysteresisTickDtEma = 0;
+            }
+        }
+        lastTickAt = tNow;
+
         // reactivity: detect live edits (throttled). Transform change → in-place
         // instance/TLAS rewrite (near-instant, no rebuild). Light change → cheap
         // in-place buffer refresh. STRUCTURE change (topology/instance set) →
@@ -2363,54 +2456,16 @@ export function createProbeField({
         if (reactiveTicks > 0) {
             const t = 1 - (reactiveTicks / REACTIVE_TICKS); // 0 at burst start → 1 at burst end
             hTickBase = REACTIVE_HYSTERESIS + (baseHysteresis - REACTIVE_HYSTERESIS) * t;
-            reactiveTicks--;
+            // reactiveTicks are 60 Hz-equivalent time units, not rendered frames.
+            // The fade therefore remains ~1.25 s at 30/60/120/240 Hz alike.
+            reactiveTicks = advanceReactiveTicks(
+                reactiveTicks,
+                hysteresisTickDtEma > 0 ? hysteresisTickDtEma : HYSTERESIS_DT_REF_MS,
+            );
         } else {
             hTickBase = baseHysteresis;
         }
-        // Frame-rate normalize: the blend `mix(candidate, prev, h)` is applied ONCE PER PROBE
-        // UPDATE — and a probe only updates when the round-robin scan window reaches it,
-        // i.e. every ceil(unionProbes / tickCap) ticks. The REAL interval between blends of
-        // one probe is therefore tickDt × passTicks, not tickDt: a divisions-32 grid on a
-        // slow machine was smoothing 10-40× slower than the slider promised ("hysteresis
-        // just lags"). Treat h as a time constant over that per-probe interval. The exponent
-        // is CLAMPED both ways: the floor keeps 240 Hz displays from over-smoothing, the cap
-        // bounds how much history a single update may drop — exact time-constant fidelity at
-        // multi-second update intervals would need h^40 ≈ 0, i.e. raw single-pass noise.
-        // passTicks is the "no lag" fix; the cap is the "no boil" guarantee. The clamp is
-        // continuous (no on/off gate), so cadence hovering at a threshold cannot flip-flop.
-        const passTicks = Math.max(1, Math.ceil(totalUnionProbes() / tickCap()));
-        const updateDt = (tickDtEma > 0 ? tickDtEma : HYSTERESIS_DT_REF_MS) * passTicks;
-        const hExp = hysteresisNormalize
-            ? THREE.MathUtils.clamp(updateDt / HYSTERESIS_DT_REF_MS, HYSTERESIS_EXP_MIN, HYSTERESIS_EXP_MAX)
-            : 1;
-        U.hysteresis.value = Math.pow(hTickBase, hExp);
-
-        // Auto-throttle: compare CONSECUTIVE tick timestamps (gaps from idle-gating or
-        // motion are discarded, so this reads GPU pressure, not pauses). Sustained
-        // frames slower than ~54 fps shrink the ray budget ×0.7 (multiplicative —
-        // recovers headroom fast); frames at/above 60 fps creep it back up (additive;
-        // the grow threshold sits ABOVE a 60 Hz vsync dt of 16.7 ms so a throttled
-        // budget recovers on locked-60 displays instead of sticking low forever).
-        const tNow = _nowMs();
-        if (lastTickAt > 0) {
-            const dt = tNow - lastTickAt;
-            if (dt < 100) {
-                tickDtEma = tickDtEma > 0 ? tickDtEma * 0.8 + dt * 0.2 : dt;
-                if (budgetCooldown > 0) budgetCooldown--;
-                if (tickDtEma > 18.5 && tickBudgetRays > RAYS_PER_TICK_MIN) {
-                    tickBudgetRays = Math.max(RAYS_PER_TICK_MIN, Math.floor(tickBudgetRays * 0.7));
-                    tickDtEma = 0;        // re-measure at the new budget
-                    budgetCooldown = 120; // hold ~2 s before growing again — a render-bound
-                                          // scene that misses 60 fps at ANY budget otherwise
-                                          // saw-tooths between floor and max
-                } else if (budgetCooldown === 0 && tickDtEma < 17.2 && tickBudgetRays < RAYS_PER_TICK) {
-                    tickBudgetRays = Math.min(RAYS_PER_TICK, tickBudgetRays + 2048);
-                }
-            } else {
-                tickDtEma = 0;
-            }
-        }
-        lastTickAt = tNow;
+        U.hysteresis.value = hTickBase;
 
         // (#1) Cascade scheduling. When the per-tick ray budget covers the WHOLE union
         // (the common small/medium-grid case) solve BOTH cascades every tick — every
@@ -2434,6 +2489,30 @@ export function createProbeField({
                 if (!gpu) continue;
 
                 const updated = Math.min(tickCap(), C.probeTotal);
+                // Normalize per CASCADE from its accepted service cadence. In partial
+                // mode C0/C1 alternate and may have very different sizes, so the old
+                // union-wide ceil(total/cap) coefficient could make the fine grid boil
+                // while the coarse grid lagged. The fractional pass ratio is the exact
+                // long-term rate for circular modulo batches and stays continuous as the
+                // auto-throttled cap changes.
+                let nextSolveDtEma = C.solveDtEma;
+                if (C.lastSolveAt > 0) {
+                    const solveDt = tNow - C.lastSolveAt;
+                    if (solveDt > 0 && solveDt < 200) {
+                        nextSolveDtEma = nextSolveDtEma > 0 ? nextSolveDtEma * 0.8 + solveDt * 0.2 : solveDt;
+                    } else {
+                        nextSolveDtEma = 0;
+                    }
+                }
+                const fallbackServiceTicks = (!haveC1 || fullPassPerTick) ? 1 : 2;
+                const serviceDt = nextSolveDtEma > 0
+                    ? nextSolveDtEma
+                    : (hysteresisTickDtEma > 0 ? hysteresisTickDtEma : HYSTERESIS_DT_REF_MS) * fallbackServiceTicks;
+                const revisitPasses = probeUpdateIntervalTicks(C.probeTotal, updated);
+                C.U.hysteresisExponent.value = hysteresisExponentForInterval(
+                    serviceDt * revisitPasses,
+                    hysteresisNormalize,
+                );
                 C.U.probeOffset.value = C.probeCursor >>> 0;
                 C.U.updatedCount.value = updated >>> 0;
                 // (B1) Ray-set rotation shares ONE frameJitter, advanced ONLY on C0's pass
@@ -2488,6 +2567,8 @@ export function createProbeField({
                 if (gpu.glossyKernel) solve.push(renderer.computeAsync(gpu.glossyKernel));
                 solve.push(renderer.computeAsync(gpu.uploadKernel));
                 await Promise.all(solve);
+                C.lastSolveAt = tNow;
+                C.solveDtEma = nextSolveDtEma;
             }
         } catch (e) {
             console.warn('max.js SPEEDBALL GI probe tick failed:', e);
@@ -2788,6 +2869,7 @@ export function createProbeField({
         setHysteresisNormalization: (on) => {
             hysteresisNormalize = on !== false;
             U.hysteresis.value = baseHysteresis;
+            if (!hysteresisNormalize) U.hysteresisExponent.value = 1;
         },
         getHysteresisNormalization: () => hysteresisNormalize,
         setNormalBias: (v) => {
@@ -2897,10 +2979,12 @@ export function createProbeField({
             reactiveTicks,
             baseHysteresis,
             hysteresis: U.hysteresis.value,
+            hysteresisExponent: U.hysteresisExponent.value,
             frameJitter: U.frameJitter.value,
             frameCounter,
             tickBudgetRays,
             tickDtEma,
+            hysteresisTickDtEma,
             budgetCooldown,
             checkCounter,
             geoStable,
@@ -2910,6 +2994,7 @@ export function createProbeField({
             cascadeState: casc.map((C) => ({
                 probes: C.probeTotal,
                 cursor: C.probeCursor,
+                solveDtEma: C.solveDtEma,
                 needsClear: C.needsClear,
                 needsClassify: C.needsClassify,
                 refreshStarted: C.refreshStarted,

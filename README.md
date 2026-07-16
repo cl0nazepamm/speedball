@@ -9,8 +9,8 @@ Best for medium scale scenes. It is prone to leaking but it is continuous and ca
 ## Hysteresis
 Hysteresis is the main slider for radiosity fade in/out.
 
-It is normalized by default over the real interval between updates of a probe (frame rate × how many ticks the round-robin scan needs to revisit it), so the temporal blend feels similar across machines, browsers, and grid sizes. 
-With slow machines or very large grids it converges as fast as it can without dissolving into per-update noise.
+It is normalized by default over each cascade's accepted solve cadence and fractional round-robin revisit interval. Adaptive diffuse/depth history is normalized only after its final reference-rate retention is formed. Rough and glossy reflection caches use one dedicated steady/noisy retention for their complete stored state (including glossy numerator and support), so their wall-time decay remains identical across refresh rates. A valid zero-coverage rough texel stays initialized instead of accepting the next sparse hit without history.
+The same reference-rate decay is preserved when a large grid revisits each probe only every several solve ticks; the Hysteresis slider remains the explicit stability/convergence tradeoff.
 
 The live demo exposes a **normalize hysteresis** switch so you can turn the normalization off and compare against the raw per-update value.
 
@@ -101,7 +101,7 @@ shader, and image path. Its live contribution is
 - **Material support is approximate(WIP)** — the trace path uses a flattened scene
   representation. Standard PBR-ish materials are the target; exotic node graphs,
   alpha/transmission edge cases, and tiny normal-map detail won't all bounce
-  exactly like final shading. 
+  exactly like final shading.
 - **Probe reflections are approximate** — the glossy lobe is parallax-corrected and
   stable off-screen, but its angular/probe resolution is not a pixel-accurate mirror
   or transmission path. Non-emissive pure metal/glass *hits inside the traced

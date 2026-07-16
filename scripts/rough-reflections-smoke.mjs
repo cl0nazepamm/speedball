@@ -64,8 +64,11 @@ assert.equal(steadySolve.match(/renderer\.computeAsync/g)?.length, 4, 'opt-out h
 // initialization, and PMREM/environment nodes ordered before the probe composite.
 assert.match(probes, /sampleIrradianceAndRough/);
 assert.match(probes, /roughAcc\.addAssign\(broad\.mul\(reflectionProbeW\)\)/);
-assert.match(probes, /const sh = select\(sWasEmpty, float\(0\.0\), hEff\)/);
-assert.match(glossy, /const gh = select\(empty, float\(0\.0\), U\.hysteresis\)/);
+assert.match(probes, /const steadyReflectionH = pow\(rawNoiseH\.clamp\(1e-6, 1\.0\), U\.hysteresisExponent\)/);
+assert.match(probes, /const sh = select\(dWasZero, float\(0\.0\), steadyReflectionH\)/);
+assert.doesNotMatch(probes, /const sWasEmpty\b/);
+assert.match(glossy, /const glossyH = pow\(glossyReferenceH\.clamp\(1e-6, 1\.0\), U\.hysteresisExponent\)/);
+assert.match(glossy, /const gh = select\(empty, float\(0\.0\), glossyH\)/);
 assert.match(glossy, /const num = mix\(curNum, prevNum, gh\)/);
 assert.match(glossy, /const den = mix\(curDen, prevDen, gh\)/);
 assert.match(probes, /ROUGH_UNSHADED_T_BIAS/);
