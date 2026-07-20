@@ -111,11 +111,12 @@ const GI_CHEBY_BIAS_CELL = 0.08;       // Chebyshev SELF-OCCLUSION tolerance as 
 const MAX_TRIANGLES = 4_000_000;
 const MAX_LIGHTS = 64;             // matches spectral_scene LIGHT_STRIDE table
 // ── reactivity: respond to live light/geometry edits ──
-const REACTIVE_TICKS = 75;         // ticks of EASED re-convergence after a light/geo edit
-const REACTIVE_HYSTERESIS = 0.8;   // STARTING hysteresis of the reactive fade; it ramps UP to
-                                   // the steady-state value across the burst so an edit fades in
-                                   // smoothly. (Was a flat 0.4 → passed 60% of a freshly-rotated
-                                   // 64-ray estimate each tick → the "flickers left/right" boil.)
+// There is deliberately NO global reactive/low-hysteresis burst here. Edits
+// (lights, sky, transforms, trace-side knobs, rebuilds) flow through the trace
+// and re-converge via the per-texel change detector in the blend, whose retention
+// is bounded (never below debugTempMinChangeH). A global authority drop read as
+// "flicker for a second, then settle" — a visible fade-out/in on every slider
+// touch. The temporal policy is CONSTANT at all times.
 const ROT_MIN_TICKS = 6;           // min ticks between ray-set rotations. Small grids (≤
                                    // MAX_PROBES_PER_TICK probes = a 1-tick full pass) otherwise
                                    // rotate the ray set EVERY tick, injecting fresh per-tick noise
@@ -169,16 +170,19 @@ export function probeUpdateIntervalTicks(probeTotal, probesPerTick, solveEveryTi
 export function hysteresisExponentForInterval(updateDtMs, normalize = true) {
     if (!normalize) return 1;
     const dt = Number.isFinite(updateDtMs) ? Math.max(0, updateDtMs) : HYSTERESIS_DT_REF_MS;
-    // No clamps: h^(dt/ref) must approach 1 as update frequency rises and must keep
-    // growing for sparse revisits. Either clamp changes history authority per second
-    // with FPS; the slider itself is the noise/convergence tradeoff.
-    return dt / HYSTERESIS_DT_REF_MS;
-}
-
-export function advanceReactiveTicks(remaining, acceptedDtMs) {
-    const ticks = Math.max(0, Number(remaining) || 0);
-    const dt = Number.isFinite(acceptedDtMs) ? Math.max(0, acceptedDtMs) : HYSTERESIS_DT_REF_MS;
-    return Math.max(0, ticks - dt / HYSTERESIS_DT_REF_MS);
+    // Fast side (dt < ref): UNCLAMPED. h^(dt/ref) → 1 as the update rate rises, so
+    // 120/240/480 Hz cadences consume the same fresh Monte-Carlo noise per second
+    // as 60 Hz instead of boiling harder the faster the machine renders.
+    // Slow side (dt > ref): CLAMPED at 1 — the flicker-proof bound. Every per-texel
+    // policy is a reference-domain retention r applied as r^exponent; exponent ≤ 1
+    // guarantees r^exponent ≥ r, so ONE update can never blend in more fresh noise
+    // than the slider admits at 60 Hz, no matter how sparse the service cadence gets
+    // (low FPS, throttled ray budgets, round-robin revisits, alternating cascades).
+    // Sparse service therefore converges SLOWER in wall-clock, never noisier: an
+    // unclamped exponent kept per-second decay exactly rate-invariant, but paid for
+    // it by dissolving the field into flicker exactly when the machine struggled.
+    // Bounded per-update variance is the invariant; convergence speed is the slack.
+    return Math.min(1, dt / HYSTERESIS_DT_REF_MS);
 }
 
 let _node = null;
@@ -937,7 +941,6 @@ export function createProbeField({
     let lastXformSig = null;
     let geoStable = -1;       // -1 = no pending geo change; >=0 = stable-check count since a change (debounce, A1)
     let checkCounter = 0;
-    let reactiveTicks = 0;
     let lastIdleMs = Infinity;
     let lastMoving = false;
     let lastRestOnly = true;
@@ -1055,23 +1058,17 @@ export function createProbeField({
         return out;
     }
     function setSky(input) {
+        // Trace-side change: newly traced rays carry the new sky and the per-texel
+        // change detector re-converges affected texels at the bounded steady rate.
         const sh = _skyToSH(input);
-        let changed = false;
-        const configured = input !== null && input !== undefined ? 1.0 : 0.0;
-        if (U.skyConfigured.value !== configured) { U.skyConfigured.value = configured; changed = true; }
-        for (let i = 0; i < 9; i++) {
-            if (!U.skySH[i].value.equals(sh[i])) { U.skySH[i].value.copy(sh[i]); changed = true; }
-        }
-        if (changed) reactiveTicks = REACTIVE_TICKS;  // re-converge to the new sky fast
+        U.skyConfigured.value = input !== null && input !== undefined ? 1.0 : 0.0;
+        for (let i = 0; i < 9; i++) U.skySH[i].value.copy(sh[i]);
     }
 
     function setReflectionSkyFallback(on) {
-        const v = on === true ? 1.0 : 0.0;
-        if (U.reflectionSkyFallback.value === v) return;
-        U.reflectionSkyFallback.value = v;
-        // Reflection caches are temporal by design; preserve their converged local
-        // history and fade this ownership change through the normal reactive burst.
-        reactiveTicks = REACTIVE_TICKS;
+        // Reflection caches are temporal by design; converged local history is
+        // preserved and the ownership change blends in at the steady rate.
+        U.reflectionSkyFallback.value = on === true ? 1.0 : 0.0;
     }
 
     function isSupported() {
@@ -1613,9 +1610,9 @@ export function createProbeField({
             // diffuse changeW here made rough reflections frame-rate dependent:
             // changeW is recomputed from evolving diffuse moments on every render
             // substep, so 30 and 240 Hz followed different nonlinear trajectories.
-            // Known scene edits already lower U.hysteresis through the global
-            // reactive ramp; between edits, both reflection lobes use the steady /
-            // noisy reference policy and normalize it exactly once by elapsed time.
+            // Scene edits therefore transition the reflection lobes at the steady /
+            // noisy reference rate — smooth by construction, normalized exactly
+            // once by elapsed time. (No global reactive ramp: constant policy.)
             const steadyReflectionH = pow(rawNoiseH.clamp(1e-6, 1.0), U.hysteresisExponent);
             const h = select(wasBlack, float(0.0), hEff);
             const band = sigma.mul(U.tempClampSigma);
@@ -2321,7 +2318,6 @@ export function createProbeField({
             node.setCascadeCount(1);
             buildStage = 1;   // C1 built next idle tick (staggered — never 2× the build/frame)
         }
-        reactiveTicks = REACTIVE_TICKS;
         dirty = false;
         // Fire the one-shot recompile the frame C0's data first exists (resize/first-enable
         // path OR a cascade-count change to 1). The same-dim path with no structGen change
@@ -2443,29 +2439,16 @@ export function createProbeField({
                 else if (gs !== lastGeoSig) { lastGeoSig = gs; geoStable = 0; }
                 else if (geoStable >= 0) {
                     geoStable++;
-                    if (geoStable >= GEO_SETTLE_INTERVALS) { geoStable = -1; reactiveTicks = REACTIVE_TICKS; requestRebuild(); }
+                    if (geoStable >= GEO_SETTLE_INTERVALS) { geoStable = -1; requestRebuild(); }
                 }
             }
         }
-        // Reactive re-converge: EASE the temporal blend from a faster (lower-hysteresis) start
-        // UP to the steady-state hysteresis across the burst, so a light/geometry edit FADES
-        // smoothly into its new solution over a couple seconds — instead of snapping or boiling.
-        // (Was a flat REACTIVE_HYSTERESIS for the whole burst → big per-tick jumps = the
-        // "calculating buncha shit, flickers left/right" pop the user reported.)
-        let hTickBase;
-        if (reactiveTicks > 0) {
-            const t = 1 - (reactiveTicks / REACTIVE_TICKS); // 0 at burst start → 1 at burst end
-            hTickBase = REACTIVE_HYSTERESIS + (baseHysteresis - REACTIVE_HYSTERESIS) * t;
-            // reactiveTicks are 60 Hz-equivalent time units, not rendered frames.
-            // The fade therefore remains ~1.25 s at 30/60/120/240 Hz alike.
-            reactiveTicks = advanceReactiveTicks(
-                reactiveTicks,
-                hysteresisTickDtEma > 0 ? hysteresisTickDtEma : HYSTERESIS_DT_REF_MS,
-            );
-        } else {
-            hTickBase = baseHysteresis;
-        }
-        U.hysteresis.value = hTickBase;
+        // CONSTANT temporal policy — no reactive/low-hysteresis burst. A global
+        // authority drop after an edit read as "flicker for a second, then settle"
+        // (a visible fade-out/in on every slider touch). Edits re-converge through
+        // the per-texel change detector in the blend, whose retention is bounded,
+        // so a light/sky/geometry change transitions smoothly at the steady rate.
+        U.hysteresis.value = baseHysteresis;
 
         // (#1) Cascade scheduling. When the per-tick ray budget covers the WHOLE union
         // (the common small/medium-grid case) solve BOTH cascades every tick — every
@@ -2612,11 +2595,11 @@ export function createProbeField({
 
     // ── reactivity helpers ──
     // Cheap scene signatures: a change flags a light refresh (in-place) or a full
-    // BVH rebuild. Both kick a low-hysteresis burst so the field re-converges fast.
+    // BVH rebuild. Re-convergence rides the bounded per-texel change detector.
     function lightSignature() {
         let s = '', n = 0;
         // (B4) Scene-relative deadbands so sub-perceptual delta-sync jitter does NOT
-        // arm a reactive burst every check; a genuine edit still changes the signature.
+        // trigger a refresh every check; a genuine edit still changes the signature.
         const q = lightQuant > 1e-6 ? lightQuant : 1;
         scene.traverseVisible((o) => {
             if (!o.isLight || o.isAmbientLight || o.isHemisphereLight) return;
@@ -2679,7 +2662,6 @@ export function createProbeField({
             const g = C.gpu; if (!g) continue;
             g.buffers.materials.needsUpdate = true;
         }
-        reactiveTicks = REACTIVE_TICKS;
     }
     // re-collect lights into EACH cascade's light buffer (no BVH rebuild). Count change →
     // full rebuild. Both cascades bind their own copy of the light soup, so update both.
@@ -2695,14 +2677,12 @@ export function createProbeField({
             for (let i = 0; i < records.length; i++) arr.set(records[i], i * _LIGHT_STRIDE);
             g.buffers.lights.needsUpdate = true;
         }
-        reactiveTicks = REACTIVE_TICKS;
     }
 
     function forceLightingRefresh() {
         scene.updateMatrixWorld?.(true);
         refreshLights();
         lastLightSig = lightSignature();
-        reactiveTicks = REACTIVE_TICKS;
         touchGiUniforms();
     }
 
@@ -2864,7 +2844,7 @@ export function createProbeField({
         setHysteresis: (v) => {
             if (!Number.isFinite(v)) return;
             baseHysteresis = THREE.MathUtils.clamp(v, 0, 0.99); // steady-state temporal blend (higher = more stable/slower)
-            U.hysteresis.value = baseHysteresis;                // apply now; tick() re-asserts it when no reactive burst is active
+            U.hysteresis.value = baseHysteresis;                // apply now; tick() re-asserts it every solve
         },
         setHysteresisNormalization: (on) => {
             hysteresisNormalize = on !== false;
@@ -2886,19 +2866,19 @@ export function createProbeField({
             const next = Math.max(0, v);
             if (U.radianceClamp.value === next) return;
             U.radianceClamp.value = next;   // cap multibounce feedback (anti-runaway)
-            // Trace-side knob: it only affects NEWLY traced rays, and at hysteresis 0.95
-            // the converged field absorbs them so slowly it reads as "needs a rebuild".
-            // Kick the reactive burst so the new clamp fades in over ~1-2 s instead.
-            reactiveTicks = REACTIVE_TICKS;
+            // Trace-side knob: newly traced rays carry the new clamp; texels it
+            // really moves re-converge through the bounded change detector.
         },
-        setDepthSharpness: (v) => { if (Number.isFinite(v)) U.depthSharpness.value = THREE.MathUtils.clamp(v, 1, 200); }, // depth-moment cosine power (Chebyshev crispness)
+        // depth-moment cosine power (Chebyshev crispness). 0 = uniform-ish weighting;
+        // floored at 0.01 because pow(0,0) is indeterminate in WGSL (cw is exactly 0
+        // for backfacing rays) and would poison the depth history with NaN.
+        setDepthSharpness: (v) => { if (Number.isFinite(v)) U.depthSharpness.value = Math.max(0.01, THREE.MathUtils.clamp(v, 0, 200)); },
         setSky,   // inject the sky: null | Color/hex | {zenith,horizon,ground} | LightProbe/SphericalHarmonics3 (radiance SH)
         setSkyIntensity: (v) => {
             if (!Number.isFinite(v)) return;
             const next = Math.max(0, v);
             if (U.skyIntensity.value === next) return;
             U.skyIntensity.value = next;    // sky radiance on miss rays (0 = off)
-            reactiveTicks = REACTIVE_TICKS; // trace-side knob: fade the new level in (same reason as setRadianceClamp)
         },
         getSkyIntensity: () => U.skyIntensity.value,
         // ── NIR band sensing (white-phosphor NV). Trace-side gate for emitter-class-4
@@ -2910,7 +2890,6 @@ export function createProbeField({
             const v = on ? 1.0 : 0.0;
             if (U.nirGate.value === v) return;
             U.nirGate.value = v;
-            reactiveTicks = REACTIVE_TICKS; // trace-side knob: fade the band switch in (same reason as setRadianceClamp)
         },
         getNirSensing: () => U.nirGate.value > 0.5,
         // ── adaptive-blend tuning (live; no recompile). Tune "stable continuous" by feel. ──
@@ -2976,7 +2955,6 @@ export function createProbeField({
             buildCascadeCount,
             rebuildBackoff,
             inFlight,
-            reactiveTicks,
             baseHysteresis,
             hysteresis: U.hysteresis.value,
             hysteresisExponent: U.hysteresisExponent.value,

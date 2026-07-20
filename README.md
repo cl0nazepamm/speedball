@@ -10,7 +10,7 @@ Best for medium scale scenes. It is prone to leaking but it is continuous and ca
 Hysteresis is the main slider for radiosity fade in/out.
 
 It is normalized by default over each cascade's accepted solve cadence and fractional round-robin revisit interval. Adaptive diffuse/depth history is normalized only after its final reference-rate retention is formed. Rough and glossy reflection caches use one dedicated steady/noisy retention for their complete stored state (including glossy numerator and support), so their wall-time decay remains identical across refresh rates. A valid zero-coverage rough texel stays initialized instead of accepting the next sparse hit without history.
-The same reference-rate decay is preserved when a large grid revisits each probe only every several solve ticks; the Hysteresis slider remains the explicit stability/convergence tradeoff.
+The normalization is bounded on the slow side: one update never blends in more fresh noise than the slider admits at 60 Hz, no matter how sparse the service cadence gets (low frame rates, throttled ray budgets, large-grid round-robin revisits). Sparse service converges slower in wall-clock instead of flickering. At and above 60 Hz the per-second decay stays rate-invariant; the Hysteresis slider remains the explicit stability/convergence tradeoff.
 
 The live demo exposes a **normalize hysteresis** switch so you can turn the normalization off and compare against the raw per-update value.
 

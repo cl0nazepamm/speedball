@@ -5,6 +5,31 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+## [0.6.6] — 2026-07-20
+
+- Made hysteresis normalization variance-bounded: the time-normalization exponent
+  now clamps at 1, so one update can never blend in more fresh Monte-Carlo noise
+  than the slider admits at 60 Hz — for every policy branch (diffuse noise/change,
+  depth, rough, glossy) and every service cadence. 0.6.5 removed this bound to
+  keep per-second decay exactly rate-invariant; the cost was sparse service (low
+  frame rates, throttled ray budgets, large-grid round-robin revisits, alternating
+  cascades) blending most of a fresh noisy ray set per revisit — the field
+  dissolved into flicker exactly when the machine was struggling. Sparse service
+  now converges slower in wall-clock instead of noisier; at and above 60 Hz the
+  per-second decay remains rate-invariant and high-refresh exponents stay
+  unclamped.
+- Removed the global reactive/low-hysteresis burst. Light, sky, transform, and
+  trace-side-knob edits no longer drop history authority for ~1.25 s — that read
+  as "flicker for a second, then settle" (a visible fade-out/in on every slider
+  touch). The temporal policy is constant at all times; edits re-converge through
+  the bounded per-texel change detector, so a change transitions smoothly at the
+  steady rate instead of pumping. `advanceReactiveTicks` (a debug/test helper
+  export, never part of the package entry point) is gone.
+- `setDepthSharpness` now accepts 0 (uniform-ish depth weighting; internally
+  floored at 0.01 because `pow(0,0)` is indeterminate in WGSL and would poison
+  the depth history with NaN). Demo defaults retuned: depth sharpness 0,
+  Chebyshev strength 0.8.
+
 ## [0.6.5] — 2026-07-20
 
 - Fixed hysteresis normalization across render rates. Adaptive diffuse and depth

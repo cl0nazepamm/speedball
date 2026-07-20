@@ -10,8 +10,8 @@ const KEY = 'speedball-gi-settings-v2';
 export const GI_DEFAULTS = {
     giEnabled: true, giIntensity: 10, giDivisions: 16, giRays: 64,
     giCascades: 1, giContinuous: true, showProbes: false,
-    giHysteresis: 0.6, giHysteresisNormalize: true, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 40,
-    giLeak: 0.5, giSolid: 0, giSky: 1, giNormalDetail: 1, giReflectionIntensity: 1,
+    giHysteresis: 0.6, giHysteresisNormalize: true, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 0,
+    giLeak: 0.8, giSolid: 0, giSky: 1, giNormalDetail: 1, giReflectionIntensity: 1,
     giChangeThreshold: 2.5, giSnapAmount: 0.30, giFireflyClamp: 6.0,
 };
 
@@ -71,7 +71,7 @@ export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure
     const fQ = fGI.addFolder('Quality');
     fQ.add(params, 'giNormalBias', 0, 4, 0.05).name('normal bias').onChange((v) => { gi.setNormalBias(v); onInteract(); });
     fQ.add(params, 'giRadianceClamp', 0, 32, 0.5).name('radiance clamp').onChange((v) => { gi.setRadianceClamp(v); onInteract(); });
-    fQ.add(params, 'giDepthSharpness', 1, 200, 1).name('depth sharpness').onChange((v) => { gi.setDepthSharpness(v); onInteract(); });
+    fQ.add(params, 'giDepthSharpness', 0, 200, 1).name('depth sharpness').onChange((v) => { gi.setDepthSharpness(v); onInteract(); });
     fQ.add(params, 'giLeak', 0, 1, 0.05).name('chebyshev strength').onChange((v) => { gi.setChebyStrength(v); onInteract(); });
     if (typeof gi.setSkyIntensity === 'function') {
         fQ.add(params, 'giSky', 0, 2, 0.05).name('sky light').onChange((v) => { gi.setSkyIntensity(v); onInteract(); });

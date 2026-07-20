@@ -6,8 +6,8 @@ const helperStart = probeSource.indexOf('export const HYSTERESIS_DT_REF_MS');
 const helperEnd = probeSource.indexOf('let _node = null;', helperStart);
 assert.ok(helperStart >= 0 && helperEnd > helperStart, 'production hysteresis helpers must remain extractable');
 const helperSource = probeSource.slice(helperStart, helperEnd).replace(/\bexport\s+/g, '');
-const { HYSTERESIS_DT_REF_MS, advanceReactiveTicks, hysteresisExponentForInterval, probeUpdateIntervalTicks } = new Function(
-    `${helperSource}\nreturn { HYSTERESIS_DT_REF_MS, advanceReactiveTicks, hysteresisExponentForInterval, probeUpdateIntervalTicks };`,
+const { HYSTERESIS_DT_REF_MS, hysteresisExponentForInterval, probeUpdateIntervalTicks } = new Function(
+    `${helperSource}\nreturn { HYSTERESIS_DT_REF_MS, hysteresisExponentForInterval, probeUpdateIntervalTicks };`,
  )();
 
 const EPS = 1e-12;
@@ -51,36 +51,70 @@ function squareWavePeakToPeak(fps, seconds = 8) {
 }
 
 const expectedPeakToPeak = 8 / 17; // 0.470588... for two 60 Hz updates at h=0.6
-for (const fps of [30, 60, 120, 240, 480]) {
+for (const fps of [60, 120, 240, 480]) {
     close(squareWavePeakToPeak(fps), expectedPeakToPeak, `${fps} Hz adaptive history`);
 }
+// Below the reference rate the exponent pins at 1: per-update retention equals the
+// reference policy, so a slow cadence tracks a fast physical change CALMER than
+// 60 Hz — never noisier. (Unclamped, 30 Hz used h^2 and admitted more per update.)
+const sparse30PeakToPeak = (1 - changeReference) / (1 + changeReference);
+close(squareWavePeakToPeak(30), sparse30PeakToPeak, '30 Hz pinned adaptive history');
+assert.ok(sparse30PeakToPeak < expectedPeakToPeak, '30 Hz must be calmer than the 60 Hz reference');
 
 // No high-refresh floor: dt/ref must keep shrinking above 240 Hz or fast displays
 // consume too much new Monte-Carlo noise per second.
 close(hysteresisExponentForInterval(1000 / 480), 0.125, '480 Hz exponent');
 close(hysteresisExponentForInterval(1000 / 120, false), 1, 'normalization-off exponent');
 
-// Sparse revisits must not saturate either. Ten services between updates means
-// fewer, stronger blends at low FPS and more, weaker blends at high FPS; their
-// one-second product must still equal exactly 60 reference-rate blends.
+// The flicker-proof bound: at and below the reference rate the exponent is exactly 1.
+close(hysteresisExponentForInterval(HYSTERESIS_DT_REF_MS), 1, 'reference-interval exponent');
+close(hysteresisExponentForInterval(1000 / 30), 1, '30 Hz exponent pins at the reference');
+close(hysteresisExponentForInterval(HYSTERESIS_DT_REF_MS * 20), 1, 'sparse-revisit exponent pins at the reference');
+
+// Sparse revisits are where the bound matters most. Per-update retention is PINNED
+// at the slider's reference value — one revisit never hands a fresh noisy ray set
+// more authority than 60 Hz would — and the per-second product is therefore ≥ the
+// 60 Hz decay: sparse service converges slower in wall-clock, never noisier.
 const sparseReference = 0.95;
 for (const fps of [30, 60, 120, 240, 480]) {
     const revisitServices = 10;
-    const exponent = hysteresisExponentForInterval((1000 / fps) * revisitServices);
-    const updatesPerSecond = fps / revisitServices;
-    const retention = Math.pow(Math.pow(sparseReference, exponent), updatesPerSecond);
-    close(retention, Math.pow(sparseReference, 60), `${fps} Hz sparse history`);
+    const interval = (1000 / fps) * revisitServices;
+    const retention = Math.pow(sparseReference, hysteresisExponentForInterval(interval));
+    close(retention, sparseReference, `${fps} Hz sparse per-update retention pinned`);
+    const updatesPerSecond = 1000 / interval;
+    assert.ok(
+        Math.pow(retention, updatesPerSecond) >= Math.pow(sparseReference, 60) - EPS,
+        `${fps} Hz sparse history must be slower than 60 Hz, never noisier`,
+    );
 }
 
-// The reactive fade is 75 reference ticks (=1.25 s), not 75 rendered frames.
-// After half a second, every render rate must have consumed exactly 30 units.
-for (const fps of [30, 60, 120, 240, 480]) {
-    let remaining = 75;
-    for (let frame = 0; frame < fps * 0.5; frame++) {
-        remaining = advanceReactiveTicks(remaining, 1000 / fps);
+// The forever guarantee, swept: for EVERY service cadence and EVERY slider value,
+// each policy branch's per-update retention is at least its 60 Hz reference value.
+// No framerate / ray-budget / revisit pattern can make one update noisier than the
+// reference look the slider was tuned on.
+for (const interval of [1000 / 480, 1000 / 240, 1000 / 144, 1000 / 60, 1000 / 30, 1000 / 15, 250, 1000, 4000]) {
+    const exponent = hysteresisExponentForInterval(interval);
+    assert.ok(exponent <= 1 + EPS, `exponent bounded at ${interval} ms`);
+    if (interval >= HYSTERESIS_DT_REF_MS) close(exponent, 1, `exponent pinned for ${interval} ms`);
+    for (const slider of [0.5, 0.6, 0.8, 0.95, 0.99]) {
+        const branches = [
+            slider + (1 - slider) * noiseBoost,       // steady/noisy branch
+            Math.max(slider - changeDrop, minChange), // significant-change branch
+            Math.min(slider, 0.999),                  // depth branch (historyScale 1)
+        ];
+        for (const reference of branches) {
+            assert.ok(
+                Math.pow(reference, exponent) >= reference - EPS,
+                `per-update retention never below reference (interval ${interval} ms, slider ${slider})`,
+            );
+        }
     }
-    close(remaining, 45, `${fps} Hz reactive ramp`);
 }
+
+// The temporal policy is CONSTANT: no global reactive/low-hysteresis burst exists.
+// Edits re-converge through the bounded per-texel change detector only, so an
+// adjustment can never read as "flicker for a second, then settle".
+assert.doesNotMatch(probeSource, /REACTIVE_TICKS|REACTIVE_HYSTERESIS|reactiveTicks|advanceReactiveTicks/, 'no reactive burst machinery may exist');
 
 // Circular modulo batches have a fractional average revisit interval N/K. This
 // keeps wall-time decay continuous right up to full coverage instead of ceil(N/K)
@@ -101,18 +135,21 @@ close((1 / 2) * (100 / 100) * coarseTicks, 1, 'coarse wall-time authority');
 close((1 / 2) * (100 / 200) * fineTicks, 1, 'fine wall-time authority');
 
 // Exercise the steady/noisy branch too; reference-first exponentiation must retain
-// the same one-second history at every render rate.
+// the same one-second history at every render rate AT OR ABOVE the reference. Below
+// it, retention pins at the reference value (bounded noise, slower convergence).
 const noiseReference = base + (1 - base) * noiseBoost;
 const expectedNoiseRetention = Math.pow(noiseReference, 60);
-for (const fps of [30, 60, 120, 240, 480]) {
+for (const fps of [60, 120, 240, 480]) {
     const exponent = hysteresisExponentForInterval(1000 / fps);
     close(Math.pow(Math.pow(noiseReference, exponent), fps), expectedNoiseRetention, `${fps} Hz noise history`);
 }
+close(Math.pow(noiseReference, hysteresisExponentForInterval(1000 / 30)), noiseReference, '30 Hz noise retention pinned');
 
 // Reflections intentionally use the steady/noisy reference retention rather than
 // diffuse's nonlinear per-texel change detector. This makes their vec4 history a
-// true time semigroup: repeating one physical sample over more render substeps has
-// exactly the same wall-time result.
+// true time semigroup ON THE FAST SIDE: repeating one physical sample over more
+// render substeps has exactly the same wall-time result at 60 Hz and above. Below
+// the reference the coefficient pins (bounded noise beats exact rate-invariance).
 const roughCandidates = [
     [0.08, 0.18, 0.03, 0.20],
     [0.62, 0.12, 0.44, 0.75],
@@ -131,7 +168,7 @@ function roughReflectionState(fps, seconds = 8) {
     return { state, trajectory };
 }
 const roughReference = roughReflectionState(60);
-for (const fps of [30, 60, 120, 240, 480]) {
+for (const fps of [60, 120, 240, 480]) {
     const actual = roughReflectionState(fps);
     closeVector(actual.state, roughReference.state, `${fps} Hz rough reflection history`);
     assert.equal(actual.trajectory.length, roughReference.trajectory.length, `${fps} Hz rough trajectory length`);
@@ -139,6 +176,13 @@ for (const fps of [30, 60, 120, 240, 480]) {
         closeVector(actual.trajectory[i], roughReference.trajectory[i], `${fps} Hz rough boundary ${i}`);
     }
 }
+// 30 Hz rough history pins at the reference coefficient: each update admits exactly
+// the reference fresh fraction (calmer than the old h² unclamped value, never more).
+close(
+    Math.pow(noiseReference, hysteresisExponentForInterval(1000 / 30)),
+    noiseReference,
+    '30 Hz rough coefficient pinned',
+);
 
 // Transparent black is valid converged reflection history, not an initialization
 // marker. Once the parallel depth history is seeded, a later sparse hit must still
@@ -151,7 +195,10 @@ assert.notDeepEqual(retainedSparseHit, sparseHit, 'zero-coverage rough history m
 
 // Glossy stores an unnormalized numerator and angular support denominator. Both
 // hidden states must use the SAME elapsed-time coefficient; otherwise their ratio
-// pumps with FPS even when the candidate signal is physically identical.
+// pumps with FPS even when the candidate signal is physically identical. The exact
+// wall-time semigroup holds on the fast side (update interval ≤ the reference);
+// sparser cadences pin the coefficient at the reference instead of saturating —
+// one weak power-64 ray set can never take near-full authority again.
 const sparseCascadeTicks = probeUpdateIntervalTicks(200, 100, 2);
 close(sparseCascadeTicks, 4, 'reflection sparse cascade cadence');
 const glossyCandidates = [
@@ -189,8 +236,10 @@ function glossyReflectionState(fps, seconds = 8) {
         trajectory,
     };
 }
-const glossyReference = glossyReflectionState(60);
-for (const fps of [30, 60, 120, 240, 480]) {
+// 240 Hz × 4-tick cascade service = exactly the reference interval; 480 Hz halves
+// it. Both sit on the unclamped fast side, so their wall-time histories must match.
+const glossyReference = glossyReflectionState(240);
+for (const fps of [240, 480]) {
     const actual = glossyReflectionState(fps);
     closeVector(actual.num, glossyReference.num, `${fps} Hz glossy numerator`);
     close(actual.den, glossyReference.den, `${fps} Hz glossy support`);
@@ -201,6 +250,13 @@ for (const fps of [30, 60, 120, 240, 480]) {
         close(actual.trajectory[i].den, glossyReference.trajectory[i].den, `${fps} Hz glossy support boundary ${i}`);
         closeVector(actual.trajectory[i].resolved, glossyReference.trajectory[i].resolved, `${fps} Hz glossy resolved boundary ${i}`);
     }
+}
+// Below the reference cadence the shared coefficient pins: numerator and support
+// still blend with the SAME value (the structural guards below pin the wiring),
+// and no cadence saturates toward zero retention.
+for (const fps of [30, 60, 120]) {
+    const history = Math.pow(noiseReference, hysteresisExponentForInterval((1000 / fps) * sparseCascadeTicks));
+    close(history, noiseReference, `${fps} Hz glossy sparse coefficient pinned`);
 }
 
 // Tie the numeric models to the production shader wiring. These guards catch the

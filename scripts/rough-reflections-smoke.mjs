@@ -32,7 +32,7 @@ assert.match(probes, /reflectionSkyFallback\s*=\s*false/);
 assert.match(probes, /function setReflectionSkyFallback\(on\)/);
 assert.match(probes, /setReflectionSkyFallback,/);
 assert.match(probes, /skyConfigured:\s*uniform\(0\.0\)/);
-assert.match(probes, /const configured = input !== null && input !== undefined \? 1\.0 : 0\.0/);
+assert.match(probes, /U\.skyConfigured\.value = input !== null && input !== undefined \? 1\.0 : 0\.0/);
 assert.match(demo, /reflectionSkyFallback:\s*true/);
 assert.match(demo, /excludeFromGI\(metalBall\)/);
 assert.match(demo, /metalness:\s*1,\s*roughness:\s*0/);
