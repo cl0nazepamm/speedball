@@ -5,6 +5,8 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-07-20
+
 - Fixed hysteresis normalization across render rates. Adaptive diffuse and depth
   policies are formed in the 60 Hz reference domain before their final retention
   is time-normalized. Rough and glossy reflections now share a dedicated steady /
