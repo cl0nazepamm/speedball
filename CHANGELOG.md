@@ -5,6 +5,21 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- IR illuminator gain: a scalar trim on emitter-class-4 lights in the sensed
+  band, on top of the existing on/off gate, uniform-driven (no recompiles).
+  Three consumers, one knob per host: `setNirIlluminatorGain` (direct raster
+  term, gi_lights_node — also multiplied into custom-lights-node IR nodes),
+  `field.setNirGain` (probes' NEE), and the spectral tracer's `setNirGain`
+  (multiplies the 850 nm emission band; resets accumulation). The install
+  handle's `setNirGain` drives both raster consumers.
+- Authored NIR albedo (`userData.nirAlbedo`, material slot [25]) no longer
+  paints tagged materials flat past the red edge. The tag now sets the
+  material's NIR *level* and the albedo map keeps supplying per-texel spatial
+  variation: the kernel passes the pre-map scalar color into `jhReflectance`,
+  which scales the authored value by the JH ratio texel/flat (clamped to
+  [0, 1], flat guarded at 1e-3). Materials without an albedo map — and all
+  untagged materials — shade exactly as before, and scenes with no albedo
+  atlas compile an unchanged shader.
 - Frame-paced large deform refits so their 2 ms slices now yield through the
   next animation frame instead of chaining `scheduler.yield()` continuations
   ahead of paint. Normal-only settle packets update packed shading data without

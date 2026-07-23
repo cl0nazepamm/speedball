@@ -1002,6 +1002,7 @@ export function createProbeField({
         // (white-phosphor NV): IR lights join NEE at their promoted (k,k,k).
         // Mirrors the PT's emitterAtLambda 850 nm band collapsed to one scalar.
         nirGate: uniform(0.0),
+        nirGain: uniform(1.0),
         // ── sky → probes (see the "sky → probes" block below + traceKernel miss branch) ──
         skyIntensity: uniform(1.0),   // scales the injected SH sky (0 = off)
         skySH: Array.from({ length: 9 }, () => uniform(new THREE.Vector3())), // radiance SH-9; all-zero = miss stays BLACK (the old invariant)
@@ -1459,7 +1460,7 @@ export function createProbeField({
                     const ldir = loadLightVec3(lb, 4);
                     const eclass = lights.element(lb.add(uint(16)));
                     const isIr = tslAbs(eclass.sub(float(4.0))).lessThan(float(0.25));
-                    const lcol = loadLightVec3(lb, 7).mul(select(isIr, U.nirGate, float(1.0)));
+                    const lcol = loadLightVec3(lb, 7).mul(select(isIr, U.nirGate.mul(U.nirGain), float(1.0)));
                     const lrange = lights.element(lb.add(uint(10)));
                     const ldecay = lights.element(lb.add(uint(11)));
                     const lcosAngle = lights.element(lb.add(uint(12)));
@@ -2765,6 +2766,13 @@ export function createProbeField({
     // MeshBVH rebuild the moment the stream pauses. SkinnedMesh is skipped to
     // mirror the BVH build (spectral_scene isTraceableMesh): GPU skinning
     // never lands in the soup, so its churn must not schedule rebuilds.
+    // CONSUMER CONTRACT: hosts streaming geometry must not bump identity or
+    // version on data that did not change. A byte-identical index re-send
+    // that bumps index.version is indistinguishable from a connectivity edit
+    // here and arms the debounced FULL rebuild (maxjs 2026-07-23: settle
+    // packets after every timeline scrub did exactly that — ~550 ms freeze
+    // per release). Change-detect on the host side before rewriting
+    // attributes; this lane deliberately stays paranoid.
     function geoSignature() {
         let meshes = 0, prims = 0, hash = 0;
         scene.traverseVisible((o) => {
@@ -3148,6 +3156,14 @@ export function createProbeField({
             U.nirGate.value = v;
         },
         getNirSensing: () => U.nirGate.value > 0.5,
+        // Scalar trim on the gated class-4 NEE term (sensed-band illuminator
+        // brightness). Same uniform group as the gate — live, no recompile.
+        setNirGain: (gain) => {
+            const v = Number.isFinite(gain) ? Math.max(0, gain) : 1;
+            if (U.nirGain.value === v) return;
+            U.nirGain.value = v;
+        },
+        getNirGain: () => U.nirGain.value,
         // ── adaptive-blend tuning (live; no recompile). Tune "stable continuous" by feel. ──
         setChangeThreshold: (v) => { if (Number.isFinite(v)) U.tempChangeSigma1.value = THREE.MathUtils.clamp(v, 0.5, 8); },   // σ delta to treat a change as REAL — lower = snappier
         setSnapAmount: (v) => { if (Number.isFinite(v)) U.tempChangeHDrop.value = THREE.MathUtils.clamp(v, 0, 0.9); },         // hysteresis drop on a real change — higher = harder snap

@@ -40,6 +40,19 @@ const _nirGate = uniform(0.0).setGroup(renderGroup);
 export function setNirDirectSensing(on) { _nirGate.value = on ? 1.0 : 0.0; }
 export function getNirDirectSensing() { return _nirGate.value > 0.5; }
 
+// Scalar trim ON TOP of the on/off band gate: how bright class-4 IR
+// illuminators read to the sensed-band imager. Rides the same renderGroup
+// uniform path as the gate, so it is live with zero recompiles. The GI
+// probes' NEE carries its own copy (gi_probes setNirGain) and the spectral
+// tracer its own (setNirGain) — installSpeedballGI's setNirGain drives the
+// two raster consumers in lockstep; hosts wire the tracer alongside.
+const _nirGain = uniform(1.0).setGroup(renderGroup);
+export function setNirIlluminatorGain(gain) {
+    const v = Number.isFinite(gain) ? Math.max(0, gain) : 1;
+    if (_nirGain.value !== v) _nirGain.value = v;
+}
+export function getNirIlluminatorGain() { return _nirGain.value; }
+
 // IR classifier — mirrors spectral_scene.js emitterClassValue's class-4 branch.
 // Kept inline (not imported): spectral_scene statically imports three-mesh-bvh and
 // this node must stay dependency-light for plain GI consumers.
@@ -77,7 +90,7 @@ export function getOrCreateIrLightNode(light, nodeLibrary) {
         const intensity = uniform(light.intensity)
             .setGroup(renderGroup)
             .onRenderUpdate(() => light.intensity);
-        node.colorNode = vec3(1.0, 1.0, 1.0).mul(intensity).mul(_nirGate);
+        node.colorNode = vec3(1.0, 1.0, 1.0).mul(intensity).mul(_nirGate).mul(_nirGain);
     }
     _irLightNodes.set(light, node);
     return node;

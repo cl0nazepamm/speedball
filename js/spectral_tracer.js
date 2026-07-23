@@ -143,6 +143,7 @@ export function createSpectralTracer({
     // powershotInfrared.setInputMode('nir') + renderTexture(...). With no
     // nvTarget the raw flux is blitted straight to the canvas (debug view).
     let renderMode = 'visible';
+    let nirGain = 1; // sensed-band trim for class-4 IR illuminators (survives rebuilds)
     let nvTarget = null;
 
     const lastCameraWorld = { initialized: false, values: new Float64Array(16) };
@@ -421,6 +422,7 @@ export function createSpectralTracer({
         u.focusDistance.value = Math.max(0.01, dofFocusDistance);
         u.toneMapEnabled.value = toneMapInBlit ? 1 : 0;
         u.envBackground.value = envBackground ? 1 : 0;
+        u.irGain.value = nirGain;
     }
 
     // Push the live scene environment intensity/rotation into the kernel so the
@@ -731,6 +733,20 @@ export function createSpectralTracer({
         return true;
     }
     function getRenderMode() { return renderMode; }
+
+    // Sensed-band trim for class-4 IR illuminators (multiplies the 850 nm
+    // emission band). Live: resets accumulation so the change shows now.
+    function setNirGain(next) {
+        const v = Number.isFinite(next) ? Math.max(0, next) : 1;
+        if (v === nirGain) return false;
+        nirGain = v;
+        if (gpu) {
+            gpu.kernels.uniforms.irGain.value = v;
+            resetAccumulation();
+        }
+        return true;
+    }
+    function getNirGain() { return nirGain; }
     // RenderTarget the NV flux is presented into (null → canvas debug view).
     function setNvTarget(target) {
         nvTarget = target || null;
@@ -783,6 +799,8 @@ export function createSpectralTracer({
         setToneMapInBlit,
         setRenderMode,
         getRenderMode,
+        setNirGain,
+        getNirGain,
         setNvTarget,
         isSyncFrozen,
         setCamera,

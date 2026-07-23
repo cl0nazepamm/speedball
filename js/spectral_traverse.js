@@ -260,14 +260,23 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
     // default PRIOR; ≥0 = authored NIR reflectance, blended in across the red
     // edge. RGB carries zero information about NIR (metamerism) — foliage
     // red-edge, water absorption etc. are injected as data, never inferred.
-    const jhReflectance = (rgb, lambda, nirAlbedo = null) => {
+    // The tag is the material's NIR LEVEL, not a flat paint-over: when the
+    // caller passes rgbFlat (scalar color BEFORE the albedo-map multiply),
+    // per-texel spatial variation survives as the JH ratio texel/flat. No map
+    // bound → rgb === rgbFlat → ratio 1 → exact authored scalar as before.
+    const jhReflectance = (rgb, lambda, nirAlbedo = null, rgbFlat = null) => {
         const base = jhReflectanceBase(rgb, lambda);
         if (!nirAlbedo) return base;
         const blend = smoothstep(float(700.0), float(740.0), lambda);
+        let authored = clamp(nirAlbedo, 0.0, 1.0);
+        if (rgbFlat) {
+            const flat = max(jhReflectanceBase(rgbFlat, lambda), float(1e-3));
+            authored = clamp(authored.mul(base.div(flat)), 0.0, 1.0);
+        }
         return select(
             nirAlbedo.lessThan(float(0.0)),
             base,
-            mix(base, clamp(nirAlbedo, 0.0, 1.0), blend),
+            mix(base, authored, blend),
         );
     };
     const jhEmission = haveLut
@@ -303,7 +312,10 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
         // intensity (max channel) sets the band's PEAK spectral radiance.
         // Contributes ~nothing in visible mode — correct and expected.
         const di = lambda.sub(850.0).div(IR_ILLUM_SIGMA);
-        const ir = max(max(rgb.x, rgb.y), rgb.z).mul(exp(di.mul(di).mul(-0.5)));
+        // U.irGain (optional — the probe kernel's U has no irGain and never
+        // takes this branch): host-side sensed-band trim on illuminator power.
+        const irPeak = max(max(rgb.x, rgb.y), rgb.z);
+        const ir = (U.irGain ? irPeak.mul(U.irGain) : irPeak).mul(exp(di.mul(di).mul(-0.5)));
         const isLed = abs(eclass.sub(float(2.0))).lessThan(float(0.25));
         const isNa = abs(eclass.sub(float(3.0))).lessThan(float(0.25));
         const isIr = abs(eclass.sub(float(4.0))).lessThan(float(0.25));

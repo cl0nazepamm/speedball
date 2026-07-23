@@ -24,6 +24,7 @@ export { createProbeField, getGiProbeNode, GiProbeNode } from './gi_probes.js';
 export {
     giLights, default as GiLightsNode,
     setNirDirectSensing, getNirDirectSensing,
+    setNirIlluminatorGain, getNirIlluminatorGain,
     isIrEmitter, getOrCreateIrLightNode,
 } from './gi_lights_node.js';
 

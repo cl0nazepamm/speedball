@@ -164,6 +164,11 @@ export function buildKernels({
         // 1 = tone-map + sRGB encode in the blit (direct-to-canvas);
         // 0 = emit LINEAR HDR for an external post stack to tone-map.
         toneMapEnabled: uniform(1, 'uint'),
+        // Sensed-band trim for class-4 IR illuminators: multiplies their
+        // 850 nm emission band (emitterAtLambda). 1 = physical intensity as
+        // authored on the host light; the raster consumers carry matching
+        // gains (gi_lights_node / gi_probes) so the paths stay comparable.
+        irGain: uniform(1.0),
     };
 
     const W = U.resolution.x;
@@ -407,9 +412,14 @@ export function buildKernels({
 
             // material slot [25]: authored NIR albedo (−1 = untagged → JH
             // extrapolation prior). Blended in above 700 nm; visible-mode
-            // output is effectively untouched.
+            // output is effectively untouched. The pre-map scalar color rides
+            // along so the tag sets the NIR level while the albedo map keeps
+            // supplying per-texel variation (flat only when no map is bound).
             const nirAlbedo = matFloat(matId, 25);
-            const albedoL = jhReflectance(baseColor, lambda, nirAlbedo);
+            const baseColorFlat = haveAlbedoMap
+                ? vec3(matFloat(matId, 0), matFloat(matId, 1), matFloat(matId, 2))
+                : null;
+            const albedoL = jhReflectance(baseColor, lambda, nirAlbedo, baseColorFlat);
 
             // NEE: one light sample (diffuse only — fast). Mirrors the raster
             // punctual-light model (three getDistanceAttenuation +

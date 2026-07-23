@@ -11,7 +11,7 @@
 
 import * as THREE from 'three/webgpu';
 import { createProbeField } from './gi_probes.js';
-import { giLights, setNirDirectSensing } from './gi_lights_node.js';
+import { giLights, setNirDirectSensing, setNirIlluminatorGain } from './gi_lights_node.js';
 
 // spectral_scene / gi_probes gate: userData.maxjsVisible === false → kept out of the
 // GI BVH and the auto-fit bounds. Wrapped here so callers never touch the raw flag.
@@ -191,6 +191,13 @@ export function installSpeedballGI({
          * light.color stays black, so the light never exists in the visible band.
          */
         setNirSensing(on) { gi.setNirSensing(on); setNirDirectSensing(on); },
+
+        /**
+         * Sensed-band illuminator gain: one scalar trim for BOTH raster terms of
+         * emitter-class-'ir' lights (probes' NEE + direct raster). Uniform writes
+         * only. Hosts running the spectral tracer wire its setNirGain alongside.
+         */
+        setNirGain(gain) { gi.setNirGain?.(gain); setNirIlluminatorGain(gain); },
 
         /** Recompile lit materials so GI folds in — call if you add meshes after install. */
         markMaterialsDirty,
