@@ -2527,20 +2527,26 @@ export function createProbeField({
         // in-place buffer refresh. DEFORM change (same-topology vertex motion,
         // e.g. streamed skinned-mesh vertex buffers) → in-place soup gather +
         // bounds refit (no MeshBVH — never a hitch). STRUCTURE change
-        // (topology/instance set) → debounced full rebuild. These walk the
-        // scene graph (CPU), so in continuous mode they run ONLY at rest —
-        // never per orbit frame.
+        // (topology/instance set) → debounced full rebuild. The heavy lanes
+        // walk the scene graph (CPU), so in continuous mode they run ONLY at
+        // rest — never per orbit frame.
+        checkCounter++;
+        // LIGHTS are the exception: refresh-class, not rebuild-class.
+        // refreshLights() is an in-place buffer refill (no BVH, no compile)
+        // and lightSignature() is a bounded lights-only traverse with
+        // deadbands, so this lane rides THROUGH motion. Rest-gating it made
+        // every host light edit read as "GI stopped solving" while the
+        // interactive raster light updated live (maxjs 2026-07-24).
+        if (checkCounter % LIGHT_CHECK_INTERVAL === 0) {
+            const ls = lightSignature();
+            if (lastLightSig !== null && ls !== lastLightSig) refreshLights();
+            lastLightSig = ls;
+        }
         if (restOnly) {
-            checkCounter++;
             if (checkCounter % XFORM_CHECK_INTERVAL === 0) {
                 const xs = xformSignature();
                 if (lastXformSig !== null && xs !== lastXformSig) refreshTransforms();
                 lastXformSig = xs;
-            }
-            if (checkCounter % LIGHT_CHECK_INTERVAL === 0) {
-                const ls = lightSignature();
-                if (lastLightSig !== null && ls !== lastLightSig) refreshLights();
-                lastLightSig = ls;
             }
             if (checkCounter % DEFORM_CHECK_INTERVAL === 0) {
                 const ds = deformSignature();

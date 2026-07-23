@@ -5,6 +5,13 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Light reactivity now rides THROUGH motion: the light-signature check and
+  `refreshLights()` moved out of the rest-only gate in `tick()`. Lights are
+  refresh-class (in-place buffer refill — no BVH, no compile, bounded
+  lights-only traverse with deadbands), so light edits and animated lights
+  update the field live during interaction and playback. The xform, deform,
+  and structure lanes stay rest-only; the idle-gate contract for heavy work
+  is unchanged.
 - IR illuminator gain: a scalar trim on emitter-class-4 lights in the sensed
   band, on top of the existing on/off gate, uniform-driven (no recompiles).
   Three consumers, one knob per host: `setNirIlluminatorGain` (direct raster
