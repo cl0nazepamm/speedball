@@ -19,7 +19,7 @@
   },
   "scripts": {
     "start": "python3 -m http.server 8777 --bind 127.0.0.1",
-    "test": "node scripts/webgpu-cleanup-smoke.mjs && node scripts/rough-reflections-smoke.mjs && node scripts/gi-hysteresis-normalization-smoke.mjs && node scripts/gi-oct-seam-smoke.mjs"
+    "test": "node scripts/webgpu-cleanup-smoke.mjs && node scripts/rough-reflections-smoke.mjs && node scripts/gi-hysteresis-normalization-smoke.mjs && node scripts/gi-oct-seam-smoke.mjs && node scripts/gi-deform-refit-smoke.mjs && node scripts/gi-async-deform-refit-smoke.mjs && node scripts/gi-post-scrub-budget-smoke.mjs"
   },
   "repository": {
     "type": "git",
@@ -35,6 +35,7 @@
     "js/gi_lights_node.js",
     "js/gi_oct.js",
     "js/gi_probes.js",
+    "js/gi_refit.js",
     "js/index.js",
     "js/install.js",
     "js/spectral_kernel.js",

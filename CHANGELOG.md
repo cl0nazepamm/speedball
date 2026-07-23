@@ -5,6 +5,55 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Frame-paced large deform refits so their 2 ms slices now yield through the
+  next animation frame instead of chaining `scheduler.yield()` continuations
+  ahead of paint. Normal-only settle packets update packed shading data without
+  refitting BLAS/TLAS bounds. HALO also resumes from interaction at a conservative
+  ray budget, can throttle down to 2,048 rays on weak GPUs, and grows gradually
+  after frame cadence recovers; stopped timeline scrubs therefore cannot turn
+  the deferred catch-up lane into a sustained ~12 fps tail.
+- Added a deform fast path so same-topology vertex animation (streamed vertex
+  buffers, CPU skinning, morph bakes) never triggers the ~200 ms synchronous
+  MeshBVH rebuild. `built.updateDeforms()` re-gathers the deformed BLAS's
+  slice of the pooled vertex data from the live attributes and refits the
+  flattened node bounds in place (`gi_refit.js` — reverse pre-order walk over
+  the threaded layout; the tree structure stays build-time), then rewrites the
+  instance/TLAS tail via the existing `updateTransforms` path. The probe field
+  now splits its reactivity signatures: STRUCTURE (counts + index identity →
+  debounced full rebuild) no longer hashes `position.version`; a new DEFORM
+  signature (`position`/`normal` identity + versions, checked every 12 idle ticks) routes
+  vertex motion to the in-place refit and re-uploads only the touched buffer
+  ranges (`updateRanges` when the three build supports them). Previously any
+  pause in a vertex stream (scrub stop, frame step, held pose, animation end)
+  armed the settle debounce and landed a full-scene MeshBVH rebuild on the
+  render thread — a repeating ~200 ms hitch during skinned-mesh workflows. GI
+  refreshes the latest deforming pose on its idle cadence after interaction;
+  it does not perform scene scans in the playback/input lane. SkinnedMesh
+  objects are excluded from all geometry
+  signatures, mirroring their exclusion from the BVH build, so GPU-skinned
+  meshes can never schedule pointless rebuilds. Temporal policy is untouched:
+  deform refreshes re-converge through the bounded per-texel change detector,
+  no reactive burst. Async probe-scene builds now validate a monotonic scene
+  invalidation generation and the structure signature across material-map
+  extraction, catch up vertex/transform refits before install, and retry at
+  idle without losing an update that arrived while the build was yielding.
+  Deform refits also validate source index identity/version/count before any
+  writes, so connectivity edits fail closed to the structural rebuild lane.
+  Disposing or replacing a probe field now invalidates an async texture build
+  and frees its uninstalled maps before its continuation can publish resources.
+- Replaced the moving-instance TLAS rebuild/sort with an exact in-place refit
+  of the frozen build-time partition. Live transforms now rewrite stable
+  instance slots, refit leaf/interior bounds in reverse pre-order, and upload
+  only the dynamic materials tail. Instance-count/layout drift fails closed to
+  the structural rebuild lane.
+- Path tracing now retains its built scene and exposes typed transform/deform/
+  light invalidation. Topology-stable timeline updates use ranged buffer uploads and
+  reset accumulation without rebuilding MeshBVHs; untyped/structural edits keep
+  the conservative full-build behavior. Same-count light edits rewrite only the
+  packed light storage; light-count drift fails closed. Scene revisions preserve
+  edits that arrive while material extraction is yielding.
+- Included `js/gi_refit.js` in the published package whitelist.
+
 ## [0.6.6] — 2026-07-20
 
 - Made hysteresis normalization variance-bounded: the time-normalization exponent

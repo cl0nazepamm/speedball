@@ -97,7 +97,11 @@ const RAYS_PER_TICK = 98_304;       // MAX per-tick trace budget (÷ rays/probe 
                                     // union every tick; huge grids fall back to round-robin.
                                     // AUTO-THROTTLED down when the frame cadence slips (see
                                     // tick()) so the solve never drags the browser below 60.
-const RAYS_PER_TICK_MIN = 16_384;   // throttle floor (≈256 probes @64 — still 2× the old cap)
+const RAYS_PER_TICK_MIN = 2_048;    // responsiveness floor (32 probes @64). Weak GPUs must
+                                    // be allowed below the old 16k floor instead of pinning
+                                    // the viewer near 12 fps forever.
+const RAYS_PER_TICK_REST_RESUME = 4_096; // reserve frame headroom for post-interaction
+                                         // deform uploads/refits, then grow only if cadence allows.
 const MAX_PROBES_PER_TICK = 2048;   // absolute ceiling (bounds dispatch + ray scratch)
 const SURFACE_NORMAL_BIAS_CELL = 0.03; // sample 3% of a cell off the shaded wall, not half a cell
 const TRACE_SURFACE_BIAS_CELL = 0.005; // shadow/NEE ray origin bias, scaled to scene units
@@ -126,6 +130,9 @@ const LIGHT_CHECK_INTERVAL = 6;    // ticks between light-change checks
 const XFORM_CHECK_INTERVAL = 2;    // ticks between transform checks (in-place TLAS rewrite = cheap)
 const GEO_CHECK_INTERVAL = 24;     // ticks between STRUCTURE checks (topology → full rebuild = expensive)
 const GEO_SETTLE_INTERVALS = 2;    // structure must be stable this many checks before a rebuild fires (debounce)
+const DEFORM_CHECK_INTERVAL = 12;  // ticks between DEFORM checks (same-topology vertex motion → in-place
+                                   // gather+refit via built.updateDeforms, no MeshBVH, no debounce needed —
+                                   // so streamed vertex animation tracks GI without EVER arming the rebuild)
 // ── freeze-proofing: gate the synchronous BVH rebuild + GPU solve on viewport idle ──
 // The CPU MeshBVH build in rebuild() blocks the render thread, so it (and the GPU
 // solve) must NEVER land while the user is orbiting, the timeline is playing, or a
@@ -165,6 +172,20 @@ export function probeUpdateIntervalTicks(probeTotal, probesPerTick, solveEveryTi
     const cap = Math.max(1, Number(probesPerTick) || 1);
     const schedule = Math.max(1, Number(solveEveryTicks) || 1);
     return schedule * Math.max(1, total / cap);
+}
+
+// Clamp a stale high solve budget when an interaction becomes idle. This is a
+// pure helper so the post-scrub responsiveness contract stays deterministic in
+// smoke tests without requiring Three/WebGPU.
+export function probeBudgetAfterInteraction(
+    currentBudget,
+    minBudget = RAYS_PER_TICK_MIN,
+    resumeBudget = RAYS_PER_TICK_REST_RESUME,
+) {
+    const min = Math.max(1, Math.floor(Number(minBudget) || 1));
+    const resume = Math.max(min, Math.floor(Number(resumeBudget) || min));
+    const current = Math.max(min, Math.floor(Number(currentBudget) || min));
+    return Math.min(current, resume);
 }
 
 export function hysteresisExponentForInterval(updateDtMs, normalize = true) {
@@ -910,6 +931,11 @@ export function createProbeField({
     // setDivisions/setRays so those resize the grid/kernels off the cached soup (no hitch).
     let cachedBuilt = null;
     let buildDirty = true;
+    // Monotonic invalidation token for the CPU soup. A native/browser scene
+    // update can arrive while buildSpectralScene is yielding to material-map
+    // extraction; the token prevents that request from being cleared by the
+    // older build when it resumes.
+    let buildGeneration = 0;
     let manualVolumes = null; // explicit probe volumes (Probe Origin boxes); null = auto-fit scene
     // needsClassify / needsClear / probeCursor / refreshStarted / ticksSinceRot / prev*
     // are now PER-CASCADE (see makeCascade); frameCounter is SHARED (one ray-set rotation
@@ -939,6 +965,8 @@ export function createProbeField({
     let lastLightSig = null;
     let lastGeoSig = null;
     let lastXformSig = null;
+    let lastDeformSig = null;
+    let lastRefitCount = 0;   // BLASes refit by the most recent deform refresh (debug/stats)
     let geoStable = -1;       // -1 = no pending geo change; >=0 = stable-check count since a change (debounce, A1)
     let checkCounter = 0;
     let lastIdleMs = Infinity;
@@ -2222,16 +2250,84 @@ export function createProbeField({
     // (C0 = today's path exactly; C1 = fitFineBox when cascades>=2, res ~2× finer), then
     // build C0 only. Sets cascadeCountNode=1 so the fold is the single-grid shader until C1
     // comes online (stage 1). Returns false on a failed/empty build.
+    function disposeUninstalledBuild(built) {
+        built?.disposeDeformUpdates?.();
+        if (!built?.maps) return;
+        const disposedMaps = new Set();
+        for (const texture of Object.values(built.maps)) {
+            if (!texture || disposedMaps.has(texture)) continue;
+            disposedMaps.add(texture);
+            texture.dispose?.();
+        }
+    }
+
+    function retryFreshBuild(built) {
+        disposeUninstalledBuild(built);
+        dirty = true;
+        buildDirty = true;
+        rebuildBackoff = 0;
+        return 'retry';
+    }
+
     async function rebuild() {
         // Reuse the cached BVH+texture soup unless geometry actually changed. A
         // divisions/rays change (buildDirty=false) skips the synchronous MeshBVH build.
         let built = cachedBuilt;
         if (!built || buildDirty) {
             const buildSpectralScene = await ensureSceneBuilder();
+            if (disposed) return false;
+            // Capture after the lazy import: changes that land while the module
+            // loads are included in this build. Changes during the build's own
+            // async texture extraction are validated below.
+            scene.updateMatrixWorld(true);
+            const startedGeneration = buildGeneration;
+            const startedGeoSig = geoSignature();
             built = await buildSpectralScene({ THREE, scene, maxTriangles: MAX_TRIANGLES });
-            if (!built || built.error) return false;   // keep existing field; tick() arms a backoff (A7)
+            if (disposed) {
+                disposeUninstalledBuild(built);
+                return false;
+            }
+            if (buildGeneration !== startedGeneration) return retryFreshBuild(built);
+            if (!built || built.error) {
+                disposeUninstalledBuild(built);
+                return false;   // keep existing field; tick() arms a backoff (A7)
+            }
+
+            scene.updateMatrixWorld(true);
+            if (geoSignature() !== startedGeoSig) return retryFreshBuild(built);
+
+            // Vertex buffers and transforms may advance while material images
+            // are decoded. Catch the fresh build up in place before publishing
+            // it; layout drift fails closed to another idle-gated fresh build.
+            let deformResult = null;
+            let transformResult = null;
+            try {
+                deformResult = typeof built.updateDeformsAsync === 'function'
+                    ? await built.updateDeformsAsync()
+                    : built.updateDeforms?.();
+                if (disposed) {
+                    disposeUninstalledBuild(built);
+                    return false;
+                }
+                if (buildGeneration !== startedGeneration) return retryFreshBuild(built);
+                transformResult = built.updateTransforms?.();
+            } catch {
+                return retryFreshBuild(built);
+            }
+            if (!deformResult || !transformResult) return retryFreshBuild(built);
+            if (transformResult.bounds && built.bounds?.copy) built.bounds.copy(transformResult.bounds);
+
+            if (cachedBuilt && cachedBuilt !== built) cachedBuilt.disposeDeformUpdates?.();
             cachedBuilt = built;
             buildDirty = false;
+            // Establish all signature baselines from the exact scene state that
+            // was installed. The first idle checks can now detect—not silently
+            // baseline—an edit that arrives immediately after this point.
+            lastGeoSig = geoSignature();
+            lastDeformSig = deformSignature();
+            lastXformSig = xformSignature();
+            lastLightSig = lightSignature();
+            geoStable = -1;
         }
 
         const box = new THREE.Box3();
@@ -2351,8 +2447,19 @@ export function createProbeField({
         const idleMs = Number.isFinite(opts.idleMs) ? opts.idleMs : Infinity;
         const playing = opts.playing === true;
         const moving = idleMs < GI_IDLE_MS || playing;
+        const wasMoving = lastMoving;
         lastIdleMs = idleMs;
         lastMoving = moving;
+        if (!moving && wasMoving) {
+            // Scrub/playback release can expose a geometry catch-up/refit on
+            // the same first idle frames. Never resume a strict-idle field at
+            // its stale pre-interaction maximum ray budget and make those
+            // bounded CPU slices compete with a full GPU solve.
+            tickBudgetRays = probeBudgetAfterInteraction(tickBudgetRays);
+            tickDtEma = 0;
+            lastTickAt = 0;
+            budgetCooldown = Math.max(budgetCooldown, 30);
+        }
         // Default: fully idle-gated (moving → return). Continuous mode: keep the bounded GPU
         // SOLVE running while moving, but STILL hold every synchronous/compiling step — the
         // ~200ms MeshBVH rebuild, the staggered cascade build, and the per-tick scene-signature
@@ -2371,6 +2478,7 @@ export function createProbeField({
             if (rebuildBackoff > 0) return;
             inFlight = true; let ok = false;
             try { ok = await rebuild(); } finally { inFlight = false; }
+            if (ok === 'retry') return; // newer scene state stays armed; retry at the next idle tick
             if (!ok) { dirty = false; rebuildBackoff = REBUILD_BACKOFF_TICKS; return; }
             return;   // stage 0 done this tick; the solve waits for the next tick
         }
@@ -2398,13 +2506,13 @@ export function createProbeField({
                 tickDtEma = tickDtEma > 0 ? tickDtEma * 0.8 + dt * 0.2 : dt;
                 if (budgetCooldown > 0) budgetCooldown--;
                 if (tickDtEma > 18.5 && tickBudgetRays > RAYS_PER_TICK_MIN) {
-                    tickBudgetRays = Math.max(RAYS_PER_TICK_MIN, Math.floor(tickBudgetRays * 0.7));
+                    tickBudgetRays = Math.max(RAYS_PER_TICK_MIN, Math.floor(tickBudgetRays * 0.5));
                     tickDtEma = 0;        // re-measure only the budget controller at the new cap
                     budgetCooldown = 120; // hold ~2 s before growing again — a render-bound
                                           // scene that misses 60 fps at ANY budget otherwise
                                           // saw-tooths between floor and max
                 } else if (budgetCooldown === 0 && tickDtEma < 17.2 && tickBudgetRays < RAYS_PER_TICK) {
-                    tickBudgetRays = Math.min(RAYS_PER_TICK, tickBudgetRays + 2048);
+                    tickBudgetRays = Math.min(RAYS_PER_TICK, tickBudgetRays + 1024);
                 }
             } else {
                 tickDtEma = 0;
@@ -2415,9 +2523,12 @@ export function createProbeField({
 
         // reactivity: detect live edits (throttled). Transform change → in-place
         // instance/TLAS rewrite (near-instant, no rebuild). Light change → cheap
-        // in-place buffer refresh. STRUCTURE change (topology/instance set) →
-        // debounced full rebuild. These walk the scene graph (CPU), so in
-        // continuous mode they run ONLY at rest — never per orbit frame.
+        // in-place buffer refresh. DEFORM change (same-topology vertex motion,
+        // e.g. streamed skinned-mesh vertex buffers) → in-place soup gather +
+        // bounds refit (no MeshBVH — never a hitch). STRUCTURE change
+        // (topology/instance set) → debounced full rebuild. These walk the
+        // scene graph (CPU), so in continuous mode they run ONLY at rest —
+        // never per orbit frame.
         if (restOnly) {
             checkCounter++;
             if (checkCounter % XFORM_CHECK_INTERVAL === 0) {
@@ -2429,6 +2540,19 @@ export function createProbeField({
                 const ls = lightSignature();
                 if (lastLightSig !== null && ls !== lastLightSig) refreshLights();
                 lastLightSig = ls;
+            }
+            if (checkCounter % DEFORM_CHECK_INTERVAL === 0) {
+                const ds = deformSignature();
+                if (lastDeformSig !== null && ds !== lastDeformSig) {
+                    inFlight = true;
+                    try { await refreshDeforms(); } finally { inFlight = false; }
+                    if (disposed || dirty) return;
+                    // updateDeformsAsync coalesces versions that arrive while
+                    // it yields, so baseline the state it actually committed.
+                    lastDeformSig = deformSignature();
+                } else {
+                    lastDeformSig = ds;
+                }
             }
             if (checkCounter % GEO_CHECK_INTERVAL === 0) {
                 const gs = geoSignature();
@@ -2565,7 +2689,15 @@ export function createProbeField({
     // freshBuild=true (default) invalidates the cached BVH+texture soup so rebuild()
     // rebuilds it (geometry/light-count/volume change, or first build). Grid-only callers
     // (setDivisions/setRays) pass false → the cached soup is reused, no MeshBVH stall.
-    function requestRebuild(freshBuild = true) { dirty = true; rebuildBackoff = 0; if (freshBuild) buildDirty = true; }
+    function requestRebuild(freshBuild = true) {
+        dirty = true;
+        rebuildBackoff = 0;
+        if (freshBuild) {
+            cachedBuilt?.cancelDeformUpdates?.();
+            buildDirty = true;
+            buildGeneration++;
+        }
+    }
     // Set explicit probe volume(s) — e.g. synced "SPEEDBALL GI Probe Grid" helpers. Each
     // entry is a world-space THREE.Box3 (auto resolution) OR { box, res } where res is
     // a Vector3/[x,y,z] of MANUAL per-axis divisions. Pass null/empty to revert to
@@ -2596,6 +2728,17 @@ export function createProbeField({
     // ── reactivity helpers ──
     // Cheap scene signatures: a change flags a light refresh (in-place) or a full
     // BVH rebuild. Re-convergence rides the bounded per-texel change detector.
+    const structureIds = new WeakMap();
+    let nextStructureId = 1;
+    function structureId(value) {
+        if (!value || (typeof value !== 'object' && typeof value !== 'function')) return 0;
+        let id = structureIds.get(value);
+        if (id == null) {
+            id = nextStructureId++;
+            structureIds.set(value, id);
+        }
+        return id;
+    }
     function lightSignature() {
         let s = '', n = 0;
         // (B4) Scene-relative deadbands so sub-perceptual delta-sync jitter does NOT
@@ -2613,19 +2756,63 @@ export function createProbeField({
         });
         return n + ':' + s;
     }
-    // STRUCTURE signature: topology / vertex edits / instance-set identity —
+    // STRUCTURE signature: topology / connectivity / instance-set identity —
     // anything that invalidates the pooled BLAS soup and needs a full rebuild.
     // Transforms are deliberately EXCLUDED: moves ride the TLAS fast path.
+    // position.version is ALSO excluded: same-count vertex motion is a
+    // DEFORM (deformSignature → in-place gather+refit), not a rebuild — this
+    // split is what keeps a streamed vertex animation from arming the ~200 ms
+    // MeshBVH rebuild the moment the stream pauses. SkinnedMesh is skipped to
+    // mirror the BVH build (spectral_scene isTraceableMesh): GPU skinning
+    // never lands in the soup, so its churn must not schedule rebuilds.
     function geoSignature() {
         let meshes = 0, prims = 0, hash = 0;
         scene.traverseVisible((o) => {
             if (!o.isMesh && !o.isInstancedMesh) return;
+            if (o.isSkinnedMesh) return;
             const p = o.geometry?.attributes?.position; if (!p) return;
+            const idx = o.geometry.index;
             meshes++;
-            prims += o.geometry.index ? o.geometry.index.count : p.count;
-            hash = ((hash * 31) + p.count + ((p.version | 0) * 7) + ((o.count || 1) * 3)) | 0;
+            prims += idx ? idx.count : p.count;
+            const instanceCount = o.isInstancedMesh ? Math.max(0, o.count | 0) : 1;
+            hash = ((hash * 31) + structureId(o)) | 0;
+            hash = ((hash * 31) + structureId(o.geometry)) | 0;
+            // Replacing a same-sized position attribute is still a DEFORM.
+            // updateDeforms tracks both attribute identity and version, so the
+            // structure lane only needs the vertex count here.
+            hash = ((hash * 31) + p.count) | 0;
+            hash = ((hash * 31) + structureId(idx) + (idx ? ((idx.version | 0) + idx.count) : 0)) | 0;
+            hash = ((hash * 31) + instanceCount) | 0;
+            const groups = o.geometry.groups || [];
+            hash = ((hash * 31) + groups.length) | 0;
+            for (const group of groups) {
+                hash = ((hash * 31) + (group.start | 0)) | 0;
+                hash = ((hash * 31) + (group.count | 0)) | 0;
+                hash = ((hash * 31) + (group.materialIndex | 0)) | 0;
+            }
+            const mats = Array.isArray(o.material) ? o.material : [o.material];
+            hash = ((hash * 31) + mats.length) | 0;
+            for (const material of mats) hash = ((hash * 31) + structureId(material)) | 0;
         });
         return `${meshes}:${prims}:${hash}`;
+    }
+    // DEFORM signature: same-topology vertex motion (streamed vertex buffers,
+    // morph bakes, CPU skinning). A change routes to refreshDeforms() — the
+    // in-place soup gather + bounds refit — NEVER to the full rebuild.
+    function deformSignature() {
+        let h = 0;
+        scene.traverseVisible((o) => {
+            if (!o.isMesh && !o.isInstancedMesh) return;
+            if (o.isSkinnedMesh) return;
+            const g = o.geometry, p = g?.attributes?.position; if (!p) return;
+            const n = g.attributes.normal;
+            h = ((h * 31) + structureId(p)) | 0;
+            h = ((h * 31) + structureId(n)) | 0;
+            h = ((h * 31) + ((p.version | 0) * 7) + (n ? ((n.version | 0) * 13) : 5)) | 0;
+            if (p.isInterleavedBufferAttribute) h = ((h * 31) + ((p.data?.version | 0) * 17)) | 0;
+            if (n?.isInterleavedBufferAttribute) h = ((h * 31) + ((n.data?.version | 0) * 19)) | 0;
+        });
+        return h;
     }
     // TRANSFORM signature: quantized affine matrixWorld (rotation/scale at 1e-3,
     // translation deadbanded to ~¼ cell so sub-perceptual sync jitter does not
@@ -2635,6 +2822,7 @@ export function createProbeField({
         let h = 0;
         scene.traverseVisible((o) => {
             if (!o.isMesh && !o.isInstancedMesh) return;
+            if (o.isSkinnedMesh) return; // not in the soup (see geoSignature) → must not churn the TLAS
             if (!o.geometry?.attributes?.position) return;
             const e = o.matrixWorld?.elements;
             if (e) {
@@ -2658,10 +2846,67 @@ export function createProbeField({
         let res = null;
         try { res = built.updateTransforms(); } catch { res = null; }
         if (!res) { requestRebuild(); return; }
+        if (res.bounds && built.bounds?.copy) built.bounds.copy(res.bounds);
+        const matStart = built.instBase | 0;
+        const matCount = Math.max(0, (built.tlasBase | 0)
+            + ((built.tlasNodeCount | 0) * (built.strides?.TLAS_STRIDE_F32 || 12)) - matStart);
         for (const C of casc) {
             const g = C.gpu; if (!g) continue;
-            g.buffers.materials.needsUpdate = true;
+            markStorageDirty(g.buffers.materials, matCount > 0 ? [[matStart, matCount]] : null);
         }
+    }
+    // Deforming-object fast path: re-gather the deformed BLAS vertex slices +
+    // refit their node bounds in place (spectral_scene updateDeforms — no
+    // MeshBVH, no allocation, no recompile), then re-upload ONLY the touched
+    // slices of vertexData/bvhNodes plus the instance/TLAS tail. Probes
+    // re-trace the deformed geometry on the next solve pass and re-converge
+    // through the bounded per-texel change detector — the temporal policy
+    // stays CONSTANT (no reactive burst). A null result means the vertex
+    // count/layout changed under us → the soup is invalid → full rebuild.
+    async function refreshDeforms() {
+        const built = cachedBuilt;
+        if ((!built?.updateDeformsAsync && !built?.updateDeforms) || !casc[0].gpu) return false;
+        let res = null;
+        try {
+            res = typeof built.updateDeformsAsync === 'function'
+                ? await built.updateDeformsAsync()
+                : built.updateDeforms();
+        } catch { res = null; }
+        if (disposed || cachedBuilt !== built) return false;
+        if (!res) { requestRebuild(); return false; }
+        if (res.bounds && built.bounds?.copy) built.bounds.copy(res.bounds);
+        lastRefitCount = res.refitted;
+        const updated = (res.updated ?? res.refitted) | 0;
+        if (!updated) return true; // version churn outside the traced set — nothing to upload
+        const matStart = built.instBase | 0;
+        const matCount = Math.max(0, (built.tlasBase | 0)
+            + ((built.tlasNodeCount | 0) * (built.strides?.TLAS_STRIDE_F32 || 12)) - matStart);
+        for (const C of casc) {
+            const g = C.gpu; if (!g) continue;
+            markStorageDirty(g.buffers.vertexData, res.vertRanges);
+            if (res.refitted) {
+                markStorageDirty(g.buffers.bvhNodes, res.nodeRanges);
+                markStorageDirty(g.buffers.materials, matCount > 0 ? [[matStart, matCount]] : null);
+            }
+        }
+        return true;
+    }
+    // needsUpdate re-uploads the WHOLE storage buffer; updateRanges (when the
+    // three build supports them) bound the copy to the deformed slices. Keep
+    // every disjoint range queued before the renderer consumes this version;
+    // an explicit full upload clears the ranged list.
+    function markStorageDirty(attr, ranges) {
+        if (!attr) return;
+        if (typeof attr.addUpdateRange === 'function' && typeof attr.clearUpdateRanges === 'function') {
+            if (Array.isArray(ranges) && ranges.length > 0) {
+                // Preserve disjoint ranges queued by earlier edits until the
+                // renderer consumes this attribute version and clears them.
+                for (const [start, count] of ranges) attr.addUpdateRange(start, count);
+            } else {
+                attr.clearUpdateRanges();
+            }
+        }
+        attr.needsUpdate = true;
     }
     // re-collect lights into EACH cascade's light buffer (no BVH rebuild). Count change →
     // full rebuild. Both cascades bind their own copy of the light soup, so update both.
@@ -2795,7 +3040,18 @@ export function createProbeField({
         };
     }
 
-    function dispose() { disposed = true; disposeGPU(); cachedBuilt = null; buildDirty = true; node.setEnabled(false); }
+    function dispose() {
+        disposed = true;
+        // Invalidates any build currently awaiting material texture extraction.
+        // Its continuation observes disposed before publishing cachedBuilt or
+        // allocating cascade resources and disposes its uninstalled maps.
+        buildGeneration++;
+        cachedBuilt?.disposeDeformUpdates?.();
+        disposeGPU();
+        cachedBuilt = null;
+        buildDirty = true;
+        node.setEnabled(false);
+    }
 
     return {
         node,
@@ -2966,6 +3222,7 @@ export function createProbeField({
             budgetCooldown,
             checkCounter,
             geoStable,
+            lastRefitCount,
             solveList: lastSolveList,
             updatedCount: lastUpdatedCount,
             cascades: cascades,

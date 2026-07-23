@@ -6,7 +6,11 @@
 // world-AABBs packed into the tail of the materials buffer. Materials are
 // deduped into a flat uber table. Moving objects ride
 // built.updateTransforms() — an in-place instance/TLAS rewrite that needs no
-// soup rewrite, no MeshBVH rebuild, and no shader recompile.
+// soup rewrite, no MeshBVH rebuild, and no shader recompile. DEFORMING
+// objects (streamed vertex buffers, morphs, CPU skinning — same topology)
+// ride built.updateDeforms() — re-gather the deformed BLAS's pooled vertex
+// slice + in-place bounds refit (gi_refit.js) + the same TLAS rewrite, so a
+// vertex-animated mesh never forces the synchronous MeshBVH rebuild.
 //
 // Output is plain typed arrays + counts; spectral_kernel turns them into
 // StorageBufferAttributes. Nothing here touches the GPU.
@@ -19,6 +23,12 @@
 // buildMaterialTextures below.
 
 import { MeshBVH } from 'three-mesh-bvh';
+import {
+    createFlatBlasRefitStepper,
+    refitFlatBlasRange,
+    refitFlatTlasRange,
+    runLatestBudgetedTask,
+} from './gi_refit.js';
 
 const NODE_STRIDE_U32 = 8;     // bvhNodes: 6 aabb floats + miss + payload
 // materials stride (floats). Layout:
@@ -40,6 +50,13 @@ const VERTEX_DATA_STRIDE = 8;   // GPU interleaved per-vertex: pos(3) + normal(3
 const BYTES_PER_BVH_NODE = 32;  // three-mesh-bvh BYTES_PER_NODE (8 x u32)
 const TEXTURE_ATLAS_SIZE = 256; // every material map is resampled to this square size and stacked into a DataArrayTexture layer
 const SKIP_TRIANGLE_MATERIAL = 0xFFFFFFFF;
+// Keep only genuinely tiny edits synchronous. A few thousand gathered/refit
+// items stay below one frame slice even on slower hosts; anything larger
+// enters the budgeted lane before it can turn into a scrub hitch.
+const ASYNC_DEFORM_WORK_THRESHOLD = 4096;
+// Target 2 ms internally so clock batching, JIT/GC jitter, and the task handoff
+// still fit under the public 3 ms main-thread slice ceiling in real scenes.
+const ASYNC_DEFORM_MAX_BUDGET_MS = 2;
 
 const SKY_NAMES = new Set(['__maxjs_sky__']);
 
@@ -593,6 +610,10 @@ function buildLocalBlas(THREE, d) {
     const vertexUV = new Float32Array(totalV * 2);
     const vertexMaterial = new Uint32Array(totalV);
     const triIndex = new Uint32Array(d.visibleTriCount * 3);
+    // tag vertex t duplicates SOURCE vertex tagSrc[t] (the triangle's first
+    // index) — kept so updateDeforms can re-copy the duplicates after a
+    // deform gather. 0xFFFFFFFF = skipped triangle (never referenced).
+    const tagSrc = d.uniqueTriMaterial ? new Uint32Array(d.visibleTriCount).fill(0xFFFFFFFF) : null;
     for (let i = 0; i < vCount; i++) {
         const o = i * VERT_STRIDE;
         vertexPos[o] = pos.getX(i); vertexPos[o + 1] = pos.getY(i); vertexPos[o + 2] = pos.getZ(i);
@@ -610,6 +631,7 @@ function buildLocalBlas(THREE, d) {
         const sourceTri = d.visibleTriIndices ? d.visibleTriIndices[t] : t;
         if (sourceTri < 0 || sourceTri >= d.triCount) continue;
         const sourceA = index ? index.getX(sourceTri * 3) : sourceTri * 3;
+        if (tagSrc) tagSrc[t] = sourceA;
         const a = d.uniqueTriMaterial ? tagBase + t : sourceA;
         const b = index ? index.getX(sourceTri * 3 + 1) : sourceTri * 3 + 1;
         const c = index ? index.getX(sourceTri * 3 + 2) : sourceTri * 3 + 2;
@@ -642,12 +664,12 @@ function buildLocalBlas(THREE, d) {
     // the material rides the triangle's first vertex through the permutation).
     const triMaterial = new Uint32Array(d.visibleTriCount);
     for (let t = 0; t < d.visibleTriCount; t++) triMaterial[t] = vertexMaterial[triIndex[t * 3]] >>> 0;
-    return { vertexPos, vertexNormal, vertexUV, triIndex, triMaterial, records, localBounds, vertCount: totalV, triCount: d.visibleTriCount };
+    return { vertexPos, vertexNormal, vertexUV, triIndex, triMaterial, records, localBounds, vertCount: totalV, triCount: d.visibleTriCount, srcVertCount: vCount, tagSrc };
 }
 
 // Threaded TLAS over instance world-AABBs. Median split by index midpoint on
-// the longest axis, so the node COUNT is a pure function of the instance
-// count — updateTransforms can rebuild the whole TLAS into the same slots.
+// the longest axis. The initial partition and `order` are frozen after build;
+// live transforms only rewrite instance rows and refit exact bounds bottom-up.
 // Leaves reference PERMUTED instance slots [off, off+cnt); `order` maps
 // slot → source instance index.
 function buildTlasRecords(aabbs, leafSize = 2) {
@@ -739,6 +761,20 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
                 uv: geom.attributes.uv || null,
             });
             if (!blas) return;
+            // Deform tracking: soup vertices [0, srcVertCount) map 1:1 onto the
+            // source geometry's vertices, so updateDeforms can re-gather this
+            // BLAS's pooled slice straight from the live attributes.
+            blas.srcGeom = geom;
+            blas.srcPosAttr = pos;
+            blas.srcNormAttr = geom.attributes.normal || null;
+            blas.srcIndexAttr = index || null;
+            blas.srcPosVersion = pos.version | 0;
+            blas.srcNormVersion = geom.attributes.normal ? (geom.attributes.normal.version | 0) : -1;
+            blas.srcIndexVersion = index ? (index.version | 0) : -1;
+            blas.srcPosDataVersion = attributeDataVersion(pos);
+            blas.srcNormDataVersion = attributeDataVersion(geom.attributes.normal || null);
+            blas.srcIndexDataVersion = attributeDataVersion(index || null);
+            blas.srcIndexCount = index ? index.count : -1;
             blasIdx = blasList.length;
             blasList.push(blas);
             blasByKey.set(key, blasIdx);
@@ -754,6 +790,15 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
 
     if (blasList.length === 0 || instances.length === 0) return null;
     const instCount = instances.length;
+    // Stable object list for live transform refreshes. Build it once so the
+    // timeline lane does not allocate/dedupe a Set on every update.
+    const instanceObjects = Array.from(new Set(instances.map((ins) => ins.object)));
+    const instanceObjectCounts = instanceObjects.map((object) => ({
+        object,
+        count: object.isInstancedMesh
+            ? Math.max(0, Math.min(object.count | 0, (object.instanceMatrix?.count ?? object.count) | 0))
+            : 1,
+    }));
     if (instCount >= (1 << 24)) return { error: `too many instances for the TLAS leaf payload: ${instCount}` };
 
     // Pool assembly: place every BLAS at its base offsets, then serialize
@@ -869,6 +914,9 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     const tlasBase = instBase + instCount * MAT_STRIDE;
     const tlasNodeCount = dyn0.records.length;
     const materials = new Float32Array(tlasBase + tlasNodeCount * TLAS_STRIDE_F32);
+    const tlasNodes = materials.subarray(tlasBase, tlasBase + tlasNodeCount * TLAS_STRIDE_F32);
+    const liveInstanceBounds = new Float32Array(instCount * 6);
+    const tlasOrder = dyn0.order;
     for (let i = 0; i < uberList.length; i++) materials.set(uberList[i], i * MAT_STRIDE);
 
     function writeDynamic(dyn) {
@@ -896,26 +944,472 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     }
     writeDynamic(dyn0);
 
-    // Moving-object fast path: re-read live matrixWorlds, rewrite the dynamic
-    // tail in place. Returns { bounds } or null when the TLAS no longer fits
-    // (instance count changed under us → caller should full-rebuild).
-    function updateTransforms() {
-        const seen = new Set();
-        for (const ins of instances) {
-            if (seen.has(ins.object)) continue;
-            seen.add(ins.object);
-            ins.object.updateWorldMatrix?.(true, false);
+    // Moving-object fast path: re-read live matrixWorlds, rewrite the stable
+    // instance slots, then refit the build-time TLAS partition bottom-up.
+    // No per-update arrays, median sort, node objects, or topology rewrite.
+    // A wildly rearranged scene can make the frozen partition less efficient
+    // to traverse, but its exact refit bounds stay correct. Returns null only
+    // if the stored threaded layout is invalid (caller should full-rebuild).
+    function updateTransforms({ rewriteInstanceRows = true } = {}) {
+        for (const entry of instanceObjectCounts) {
+            const { object } = entry;
+            const count = object.isInstancedMesh
+                ? Math.max(0, Math.min(object.count | 0, (object.instanceMatrix?.count ?? object.count) | 0))
+                : 1;
+            if (count !== entry.count) return null;
         }
-        const dyn = computeDynamic();
-        if (dyn.records.length !== tlasNodeCount) return null;
-        writeDynamic(dyn);
-        return { bounds: dyn.worldBounds.clone() };
+        for (const object of instanceObjects) object.updateWorldMatrix?.(true, false);
+        for (let slot = 0; slot < instCount; slot++) {
+            const src = tlasOrder[slot];
+            const ins = instances[src];
+            instanceWorldMatrix(ins, _m4);
+            if (rewriteInstanceRows) {
+                const detSign = _m4.determinant() < 0 ? -1 : 1;
+                _inv.copy(_m4).invert();
+                const e = _inv.elements;
+                const b = instBase + slot * MAT_STRIDE;
+                materials[b] = e[0]; materials[b + 1] = e[4]; materials[b + 2] = e[8]; materials[b + 3] = e[12];
+                materials[b + 4] = e[1]; materials[b + 5] = e[5]; materials[b + 6] = e[9]; materials[b + 7] = e[13];
+                materials[b + 8] = e[2]; materials[b + 9] = e[6]; materials[b + 10] = e[10]; materials[b + 11] = e[14];
+                materials[b + 14] = detSign;
+            }
+            _box.copy(blasList[ins.blas].localBounds).applyMatrix4(_m4);
+            const bb = slot * 6;
+            liveInstanceBounds[bb] = _box.min.x;
+            liveInstanceBounds[bb + 1] = _box.min.y;
+            liveInstanceBounds[bb + 2] = _box.min.z;
+            liveInstanceBounds[bb + 3] = _box.max.x;
+            liveInstanceBounds[bb + 4] = _box.max.y;
+            liveInstanceBounds[bb + 5] = _box.max.z;
+        }
+        if (!refitFlatTlasRange({ nodes: tlasNodes, instanceBounds: liveInstanceBounds, end: tlasNodeCount })) return null;
+        const bounds = new THREE.Box3();
+        bounds.min.set(tlasNodes[0], tlasNodes[1], tlasNodes[2]);
+        bounds.max.set(tlasNodes[3], tlasNodes[4], tlasNodes[5]);
+        return { bounds };
+    }
+
+    let asyncDeformRequestSerial = 0;
+    let asyncDeformLifecycle = 0;
+    let asyncDeformDisposed = false;
+    let asyncDeformLatestOptions = null;
+    let asyncDeformPump = null;
+    let asyncDeformPumpLifecycle = -1;
+
+    function attributeArrayIdentity(attr) {
+        return attr?.isInterleavedBufferAttribute ? attr.data?.array : attr?.array;
+    }
+
+    function attributeDataVersion(attr) {
+        return attr?.isInterleavedBufferAttribute ? (attr.data?.version | 0) : -1;
+    }
+
+    function directFloatVec3(attr) {
+        if (!attr || attr.normalized === true) return null;
+        if (attr.isInterleavedBufferAttribute) {
+            const array = attr.data?.array;
+            const stride = attr.data?.stride | 0;
+            const offset = attr.offset | 0;
+            if (array instanceof Float32Array && stride >= offset + 3) {
+                return { array, stride, offset };
+            }
+            return null;
+        }
+        if (attr.array instanceof Float32Array && (attr.itemSize | 0) >= 3) {
+            return { array: attr.array, stride: attr.itemSize | 0, offset: 0 };
+        }
+        return null;
+    }
+
+    function stampAttribute(attr) {
+        return {
+            attr: attr || null,
+            count: attr ? attr.count : -1,
+            version: attr ? (attr.version | 0) : -1,
+            dataVersion: attributeDataVersion(attr),
+            array: attributeArrayIdentity(attr),
+            direct: directFloatVec3(attr),
+        };
+    }
+
+    function attributeMatches(attr, stamp) {
+        const current = attr || null;
+        return current === stamp.attr
+            && (current ? current.count : -1) === stamp.count
+            && (current ? (current.version | 0) : -1) === stamp.version
+            && attributeDataVersion(current) === stamp.dataVersion
+            && attributeArrayIdentity(current) === stamp.array;
+    }
+
+    function captureDeformSnapshot(requestSerial, lifecycle, options) {
+        const records = [];
+        let work = 0;
+        for (const b of blasList) {
+            const geom = b.srcGeom;
+            const posA = geom?.attributes?.position || null;
+            if (!posA) return { invalid: true };
+            const normA = geom.attributes.normal || null;
+            const indexA = geom.index || null;
+            const indexVersion = indexA ? (indexA.version | 0) : -1;
+            const indexDataVersion = attributeDataVersion(indexA);
+            const indexCount = indexA ? indexA.count : -1;
+            // Connectivity is structural. Reject the entire snapshot before
+            // touching pooled arrays so no partially updated soup is exposed.
+            if (indexA !== b.srcIndexAttr || indexVersion !== b.srcIndexVersion ||
+                indexDataVersion !== b.srcIndexDataVersion ||
+                indexCount !== b.srcIndexCount || posA.count !== b.srcVertCount ||
+                (normA && normA.count !== b.srcVertCount)) {
+                return { invalid: true };
+            }
+            const pos = stampAttribute(posA);
+            const norm = stampAttribute(normA);
+            const index = stampAttribute(indexA);
+            const posChanged = posA !== b.srcPosAttr || pos.version !== b.srcPosVersion ||
+                pos.dataVersion !== b.srcPosDataVersion;
+            const normChanged = normA !== b.srcNormAttr || norm.version !== b.srcNormVersion ||
+                norm.dataVersion !== b.srcNormDataVersion;
+            const changed = posChanged || normChanged;
+            const rec = { b, geom, pos, norm, index, posChanged, normChanged, changed };
+            records.push(rec);
+            if (changed) {
+                work += b.srcVertCount + (b.tagSrc?.length || 0);
+                if (posChanged) work += b.blasEnd - b.blasRoot;
+            }
+        }
+        return { requestSerial, lifecycle, options, records, work, invalid: false };
+    }
+
+    function validateDeformSnapshot(snapshot) {
+        if (!snapshot || snapshot.invalid || asyncDeformDisposed ||
+            snapshot.lifecycle !== asyncDeformLifecycle ||
+            snapshot.requestSerial !== asyncDeformRequestSerial) return false;
+        for (const rec of snapshot.records) {
+            const geom = rec.b.srcGeom;
+            if (geom !== rec.geom ||
+                !attributeMatches(geom?.attributes?.position, rec.pos) ||
+                !attributeMatches(geom?.attributes?.normal || null, rec.norm) ||
+                !attributeMatches(geom?.index || null, rec.index)) return false;
+        }
+        return true;
+    }
+
+    function createAsyncDeformTask(snapshot) {
+        const changed = snapshot.records.filter((rec) => rec.changed);
+        const task = {
+            changed,
+            recordIndex: 0,
+            phase: 'gather',
+            sourceIndex: 0,
+            tagIndex: 0,
+            refit: null,
+            done: changed.length === 0,
+        };
+        const copySourceRange = (rec, begin, end) => {
+            const b = rec.b;
+            const posDirect = rec.pos.direct;
+            const normDirect = rec.norm.direct;
+            for (let i = begin; i < end; i++) {
+                const dd = (b.vertBase + i) * VERTEX_DATA_STRIDE;
+                if (rec.posChanged) {
+                    if (posDirect) {
+                        const s = posDirect.offset + i * posDirect.stride;
+                        vertexData[dd] = posDirect.array[s];
+                        vertexData[dd + 1] = posDirect.array[s + 1];
+                        vertexData[dd + 2] = posDirect.array[s + 2];
+                    } else {
+                        vertexData[dd] = rec.pos.attr.getX(i);
+                        vertexData[dd + 1] = rec.pos.attr.getY(i);
+                        vertexData[dd + 2] = rec.pos.attr.getZ(i);
+                    }
+                }
+                if (rec.normChanged && rec.norm.attr) {
+                    if (normDirect) {
+                        const s = normDirect.offset + i * normDirect.stride;
+                        vertexData[dd + 3] = normDirect.array[s];
+                        vertexData[dd + 4] = normDirect.array[s + 1];
+                        vertexData[dd + 5] = normDirect.array[s + 2];
+                    } else {
+                        vertexData[dd + 3] = rec.norm.attr.getX(i);
+                        vertexData[dd + 4] = rec.norm.attr.getY(i);
+                        vertexData[dd + 5] = rec.norm.attr.getZ(i);
+                    }
+                }
+            }
+        };
+        task.step = ({ deadline, now }) => {
+            while (task.recordIndex < changed.length) {
+                const rec = changed[task.recordIndex];
+                const b = rec.b;
+                if (task.phase === 'gather') {
+                    const end = Math.min(b.srcVertCount, task.sourceIndex + 256);
+                    copySourceRange(rec, task.sourceIndex, end);
+                    task.sourceIndex = end;
+                    if (task.sourceIndex < b.srcVertCount) {
+                        if (now() >= deadline) return true;
+                        continue;
+                    }
+                    task.phase = 'tags';
+                }
+                if (task.phase === 'tags') {
+                    const tags = b.tagSrc;
+                    if (tags) {
+                        const end = Math.min(tags.length, task.tagIndex + 256);
+                        const tagBase = b.vertBase + b.srcVertCount;
+                        for (let t = task.tagIndex; t < end; t++) {
+                            const s = tags[t];
+                            if (s === 0xFFFFFFFF) continue;
+                            if (s >= b.srcVertCount) return false;
+                            const dd = (tagBase + t) * VERTEX_DATA_STRIDE;
+                            const ds = (b.vertBase + s) * VERTEX_DATA_STRIDE;
+                            vertexData[dd] = vertexData[ds];
+                            vertexData[dd + 1] = vertexData[ds + 1];
+                            vertexData[dd + 2] = vertexData[ds + 2];
+                            vertexData[dd + 3] = vertexData[ds + 3];
+                            vertexData[dd + 4] = vertexData[ds + 4];
+                            vertexData[dd + 5] = vertexData[ds + 5];
+                        }
+                        task.tagIndex = end;
+                        if (task.tagIndex < tags.length) {
+                            if (now() >= deadline) return true;
+                            continue;
+                        }
+                    }
+                    task.phase = rec.posChanged ? 'refit' : 'next';
+                }
+                if (task.phase === 'refit') {
+                    task.refit ||= createFlatBlasRefitStepper({
+                        nodesF, nodesU, triIndex, vertexData,
+                        root: b.blasRoot, end: b.blasEnd,
+                        nodeStrideU32: NODE_STRIDE_U32,
+                        vertexDataStride: VERTEX_DATA_STRIDE,
+                    });
+                    if (!task.refit.valid || task.refit.step({ deadline, now }) === false) return false;
+                    if (!task.refit.done) return true;
+                    task.phase = 'next';
+                }
+                if (task.phase === 'next') {
+                    task.recordIndex++;
+                    task.phase = 'gather';
+                    task.sourceIndex = 0;
+                    task.tagIndex = 0;
+                    task.refit = null;
+                    if (task.recordIndex < changed.length && now() >= deadline) return true;
+                }
+            }
+            task.done = true;
+            return true;
+        };
+        return task;
+    }
+
+    function commitAsyncDeform(snapshot, task) {
+        if (!validateDeformSnapshot(snapshot)) return { restart: true };
+        const vertRanges = [], nodeRanges = [];
+        let refitted = 0;
+        for (const rec of task.changed) {
+            const b = rec.b;
+            b.srcPosAttr = rec.pos.attr;
+            b.srcNormAttr = rec.norm.attr;
+            b.srcPosVersion = rec.pos.version;
+            b.srcNormVersion = rec.norm.version;
+            b.srcPosDataVersion = rec.pos.dataVersion;
+            b.srcNormDataVersion = rec.norm.dataVersion;
+            vertRanges.push([b.vertBase * VERTEX_DATA_STRIDE, b.vertCount * VERTEX_DATA_STRIDE]);
+            if (rec.posChanged) {
+                const rb = b.blasRoot * NODE_STRIDE_U32;
+                b.localBounds.min.set(nodesF[rb], nodesF[rb + 1], nodesF[rb + 2]);
+                b.localBounds.max.set(nodesF[rb + 3], nodesF[rb + 4], nodesF[rb + 5]);
+                nodeRanges.push([b.blasRoot * NODE_STRIDE_U32, (b.blasEnd - b.blasRoot) * NODE_STRIDE_U32]);
+                refitted++;
+            }
+        }
+        if (task.changed.length === 0) {
+            return { updated: 0, refitted: 0, bounds: null, vertRanges, nodeRanges };
+        }
+        if (refitted === 0 || snapshot.options.updateTlas === false) {
+            return { updated: task.changed.length, refitted, bounds: null, vertRanges, nodeRanges };
+        }
+        const res = updateTransforms({ rewriteInstanceRows: false });
+        if (!res) return null;
+        return { updated: task.changed.length, refitted, bounds: res.bounds, vertRanges, nodeRanges };
+    }
+
+    // Deform fast path: SAME topology, moved vertices (streamed vertex
+    // buffers, morphs, CPU skinning). Small edits retain the synchronous API;
+    // large edits use updateDeformsAsync below so the UI never pays one
+    // unbounded gather/refit task.
+    function updateDeforms({ updateTlas = true } = {}) {
+        if (asyncDeformPump) {
+            // A direct synchronous caller owns the buffers now. Invalidate the
+            // yielded job; this complete pass overwrites every uncommitted
+            // changed slice before publishing its ranges.
+            asyncDeformLifecycle++;
+            asyncDeformRequestSerial++;
+        }
+        let updated = 0;
+        let refitted = 0;
+        const vertRanges = [], nodeRanges = [];
+        for (const b of blasList) {
+            const geom = b.srcGeom;
+            const posA = geom?.attributes?.position;
+            if (!posA) return null;
+            const normA = geom.attributes.normal || null;
+            const indexA = geom.index || null;
+            const pv = posA.version | 0;
+            const nv = normA ? (normA.version | 0) : -1;
+            const iv = indexA ? (indexA.version | 0) : -1;
+            const pdv = attributeDataVersion(posA);
+            const ndv = attributeDataVersion(normA);
+            const idv = attributeDataVersion(indexA);
+            // Connectivity is structural, never a deformation. Fail before
+            // touching the pooled vertices so an index edit cannot refit the
+            // old triangle soup during the structural debounce window.
+            if (indexA !== b.srcIndexAttr || iv !== b.srcIndexVersion ||
+                idv !== b.srcIndexDataVersion ||
+                (indexA ? indexA.count : -1) !== b.srcIndexCount) return null;
+            const posChanged = posA !== b.srcPosAttr ||
+                pv !== b.srcPosVersion || pdv !== b.srcPosDataVersion;
+            const normChanged = normA !== b.srcNormAttr ||
+                nv !== b.srcNormVersion || ndv !== b.srcNormDataVersion;
+            if (!posChanged && !normChanged) continue;
+            if (posA.count !== b.srcVertCount || (normA && normA.count !== b.srcVertCount)) return null;
+            for (let i = 0; i < b.srcVertCount; i++) {
+                const dd = (b.vertBase + i) * VERTEX_DATA_STRIDE;
+                if (posChanged) {
+                    vertexData[dd] = posA.getX(i);
+                    vertexData[dd + 1] = posA.getY(i);
+                    vertexData[dd + 2] = posA.getZ(i);
+                }
+                if (normChanged && normA) {
+                    vertexData[dd + 3] = normA.getX(i);
+                    vertexData[dd + 4] = normA.getY(i);
+                    vertexData[dd + 5] = normA.getZ(i);
+                }
+                // normal attribute gone since build → keep the build-time
+                // normals (stale beats zero/flat for a low-frequency field)
+            }
+            if (b.tagSrc) {
+                const tagBase = b.vertBase + b.srcVertCount;
+                for (let t = 0; t < b.tagSrc.length; t++) {
+                    const s = b.tagSrc[t];
+                    if (s === 0xFFFFFFFF) continue;
+                    const dd = (tagBase + t) * VERTEX_DATA_STRIDE, ds = (b.vertBase + s) * VERTEX_DATA_STRIDE;
+                    if (posChanged) {
+                        vertexData[dd] = vertexData[ds];
+                        vertexData[dd + 1] = vertexData[ds + 1];
+                        vertexData[dd + 2] = vertexData[ds + 2];
+                    }
+                    if (normChanged) {
+                        vertexData[dd + 3] = vertexData[ds + 3];
+                        vertexData[dd + 4] = vertexData[ds + 4];
+                        vertexData[dd + 5] = vertexData[ds + 5];
+                    }
+                }
+            }
+            if (posChanged && !refitFlatBlasRange({
+                    nodesF, nodesU, triIndex, vertexData,
+                    root: b.blasRoot, end: b.blasEnd,
+                    nodeStrideU32: NODE_STRIDE_U32, vertexDataStride: VERTEX_DATA_STRIDE,
+                })) return null;
+            b.srcPosAttr = posA;
+            b.srcNormAttr = normA;
+            b.srcPosVersion = pv;
+            b.srcNormVersion = nv;
+            b.srcPosDataVersion = pdv;
+            b.srcNormDataVersion = ndv;
+            vertRanges.push([b.vertBase * VERTEX_DATA_STRIDE, b.vertCount * VERTEX_DATA_STRIDE]);
+            updated++;
+            if (posChanged) {
+                const rb = b.blasRoot * NODE_STRIDE_U32;
+                b.localBounds.min.set(nodesF[rb], nodesF[rb + 1], nodesF[rb + 2]);
+                b.localBounds.max.set(nodesF[rb + 3], nodesF[rb + 4], nodesF[rb + 5]);
+                nodeRanges.push([b.blasRoot * NODE_STRIDE_U32, (b.blasEnd - b.blasRoot) * NODE_STRIDE_U32]);
+                refitted++;
+            }
+        }
+        if (updated === 0) return { updated: 0, refitted: 0, bounds: null, vertRanges, nodeRanges };
+        if (refitted === 0 || !updateTlas) {
+            return { updated, refitted, bounds: null, vertRanges, nodeRanges };
+        }
+        const res = updateTransforms({ rewriteInstanceRows: false }); // TLAS bounds from the refit local bounds
+        if (!res) return null;
+        return { updated, refitted, bounds: res.bounds, vertRanges, nodeRanges };
+    }
+
+    function updateDeformsAsync(options = {}) {
+        if (asyncDeformDisposed) return Promise.resolve(null);
+        asyncDeformRequestSerial++;
+        asyncDeformLatestOptions = {
+            updateTlas: options.updateTlas !== false,
+            budgetMs: Math.min(ASYNC_DEFORM_MAX_BUDGET_MS,
+                Math.max(0.25, Number.isFinite(options.budgetMs) ? options.budgetMs : ASYNC_DEFORM_MAX_BUDGET_MS)),
+            workThreshold: Math.max(0, Number.isFinite(options.workThreshold)
+                ? options.workThreshold : ASYNC_DEFORM_WORK_THRESHOLD),
+            now: typeof options.now === 'function' ? options.now : undefined,
+            yieldTask: typeof options.yieldTask === 'function' ? options.yieldTask : undefined,
+        };
+        if (asyncDeformPump && asyncDeformPumpLifecycle === asyncDeformLifecycle) {
+            return asyncDeformPump;
+        }
+
+        const preview = captureDeformSnapshot(
+            asyncDeformRequestSerial, asyncDeformLifecycle, asyncDeformLatestOptions);
+        if (preview.invalid) return Promise.resolve(null);
+        if (preview.work <= asyncDeformLatestOptions.workThreshold) {
+            return Promise.resolve(updateDeforms({ updateTlas: asyncDeformLatestOptions.updateTlas }));
+        }
+
+        const pumpLifecycle = asyncDeformLifecycle;
+        const running = runLatestBudgetedTask({
+            capture: () => captureDeformSnapshot(
+                asyncDeformRequestSerial, asyncDeformLifecycle, asyncDeformLatestOptions),
+            createTask: createAsyncDeformTask,
+            validate: validateDeformSnapshot,
+            commit: commitAsyncDeform,
+            isCancelled: () => asyncDeformDisposed || asyncDeformLifecycle !== pumpLifecycle,
+            budgetMs: asyncDeformLatestOptions.budgetMs,
+            now: asyncDeformLatestOptions.now,
+            yieldTask: asyncDeformLatestOptions.yieldTask,
+        });
+        let wrapped = null;
+        wrapped = running.finally(() => {
+            if (asyncDeformPump === wrapped) {
+                asyncDeformPump = null;
+                asyncDeformPumpLifecycle = -1;
+            }
+        });
+        asyncDeformPump = wrapped;
+        asyncDeformPumpLifecycle = pumpLifecycle;
+        return wrapped;
+    }
+
+    function cancelDeformUpdates() {
+        asyncDeformLifecycle++;
+        asyncDeformRequestSerial++;
+    }
+
+    function disposeDeformUpdates() {
+        asyncDeformDisposed = true;
+        cancelDeformUpdates();
     }
 
     // Lights
     const lightRecords = collectLights(THREE, scene, camera);
     const lights = new Float32Array(Math.max(1, lightRecords.length) * LIGHT_STRIDE);
     for (let i = 0; i < lightRecords.length; i++) lights.set(lightRecords[i], i * LIGHT_STRIDE);
+
+    // Same-layout light fast path. Light motion/color/intensity does not touch
+    // either BVH; rewrite the retained packed buffer in place. A count change
+    // changes storage layout and therefore fails closed to a full scene build.
+    function updateLights() {
+        const nextRecords = collectLights(THREE, scene, camera);
+        if (nextRecords.length !== lightRecords.length) return null;
+        lights.fill(0);
+        for (let i = 0; i < nextRecords.length; i++) {
+            lights.set(nextRecords[i], i * LIGHT_STRIDE);
+        }
+        return { lightCount: nextRecords.length };
+    }
 
     // Environment (equirect)
     const env = scene.userData?.maxjsPathTraceEnvironment?.isTexture
@@ -932,10 +1426,15 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         materials, materialCount: uberList.length,
         instBase, instCount, tlasBase, tlasNodeCount,
         updateTransforms,
+        updateDeforms,
+        updateDeformsAsync,
+        cancelDeformUpdates,
+        disposeDeformUpdates,
+        updateLights,
         lights, lightCount: lightRecords.length,
         env,
         maps, // { albedo, normal, roughness, metalness, emissive, alpha } DataArrayTexture | null
-        strides: { NODE_STRIDE_U32, MAT_STRIDE, LIGHT_STRIDE, VERT_STRIDE, VERTEX_DATA_STRIDE },
+        strides: { NODE_STRIDE_U32, MAT_STRIDE, LIGHT_STRIDE, VERT_STRIDE, VERTEX_DATA_STRIDE, TLAS_STRIDE_F32 },
     };
 }
 

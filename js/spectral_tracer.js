@@ -66,6 +66,9 @@ const MAX_GI_CLAMP = 1000.0;
 const DEFAULT_SAMPLE_LIMIT = 0;     // 0 = unlimited (keep accumulating forever)
 const MAX_SAMPLE_LIMIT = 100000;
 const MAX_TRIANGLES = 4_000_000;
+const LIVE_UPDATE_TRANSFORM = 1;
+const LIVE_UPDATE_DEFORM = 2;
+const LIVE_UPDATE_LIGHT = 4;
 
 function normalizeSamplesPerFrame(value) {
     const n = Math.round(Number(value));
@@ -110,6 +113,8 @@ export function createSpectralTracer({
 
     let sceneDirty = true;
     let sceneDirtyAt = 0;
+    let sceneRevision = 0;
+    let pendingLiveUpdateMask = 0;
     let hasSceneBuilt = false;
     let lastSceneRebuildAt = -Infinity;
     let nextRebuildRetryAt = 0;
@@ -150,6 +155,9 @@ export function createSpectralTracer({
 
     // GPU resources (rebuilt on scene change)
     let gpu = null; // { buffers, kernels, quad, width, height, env }
+    let activeLiveUpdateMask = 0;
+    let liveUpdatePump = null;
+    let liveUpdateLifecycle = 0;
 
     function isEnabled() { return enabled === true && !disposed; }
     function isStarted() { return started === true && isEnabled(); }
@@ -166,6 +174,13 @@ export function createSpectralTracer({
     }
 
     function requestSceneRebuild({ immediate = false } = {}) {
+        // A structural rebuild supersedes any yielded topology-stable update.
+        // Keep presenting the old coherent GPU scene until the replacement is
+        // ready, but prevent the old job from publishing after this request.
+        liveUpdateLifecycle++;
+        activeLiveUpdateMask = 0;
+        gpu?.built?.cancelDeformUpdates?.();
+        sceneRevision++;
         const wasDirty = sceneDirty;
         sceneDirty = true;
         const now = performance.now();
@@ -203,6 +218,7 @@ export function createSpectralTracer({
 
     function disposeGPU() {
         if (!gpu) return;
+        gpu.built?.disposeDeformUpdates?.();
         disposeComputeNodes(gpu.kernels, ['traceKernel', 'clearKernel']);
         disposeStorageAttributes(renderer, gpu.buffers, ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights', 'accum']);
         // Per-scene PBR map array textures (the shared spectral LUT is NOT
@@ -217,6 +233,81 @@ export function createSpectralTracer({
         return new THREE.StorageBufferAttribute(array, 1);
     }
 
+    function markStorageDirty(attr, ranges) {
+        if (!attr) return;
+        if (typeof attr.addUpdateRange === 'function' && typeof attr.clearUpdateRanges === 'function') {
+            if (Array.isArray(ranges) && ranges.length > 0) {
+                // Do not clear here: multiple typed edits can arrive before
+                // WebGPU consumes the new attribute version. Three clears the
+                // accumulated ranges after upload; replacing them here would
+                // silently drop an earlier disjoint BLAS update.
+                for (const [start, count] of ranges) attr.addUpdateRange(start, count);
+            } else {
+                // Empty ranges explicitly mean a whole-buffer upload.
+                attr.clearUpdateRanges();
+            }
+        }
+        attr.needsUpdate = true;
+    }
+
+    // Apply a topology-stable live edit directly to the CPU arrays retained by
+    // the current spectral scene. The same helper is used while a scene build
+    // is in flight (before storage attributes exist) so a late timeline packet
+    // cannot be lost when the freshly built buffers swap in.
+    async function applyBuiltLiveUpdate(built, mask, { upload = true, reset = true } = {}) {
+        if (!built || !mask) return true;
+        const transform = (mask & LIVE_UPDATE_TRANSFORM) !== 0;
+        const deform = (mask & LIVE_UPDATE_DEFORM) !== 0;
+        const light = (mask & LIVE_UPDATE_LIGHT) !== 0;
+        let deformResult = null;
+        let lightResult = null;
+        if (deform) {
+            if (typeof built.updateDeformsAsync !== 'function' && typeof built.updateDeforms !== 'function') return false;
+            try {
+                deformResult = typeof built.updateDeformsAsync === 'function'
+                    ? await built.updateDeformsAsync({ updateTlas: !transform })
+                    : built.updateDeforms({ updateTlas: !transform });
+            } catch { return false; }
+            if (!deformResult) return false;
+        }
+        if (transform) {
+            if (typeof built.updateTransforms !== 'function') return false;
+            let transformResult = null;
+            try { transformResult = built.updateTransforms(); } catch { return false; }
+            if (!transformResult) return false;
+        }
+        if (light) {
+            if (typeof built.updateLights !== 'function') return false;
+            try { lightResult = built.updateLights(); } catch { return false; }
+            if (!lightResult) return false;
+        }
+
+        const deformUpdated = ((deformResult?.updated ?? deformResult?.refitted) | 0) > 0;
+        const deformRefitted = (deformResult?.refitted | 0) > 0;
+        const changed = transform || deformUpdated || !!lightResult;
+        const mayPublish = !upload || gpu?.built === built;
+        if (upload && mayPublish && changed) {
+            if (deformUpdated) {
+                markStorageDirty(gpu.buffers.vertexData, deformResult.vertRanges);
+            }
+            if (deformRefitted) {
+                markStorageDirty(gpu.buffers.bvhNodes, deformResult.nodeRanges);
+            }
+            const matStart = built.instBase | 0;
+            const tlasStride = built.strides?.TLAS_STRIDE_F32 || 12;
+            const matCount = Math.max(0, (built.tlasBase | 0)
+                + ((built.tlasNodeCount | 0) * tlasStride) - matStart);
+            if (transform || deformRefitted) {
+                markStorageDirty(gpu.buffers.materials, matCount > 0 ? [[matStart, matCount]] : null);
+            }
+            if (lightResult) markStorageDirty(gpu.buffers.lights, null);
+        }
+        // A build swap can finish while a budgeted deform is yielding. Never
+        // reset the replacement scene for work owned by the old one.
+        if (reset && mayPublish && changed) resetAccumulation();
+        return true;
+    }
+
     let sceneBuildInFlight = false;
     function rebuildScene() {
         // buildSpectralScene is ASYNC (it time-slices PBR map extraction over
@@ -227,6 +318,7 @@ export function createSpectralTracer({
         // "Invalid BindGroup bindGroup_object" on every compute submit.
         if (sceneBuildInFlight) return hasSceneBuilt;
         sceneBuildInFlight = true;
+        const buildRevision = sceneRevision;
         (async () => {
         try {
             const built = await buildSpectralScene({ THREE, scene, camera: activeCamera, maxTriangles: MAX_TRIANGLES });
@@ -234,15 +326,39 @@ export function createSpectralTracer({
                 // Empty scene — nothing to trace. Treat as built so we just clear.
                 disposeGPU();
                 hasSceneBuilt = false;
-                sceneDirty = false;
-                sceneDirtyAt = 0;
+                pendingLiveUpdateMask = 0;
+                sceneDirty = sceneRevision !== buildRevision;
+                sceneDirtyAt = sceneDirty ? performance.now() + SCENE_REBUILD_COALESCE_MS : 0;
                 lastCameraLayersMask = cameraLayersMask(activeCamera);
                 return;
             }
             if (built.error) {
                 onStatus(`max.js - Path tracer: ${built.error}`);
-                sceneDirty = false; // don't spin; surface the cap and stop
+                pendingLiveUpdateMask = 0;
+                // Don't spin on a stable over-cap scene, but don't discard a
+                // structural edit that arrived while this build was yielding.
+                sceneDirty = sceneRevision !== buildRevision;
+                sceneDirtyAt = sceneDirty ? performance.now() + SCENE_REBUILD_COALESCE_MS : 0;
                 hasSceneBuilt = false;
+                return;
+            }
+
+            let catchupFailed = false;
+            while (pendingLiveUpdateMask) {
+                const liveMask = pendingLiveUpdateMask;
+                pendingLiveUpdateMask = 0;
+                if (!await applyBuiltLiveUpdate(built, liveMask, { upload: false, reset: false })) {
+                    // A typed update discovered layout drift (count/association
+                    // change). Escalate to the conservative structural lane.
+                    catchupFailed = true;
+                    sceneRevision++;
+                    break;
+                }
+            }
+            if (catchupFailed) pendingLiveUpdateMask = 0;
+            if (disposed) {
+                built.disposeDeformUpdates?.();
+                if (built.maps) for (const t of Object.values(built.maps)) t?.dispose?.();
                 return;
             }
 
@@ -270,16 +386,16 @@ export function createSpectralTracer({
                 mode: renderMode,
             });
             const quad = new THREE.QuadMesh(kernels.blitMaterial);
-            gpu = { buffers, kernels, quad, width, height, env: built.env, maps: built.maps };
+            gpu = { buffers, kernels, quad, width, height, env: built.env, maps: built.maps, built };
 
             applyUniformSettings();
             updateCameraUniforms(true);
             updateEnvUniforms(true);
             renderedSamples = 0;
 
-            sceneDirty = false;
+            sceneDirty = sceneRevision !== buildRevision;
             hasSceneBuilt = true;
-            sceneDirtyAt = 0;
+            sceneDirtyAt = sceneDirty ? performance.now() + SCENE_REBUILD_COALESCE_MS : 0;
             lastCameraLayersMask = cameraLayersMask(activeCamera);
             lastSceneRebuildAt = performance.now();
             nextRebuildRetryAt = 0;
@@ -451,6 +567,61 @@ export function createSpectralTracer({
     }
 
     function markSceneDirty() { requestSceneRebuild(); }
+    function queueActiveLiveUpdates() {
+        if (liveUpdatePump || disposed) return;
+        const lifecycle = liveUpdateLifecycle;
+        let wrapped = null;
+        const running = (async () => {
+            try {
+                while (!disposed && lifecycle === liveUpdateLifecycle && activeLiveUpdateMask) {
+                    const built = gpu?.built;
+                    if (!built || sceneDirty || sceneBuildInFlight) return;
+                    const mask = activeLiveUpdateMask;
+                    activeLiveUpdateMask = 0;
+                    const ok = await applyBuiltLiveUpdate(built, mask);
+                    if (disposed || lifecycle !== liveUpdateLifecycle || gpu?.built !== built) return;
+                    if (!ok) {
+                        activeLiveUpdateMask = 0;
+                        requestSceneRebuild();
+                        return;
+                    }
+                    // A newer request may have arrived while the budgeted
+                    // refit yielded. Its mask is retained and folded into the
+                    // next pass; the scene-level runner itself already
+                    // converged to the latest attribute versions before
+                    // publishing this one.
+                }
+            } catch {
+                if (!disposed && lifecycle === liveUpdateLifecycle) requestSceneRebuild();
+            }
+        })();
+        wrapped = running.finally(() => {
+            if (liveUpdatePump === wrapped) liveUpdatePump = null;
+            if (!disposed && activeLiveUpdateMask && !sceneDirty) queueActiveLiveUpdates();
+        });
+        liveUpdatePump = wrapped;
+    }
+
+    function markLiveSceneDirty(mask) {
+        if (!mask || disposed) return false;
+        if (sceneBuildInFlight || sceneDirty || !gpu?.built) {
+            pendingLiveUpdateMask |= mask;
+            if (!sceneBuildInFlight && !sceneDirty) requestSceneRebuild();
+            return true;
+        }
+        activeLiveUpdateMask |= mask;
+        queueActiveLiveUpdates();
+        return true;
+    }
+    function markTransformsDirty() {
+        return markLiveSceneDirty(LIVE_UPDATE_TRANSFORM);
+    }
+    function markDeformsDirty({ transforms = false } = {}) {
+        return markLiveSceneDirty(LIVE_UPDATE_DEFORM | (transforms ? LIVE_UPDATE_TRANSFORM : 0));
+    }
+    function markLightsDirty() {
+        return markLiveSceneDirty(LIVE_UPDATE_LIGHT);
+    }
     // Warm the scene/BVH build ahead of time WITHOUT presenting a frame, so a
     // later switch into the path-traced view swaps in with zero rebuild lag.
     // Safe to call once at load while another path (e.g. DDGI) owns the canvas:
@@ -574,9 +745,12 @@ export function createSpectralTracer({
     }
     function dispose() {
         disposed = true;
+        liveUpdateLifecycle++;
+        activeLiveUpdateMask = 0;
         disposeGPU();
         hasSceneBuilt = false;
         sceneDirty = false;
+        pendingLiveUpdateMask = 0;
     }
 
     if (typeof window !== 'undefined' && isEnabled()) {
@@ -592,6 +766,9 @@ export function createSpectralTracer({
         isSupported,
         render,
         markSceneDirty,
+        markTransformsDirty,
+        markDeformsDirty,
+        markLightsDirty,
         prebuild,
         isSceneBuilt,
         getSampleCount,
