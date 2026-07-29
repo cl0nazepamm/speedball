@@ -117,7 +117,7 @@ shader, and image path. Its live contribution is
 ## Beyond DDGI: the full light-transport surface
 
 Speedball is the single source for all of its GPU light transport — downstream
-apps (maxjs, powershot-threejs, sigils) import these entry points rather than
+apps (powershot-threejs, sigils) import these entry points rather than
 vendoring files:
 
 - **`speedball-gi/spectral-tracer`** — `createSpectralTracer`: progressive
@@ -136,8 +136,7 @@ vendoring files:
   traversal + spectral shading emitters).
 
 All of these work from a plain CDN import map too (e.g. jsDelivr:
-`https://cdn.jsdelivr.net/npm/speedball-gi@0.5.0/js/index.js`) — that is how
-maxjs consumes them without being an npm package.
+`https://cdn.jsdelivr.net/npm/speedball-gi@0.5.0/js/index.js`)
 
 Light records are stride 17 floats (slot [16] = emitter class) and material
 records stride 28 (slot [25] = NIR albedo); these extra fields are inert for
