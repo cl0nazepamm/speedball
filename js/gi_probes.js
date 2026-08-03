@@ -2805,6 +2805,7 @@ export function createProbeField({
         let meshes = 0, prims = 0, hash = 0;
         scene.traverseVisible((o) => {
             if (!o.isMesh && !o.isInstancedMesh) return;
+            if (o.userData?.maxjsVisible === false) return;  // excluded from the soup → must not arm a rebuild
             if (o.isSkinnedMesh) return;
             const p = o.geometry?.attributes?.position; if (!p) return;
             const idx = o.geometry.index;
@@ -2839,6 +2840,7 @@ export function createProbeField({
         let h = 0;
         scene.traverseVisible((o) => {
             if (!o.isMesh && !o.isInstancedMesh) return;
+            if (o.userData?.maxjsVisible === false) return;  // excluded from the soup → nothing to re-gather
             if (o.isSkinnedMesh) return;
             const g = o.geometry, p = g?.attributes?.position; if (!p) return;
             const n = g.attributes.normal;
@@ -2858,6 +2860,7 @@ export function createProbeField({
         let h = 0;
         scene.traverseVisible((o) => {
             if (!o.isMesh && !o.isInstancedMesh) return;
+            if (o.userData?.maxjsVisible === false) return; // same reason: not in the soup, no TLAS entry to churn
             if (o.isSkinnedMesh) return; // not in the soup (see geoSignature) → must not churn the TLAS
             if (!o.geometry?.attributes?.position) return;
             const e = o.matrixWorld?.elements;
