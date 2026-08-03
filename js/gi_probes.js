@@ -852,6 +852,7 @@ export function createProbeField({
     roughReflections = false,
     reflectionIntensity = 1.0,
     reflectionSkyFallback = false,
+    clusteredLighting = false,
 } = {}) {
     const node = getGiProbeNode();
     node.setIntensity(intensity);
@@ -930,6 +931,17 @@ export function createProbeField({
     // it's set by geometry/light-count/volume changes (true at start), and left FALSE by
     // setDivisions/setRays so those resize the grid/kernels off the cached soup (no hitch).
     let cachedBuilt = null;
+    // ── clustered-lighting mode (opt-in, structural at creation) ──
+    // The raster side draws EVERY light through GiClusteredLightsNode; the GI lane
+    // keeps its "NEE over ALL lights" kernel by budgeting to a FIXED MAX_LIGHTS-slot
+    // arena filled by importance selection (see selectGiLights). Because the arena
+    // never changes size, light-count drift lands in the count uniform + an in-place
+    // refill — the clustered mode NEVER escalates a light edit to a BVH rebuild.
+    // With clusteredLighting:false every branch below is dead and the legacy
+    // build/refresh path is byte-identical.
+    const clusteredGi = clusteredLighting === true;
+    let giLightArena = null;     // Float32Array(MAX_LIGHTS * _LIGHT_STRIDE), allocated at first fill
+    let giSelectedCount = 0;
     let buildDirty = true;
     // Monotonic invalidation token for the CPU soup. A native/browser scene
     // update can arrive while buildSpectralScene is yielding to material-map
@@ -1197,13 +1209,17 @@ export function createProbeField({
         const probeTotal = C.probeTotal;     // shadow the old flat name → per-cascade
         const atlasW = C.atlasW, atlasH = C.atlasH;
         const res = C.res;
+        // Clustered mode binds the fixed importance arena instead of the build's
+        // packed lights (rebuild() fills it before kernels are built; the guard
+        // covers any future call order drift).
+        if (clusteredGi && !giLightArena) fillGiLightArena(recordsFromBuilt(built));
         const buffers = {
             bvhNodes: new THREE.StorageBufferAttribute(built.bvhNodes, 1),
             triIndex: new THREE.StorageBufferAttribute(built.triIndex, 1),
             vertexData: new THREE.StorageBufferAttribute(built.vertexData, 1),
             triMaterial: new THREE.StorageBufferAttribute(built.triMaterial, 1),
             materials: new THREE.StorageBufferAttribute(built.materials, 1),
-            lights: new THREE.StorageBufferAttribute(built.lights, 1),
+            lights: new THREE.StorageBufferAttribute(clusteredGi ? giLightArena : built.lights, 1),
         };
         const bvhNodes = storage(buffers.bvhNodes, 'uint', buffers.bvhNodes.count).toReadOnly();
         const triIndex = storage(buffers.triIndex, 'uint', buffers.triIndex.count).toReadOnly();
@@ -2009,7 +2025,7 @@ export function createProbeField({
             atlas, roughSpecularAtlas, glossySpecularAtlas, depthAtlas, stateAtlas,
             irrBuffer, roughSpecularBuffer, glossySpecularBuffer, glossyWeightBuffer,
             depthBuffer, stateBuffer, rayBuffer,
-            maps: built.maps, lightCount: built.lightCount,
+            maps: built.maps, lightCount: clusteredGi ? giSelectedCount : built.lightCount,
         };
     }
 
@@ -2358,6 +2374,12 @@ export function createProbeField({
         curMinCell = C0.minCell;                                 // setNormalBias() lives off C0's cell
         quantStep = Math.max(1e-4, C0.minCell * 0.25);          // A1: geo-signature translation deadband
         lightQuant = Math.max(1e-3, C0.gridSize.length() * 0.003); // B4: light-signature position deadband
+
+        // Clustered mode: budget the GI lane into the fixed arena BEFORE any kernel
+        // binds it. Records come from the build snapshot itself (no re-collect), so
+        // the arena is byte-consistent with what the legacy path would have bound;
+        // the light lane's refreshLights keeps it current from there.
+        if (clusteredGi) fillGiLightArena(recordsFromBuilt(built));
 
         // ── C1 dims: fine sub-box via the CPU triangle-density histogram (idle-gated). ──
         // A flat/degenerate histogram → treat as cascades=1 for placement (safe fallback).
@@ -2922,12 +2944,66 @@ export function createProbeField({
         }
         attr.needsUpdate = true;
     }
+    // ── clustered mode: importance top-K into the fixed arena ──
+    // ≤ MAX_LIGHTS records pass through untouched (collection order — identical set
+    // to the legacy path). Past the budget, rank by peak power × spot solid-angle ×
+    // proximity to the C0 grid; directionals always survive. The NEE loop SUMS its
+    // lights, so selection order never changes the image — only membership does,
+    // and members only churn when a light's importance genuinely crosses the cut.
+    function giLightImportance(rec, bmin, bmax) {
+        if (rec[0] < 0.5) return Infinity;                    // directional: always keep
+        const power = Math.max(rec[7], rec[8], rec[9]);       // records store color × intensity
+        const cone = Math.abs(rec[0] - 2) < 0.5 ? Math.max(0.02, (1 - rec[12]) * 0.5) : 1;
+        const dx = Math.max(bmin.x - rec[1], 0, rec[1] - bmax.x);
+        const dy = Math.max(bmin.y - rec[2], 0, rec[2] - bmax.y);
+        const dz = Math.max(bmin.z - rec[3], 0, rec[3] - bmax.z);
+        return (power * cone) / (1 + dx * dx + dy * dy + dz * dz);
+    }
+    const _selMax = new THREE.Vector3();
+    function selectGiLights(records) {
+        if (records.length <= MAX_LIGHTS) return records;
+        const C0 = casc[0];
+        const bmin = C0.gridMin;
+        const bmax = _selMax.copy(C0.gridMin).add(C0.gridSize);
+        const scored = records.map((rec, i) => [giLightImportance(rec, bmin, bmax), i]);
+        scored.sort((a, b) => (b[0] - a[0]) || (a[1] - b[1]));   // score desc, index asc (deterministic)
+        scored.length = MAX_LIGHTS;
+        return scored.map(([, i]) => records[i]);
+    }
+    function fillGiLightArena(records) {
+        const need = MAX_LIGHTS * _LIGHT_STRIDE;
+        if (!giLightArena || giLightArena.length !== need) giLightArena = new Float32Array(need);
+        const selected = selectGiLights(records);
+        giLightArena.fill(0);
+        for (let i = 0; i < selected.length; i++) giLightArena.set(selected[i], i * _LIGHT_STRIDE);
+        giSelectedCount = selected.length;
+    }
+    // Build-snapshot records (stride slices of the packed buffer) — keeps the arena
+    // byte-consistent with the build without a second scene traverse.
+    function recordsFromBuilt(built) {
+        const n = built.lightCount | 0, out = [];
+        for (let i = 0; i < n; i++) out.push(built.lights.subarray(i * _LIGHT_STRIDE, (i + 1) * _LIGHT_STRIDE));
+        return out;
+    }
     // re-collect lights into EACH cascade's light buffer (no BVH rebuild). Count change →
     // full rebuild. Both cascades bind their own copy of the light soup, so update both.
     function refreshLights() {
         if (!casc[0].gpu || !_collectLights) return;
         let records;
         try { records = _collectLights(THREE, scene); } catch { return; }
+        if (clusteredGi) {
+            // Fixed arena: count drift lands in the count uniform + an in-place
+            // refill — never a rebuild. U.lightCount is the SHARED uniform folded
+            // into both cascade blocks, so one write serves C0 and C1.
+            fillGiLightArena(records);
+            U.lightCount.value = Math.min(MAX_LIGHTS, giSelectedCount) >>> 0;
+            for (const C of casc) {
+                const g = C.gpu; if (!g) continue;
+                g.lightCount = giSelectedCount;
+                g.buffers.lights.needsUpdate = true;
+            }
+            return;
+        }
         if (records.length !== casc[0].gpu.lightCount) { requestRebuild(); return; }
         for (const C of casc) {
             const g = C.gpu; if (!g) continue;

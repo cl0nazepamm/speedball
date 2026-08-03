@@ -31,6 +31,7 @@
   },
   "files": [
     "js/caustic_engine.js",
+    "js/gi_clustered_lights_node.js",
     "js/gi_irradiance_volume.js",
     "js/gi_lights_node.js",
     "js/gi_oct.js",

@@ -16,9 +16,9 @@ The live demo exposes a **normalize hysteresis** switch so you can turn the norm
 
 ## Launch live demos
 
-**[▶ Sponza GI](https://cl0nazepamm.github.io/speedball/)** · **[▶ Glass dispersion](https://cl0nazepamm.github.io/speedball/dispersion.html)**
+**[▶ Sponza GI](https://cl0nazepamm.github.io/speedball/)** · **[▶ Glass dispersion](https://cl0nazepamm.github.io/speedball/dispersion.html)** · **[▶ Clustered lighting](https://cl0nazepamm.github.io/speedball/clustered.html)**
 
-Locally: `npm start` then open `http://127.0.0.1:8777/` or `/dispersion.html`.
+Locally: `npm start` then open `http://127.0.0.1:8777/`, `/dispersion.html`, or `/clustered.html`.
 
 Requires a WebGPU-capable browser (Chrome/Edge stable; Safari 26+).
 
@@ -93,6 +93,26 @@ set it at creation when the layer boundary must be established before first solv
 The whole feature is opt-in, so existing integrations keep their allocation,
 shader, and image path. Its live contribution is
 `gi.setReflectionIntensity(0..1)`.
+
+## Clustered lighting (secondary mode)
+
+Pass **`clusteredLighting: true`** (three r185+) to draw thousands of
+non-shadowed point lights cheaply. The batched raster lights node is replaced by
+`GiClusteredLightsNode` — three's Forward+ clustered addon (compute-culled
+screen-tile × depth-slice light lists) with the same GI injection and IR-emitter
+seams — so the direct term stops caring how many small point lights the scene
+carries (the `lights` batch caps no longer apply). Directional, spot, and
+shadow-casting lights keep the stock per-light path.
+
+The GI lane switches to a fixed importance-budgeted light arena: the probes'
+NEE shades the `MAX_LIGHTS` (64) most important records — ranked by peak power ×
+spot solid-angle × proximity to the probe volume, directionals always kept —
+and light-count changes land in a count uniform + in-place refill, **never** a
+BVH rebuild. Pass an object to tune the cluster grid:
+`clusteredLighting: { maxLights: 1024, tileSize: 32, zSlices: 24, maxLightsPerCluster: 64 }`.
+
+The default (`false`) keeps the primary batched path byte-identical to previous
+releases. See `clustered.html` for the 50-light no-sun Sponza demo.
 
 ## Limitations
 

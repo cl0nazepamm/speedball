@@ -12,6 +12,7 @@
 import * as THREE from 'three/webgpu';
 import { createProbeField } from './gi_probes.js';
 import { giLights, setNirDirectSensing, setNirIlluminatorGain } from './gi_lights_node.js';
+import { giClusteredLights } from './gi_clustered_lights_node.js';
 
 // spectral_scene / gi_probes gate: userData.maxjsVisible === false → kept out of the
 // GI BVH and the auto-fit bounds. Wrapped here so callers never touch the raw flag.
@@ -100,6 +101,16 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @param {number}  [opts.reflectionIntensity=1] local-vs-environment reflection coverage blend, 0..1
  * @param {boolean} [opts.reflectionSkyFallback=false] fill reflection misses from setSky() SH instead of leaving them for PMREM/SSR
  * @param {object}  [opts.lights]              max light counts for the batched lights node
+ * @param {boolean|object} [opts.clusteredLighting=false]  SECONDARY MODE (three r185+): Forward+
+ *                  clustered raster lighting — thousands of non-shadowed point lights for
+ *                  near-constant direct cost (GiClusteredLightsNode replaces the batched
+ *                  DynamicLightsNode; `lights` caps are then ignored), while the GI lane
+ *                  budgets itself to the MAX_LIGHTS most important records (importance
+ *                  top-K + fixed light arena — light-count changes never trigger a BVH
+ *                  rebuild in this mode). Directional/spot/shadow-casting lights keep the
+ *                  stock per-light path. Pass an object to tune the cluster grid:
+ *                  { maxLights=1024, tileSize=32, zSlices=24, maxLightsPerCluster=64 }.
+ *                  Default false = the primary path, byte-identical to previous releases.
  * @param {boolean} [opts.installLightsNode=true]  set false if you install your own GI-aware lights node
  * @param {boolean} [opts.prepareMaterials=false]  run prepareMaterialsForGI(scene) on install
  * @returns {object} the probe field (all setters) augmented with update(), markInteraction(),
@@ -117,10 +128,15 @@ export function installSpeedballGI({
     reflectionIntensity = 1,
     reflectionSkyFallback = false,
     lights = { maxDirectionalLights: 4, maxPointLights: 16, maxSpotLights: 16, maxHemisphereLights: 2 },
+    clusteredLighting = false,
     installLightsNode = true,
     prepareMaterials = false,
 } = {}) {
     if (!renderer || !scene) throw new Error('installSpeedballGI: { renderer, scene } are required.');
+
+    const clustered = clusteredLighting === true
+        || (typeof clusteredLighting === 'object' && clusteredLighting !== null);
+    const clusteredOpts = clustered && typeof clusteredLighting === 'object' ? clusteredLighting : {};
 
     // 1. Lights factory — one line folds GI into every PBR material (no per-material wiring).
     let prevCreateNode = null;
@@ -136,7 +152,9 @@ export function installSpeedballGI({
                 'or GI may never fold into already-compiled materials.');
         }
         prevCreateNode = renderer.lighting.createNode || null;
-        renderer.lighting.createNode = (lightList = []) => giLights(lights).setLights(lightList);
+        renderer.lighting.createNode = clustered
+            ? (lightList = []) => giClusteredLights(clusteredOpts).setLights(lightList)
+            : (lightList = []) => giLights(lights).setLights(lightList);
     }
 
     if (prepareMaterials) prepareMaterialsForGI(scene);
@@ -152,6 +170,7 @@ export function installSpeedballGI({
         roughReflections,
         reflectionIntensity,
         reflectionSkyFallback,
+        clusteredLighting: clustered,
         onRebuilt: markMaterialsDirty,
     });
     if (enabled) gi.setEnabled(true);
