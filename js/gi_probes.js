@@ -2769,21 +2769,47 @@ export function createProbeField({
         return id;
     }
     function lightSignature() {
-        let s = '', n = 0;
+        // Numeric rolling hash — NO per-light string build. This lane deliberately
+        // runs THROUGH motion every LIGHT_CHECK_INTERVAL ticks, so at hundreds of
+        // lights (clustered mode) the old concatenated-string signature became a
+        // real per-check CPU + GC tax. Two independent 32-bit accumulators make a
+        // missed edit a ~2^-64 event; the light count stays explicit in the return
+        // value so count↔hash aliasing is impossible. Order-sensitive like the old
+        // string (two lights swapping records must re-fill the buffer).
         // (B4) Scene-relative deadbands so sub-perceptual delta-sync jitter does NOT
         // trigger a refresh every check; a genuine edit still changes the signature.
+        let n = 0, h1 = 0x9e3779b9 | 0, h2 = 0x85ebca6b | 0;
         const q = lightQuant > 1e-6 ? lightQuant : 1;
         scene.traverseVisible((o) => {
             if (!o.isLight || o.isAmbientLight || o.isHemisphereLight) return;
+            // Excluded lights never reach collectLights (objectIsRenderable) → their
+            // edits must not churn the lane (same rule 2abc2cd applied to the
+            // geo/deform/xform signatures for excluded meshes).
+            if (o.userData?.maxjsVisible === false) return;
             o.updateWorldMatrix?.(true, false);
             o.getWorldPosition(_sigVec);
             const c = o.color;
-            s += `${Math.round(_sigVec.x / q)},${Math.round(_sigVec.y / q)},${Math.round(_sigVec.z / q)}|`
-               + `${c ? Math.round((c.r * 7 + c.g * 11 + c.b * 13) * 16) : 0}|`
-               + `${Math.round((o.intensity || 0) * 4)}|${Math.round((o.angle || 0) * 50)};`;
+            let v = Math.round(_sigVec.x / q);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round(_sigVec.y / q);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round(_sigVec.z / q);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = c ? Math.round((c.r * 7 + c.g * 11 + c.b * 13) * 16) : 0;
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round((o.intensity || 0) * 4);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round((o.angle || 0) * 50);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            // range/decay were missing from the old string signature — a distance
+            // edit silently never reached the GI records until something else moved.
+            v = Math.round((o.distance || 0) * 4);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round((o.decay || 0) * 8);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
             n++;
         });
-        return n + ':' + s;
+        return n + ':' + h1 + ':' + h2;
     }
     // STRUCTURE signature: topology / connectivity / instance-set identity —
     // anything that invalidates the pooled BLAS soup and needs a full rebuild.

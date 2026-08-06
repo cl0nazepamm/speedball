@@ -80,7 +80,8 @@
 <canvas id="c"></canvas>
 <div id="hud">
   <div class="title">SPEEDBALL GI · CLUSTERED</div>
-  <span class="sub">50 point lights · no sky, no sun · Forward+ clustered raster + importance-budgeted GI · <a href="./index.html" style="color:#9ec8ff;pointer-events:auto;text-decoration:none">sky demo</a></span>
+  <span class="sub"><span id="lightCountLabel">50</span> point lights · no sky, no sun · Forward+ clustered raster + importance-budgeted GI · <a href="./index.html" style="color:#9ec8ff;pointer-events:auto;text-decoration:none">sky demo</a></span>
+  <div id="mon" class="sub"></div>
 </div>
 <div id="status">initializing WebGPU…</div>
 
@@ -122,7 +123,7 @@ controls.dampingFactor = 0.08;
 
 const params = {
   giEnabled: true, giIntensity: 20,
-  lightIntensity: 8, lightRange: 7, markers: true,
+  lightCount: 50, lightIntensity: 8, lightRange: 7, markers: true,
   exposure: 1,
   // Wide down-the-atrium hero view — shows the whole 10×5 light grid at once.
   camX: 9.5, camY: 6.8, camZ: -0.2,
@@ -153,33 +154,56 @@ const gi = installSpeedballGI({
 if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', true);
 window.gi = gi; window.scene = scene; window.renderer = renderer;
 
-// ── The 50-light grid ─────────────────────────────────────────────────────────
-const LIGHTS_X = 10, LIGHTS_Z = 5;                 // 10 × 5 = 50, spread over the atrium
+// ── The light grid (rebuildable: 10..500 via the stress slider) ───────────────
+// Rebuilding at a NEW count is the tier-2 stress test: in clustered mode the GI
+// lane absorbs a light-count change as an arena refill + count-uniform write —
+// never a BVH rebuild — and past 64 lights the importance selection picks which
+// records the probes shade.
 const pointLights = [];
 let markerMesh = null;
+let sponzaBounds = null;
 
-function buildLightGrid(bounds) {
-  const size = bounds.getSize(new THREE.Vector3());
-  const y = bounds.min.y + size.y * 0.16;          // lantern height, below the gallery
-  const x0 = bounds.min.x + size.x * 0.10, x1 = bounds.max.x - size.x * 0.10;
-  const z0 = bounds.min.z + size.z * 0.20, z1 = bounds.max.z - size.z * 0.20;
-  const color = new THREE.Color();
-  let idx = 0;
-  for (let iz = 0; iz < LIGHTS_Z; iz++) {
-    for (let ix = 0; ix < LIGHTS_X; ix++, idx++) {
-      color.setHSL(idx / (LIGHTS_X * LIGHTS_Z), 0.95, 0.55);
-      const light = new THREE.PointLight(color.clone(), params.lightIntensity, params.lightRange, 2);
-      light.castShadow = false;                    // clustering handles non-shadowed points
-      light.position.set(
-        THREE.MathUtils.lerp(x0, x1, LIGHTS_X > 1 ? ix / (LIGHTS_X - 1) : 0.5),
-        y,
-        THREE.MathUtils.lerp(z0, z1, LIGHTS_Z > 1 ? iz / (LIGHTS_Z - 1) : 0.5),
-      );
-      scene.add(light);
-      pointLights.push(light);
-    }
+function rebuildLights(count) {
+  count = Math.max(1, Math.round(count));
+  for (const l of pointLights) scene.remove(l);
+  pointLights.length = 0;
+  if (markerMesh) {
+    scene.remove(markerMesh);
+    markerMesh.geometry.dispose();
+    markerMesh.material.dispose();
+    markerMesh = null;
   }
-  // Emissive-looking markers so the grid is inspectable (kept OUT of the GI BVH).
+  if (!sponzaBounds) return;
+  const bounds = sponzaBounds;
+  const size = bounds.getSize(new THREE.Vector3());
+  const x0 = bounds.min.x + size.x * 0.08, x1 = bounds.max.x - size.x * 0.08;
+  const z0 = bounds.min.z + size.z * 0.14, z1 = bounds.max.z - size.z * 0.14;
+  // Vertical band: lantern height up through the gallery level, under the vaults.
+  const y0 = bounds.min.y + size.y * 0.16, y1 = bounds.min.y + size.y * 0.62;
+  // 3D grid: Y layers scale with count (50 → 2 layers, 500 → 4), each layer a
+  // ~2:1 x:z grid matching the atrium's long axis.
+  const gy = count < 40 ? 1 : count < 150 ? 2 : count < 350 ? 3 : 4;
+  const perLayer = Math.ceil(count / gy);
+  const gz = Math.max(1, Math.round(Math.sqrt(perLayer / 2)));
+  const gx = Math.max(1, Math.ceil(perLayer / gz));
+  const color = new THREE.Color();
+  for (let idx = 0; idx < count; idx++) {
+    const iy = Math.floor(idx / perLayer);
+    const inLayer = idx % perLayer;
+    const ix = inLayer % gx, iz = Math.floor(inLayer / gx);
+    color.setHSL(idx / count, 0.95, 0.55);
+    const light = new THREE.PointLight(color.clone(), params.lightIntensity, params.lightRange, 2);
+    light.castShadow = false;                      // clustering handles non-shadowed points
+    light.position.set(
+      THREE.MathUtils.lerp(x0, x1, gx > 1 ? ix / (gx - 1) : 0.5),
+      THREE.MathUtils.lerp(y0, y1, gy > 1 ? iy / (gy - 1) : 0.5),
+      THREE.MathUtils.lerp(z0, z1, gz > 1 ? iz / (gz - 1) : 0.5),
+    );
+    scene.add(light);
+    pointLights.push(light);
+  }
+  // Emissive-looking markers so the grid is inspectable (kept OUT of the GI BVH —
+  // and since 2abc2cd, excluded meshes don't churn the structure lane on rebuild).
   const geo = new THREE.SphereGeometry(0.05, 10, 8);
   const mat = new THREE.MeshBasicMaterial({ toneMapped: false });
   markerMesh = new THREE.InstancedMesh(geo, mat, pointLights.length);
@@ -191,19 +215,25 @@ function buildLightGrid(bounds) {
   }
   markerMesh.instanceMatrix.needsUpdate = true;
   markerMesh.instanceColor.needsUpdate = true;
+  markerMesh.visible = params.markers;
   excludeFromGI(markerMesh);
   scene.add(markerMesh);
+  document.getElementById('lightCountLabel').textContent = String(count);
 }
 
 // ── GUI ───────────────────────────────────────────────────────────────────────
 const gui = new GUI({ title: 'SPEEDBALL GI · Clustered' });
+gui.add(params, 'lightCount', 10, 500, 10).name('light count (stress)').onFinishChange((v) => {
+  rebuildLights(v);
+  gi.forceLightingRefresh();          // count change = arena refill in clustered mode, never a rebuild
+});
 gui.add(params, 'lightIntensity', 0, 40, 0.1).name('light intensity').onChange((v) => {
   for (const l of pointLights) l.intensity = v;
   gi.forceLightingRefresh();
 });
 gui.add(params, 'lightRange', 0, 20, 0.1).name('light range').onChange((v) => {
   for (const l of pointLights) l.distance = v;
-  gi.forceLightingRefresh();          // range isn't part of the light signature — kick explicitly
+  gi.forceLightingRefresh();          // the light lane would catch this within ~6 ticks; kick for instant response
 });
 gui.add(params, 'markers').name('light markers').onChange((v) => { if (markerMesh) markerMesh.visible = v; });
 gui.add(params, 'giEnabled').name('GI enabled').onChange((v) => { gi.setEnabled(v); gi.markMaterialsDirty(); });
@@ -245,7 +275,8 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
   const radius = Math.max(size.x, size.y, size.z) * 0.5;
   camera.near = radius * 0.01; camera.far = radius * 30; camera.updateProjectionMatrix();
 
-  buildLightGrid(box);
+  sponzaBounds = box;
+  rebuildLights(params.lightCount);
 
   // model + lights are in the scene now → build the probe field over them.
   gi.requestRebuild();
@@ -256,11 +287,25 @@ new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
   setStatus('Failed to load ./Sponza/glTF/Sponza.gltf\n' + (err?.message || err), true);
 });
 
+window.demo = { params, rebuildLights };   // console handle for stress poking
+
 // ── Render loop ───────────────────────────────────────────────────────────────
-renderer.setAnimationLoop(() => {
+const monEl = document.getElementById('mon');
+let fpsEma = 0, lastFrameT = 0, lastMonT = 0;
+renderer.setAnimationLoop((nowMs) => {
   controls.update();
   gi?.update({ playing: false });      // idle-gated solve (camera-rest detection is built in)
   renderer.render(scene, camera);
+  if (lastFrameT > 0) {
+    const dt = nowMs - lastFrameT;
+    if (dt > 0 && dt < 250) fpsEma = fpsEma > 0 ? fpsEma * 0.95 + dt * 0.05 : dt;
+  }
+  lastFrameT = nowMs;
+  if (nowMs - lastMonT > 500) {
+    lastMonT = nowMs;
+    const arena = gi?._debugLightCount?.(0);
+    monEl.textContent = `${fpsEma > 0 ? (1000 / fpsEma).toFixed(0) : '—'} fps · GI arena ${arena ?? '—'}/${pointLights.length}`;
+  }
 });
 </script>
 </body>

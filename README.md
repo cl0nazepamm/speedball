@@ -112,7 +112,9 @@ BVH rebuild. Pass an object to tune the cluster grid:
 `clusteredLighting: { maxLights: 1024, tileSize: 32, zSlices: 24, maxLightsPerCluster: 64 }`.
 
 The default (`false`) keeps the primary batched path byte-identical to previous
-releases. See `clustered.html` for the 50-light no-sun Sponza demo.
+releases. See `clustered.html` for the no-sun Sponza demo — 50 lights by
+default, with a stress slider to 500 that exercises the importance cut and the
+rebuild-free count changes.
 
 ## Limitations
 
