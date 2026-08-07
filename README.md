@@ -151,8 +151,12 @@ vendoring files:
   casters, soft t-cull (`setThrowFalloff`), and a `setCasterMesh(mesh,
   { shaper })` hook for baking procedural vertex displacement into photon
   emission. Pass `mode: 'refract'` (plus `ior` / `dispersion` / `thickness`)
-  for glass caustics — same splat pipeline, Snell thin-slab bend, chromatic
-  R/G/B grids so dispersion fans on the receiver.
+  for glass caustics — same splat pipeline, BVH-accelerated through-mesh Snell
+  refraction, Cauchy-style chromatic R/G/B grids, high-photon convergence
+  controls (`photonBudget`, `resolveInterval`, `setTargetPhotons`), light/floor
+  response controls (`setLightIntensity`, `setLightColor`,
+  `setReceiverAlbedo`), and optional
+  spotlight-cone matching via `setLightCone(direction, angleRadians, penumbra)`.
 - **`speedball-gi/spectral-scene`** / **`speedball-gi/spectral-traverse`** —
   the shared scene foundation (scene → flat BVH/material/light buffers; TSL
   traversal + spectral shading emitters).

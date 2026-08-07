@@ -166,6 +166,9 @@ function makeGlass({ color = 0xffffff, ior = 1.52, dispersion = 0.12, roughness 
     dispersion,
     transparent: true,
     opacity: 1,
+    // Let the floor-caustic overlay depth-test against opaque blockers without
+    // treating transmissive glass as an opaque hole in the depth buffer.
+    depthWrite: false,
     side: THREE.DoubleSide,
   });
 }
@@ -241,6 +244,11 @@ const ambient = new THREE.AmbientLight(0x404050, 0.15);
 scene.add(ambient);
 
 // ── Glass photon caustics (same engine as metal, refract mode) ───────────────
+const CAUSTIC_GRID = 768;
+const CAUSTIC_TARGET_PHOTONS = 3_000_000;
+const CAUSTIC_PHOTONS_PER_FRAME = 90_000;
+const CAUSTIC_RESOLVE_INTERVAL = 2;
+
 const params = {
   exposure: 1.05,
   spotIntensity: 80,
@@ -250,12 +258,13 @@ const params = {
   spotX: -2.4, spotY: 3.6, spotZ: 3.2,
   targetX: 0.1, targetY: 0.55, targetZ: 0,
   ior: 1.52,
-  dispersion: 0.16,
-  thickness: 0.35,
+  dispersion: 0.24,
+  causticAbsorption: 0.35,
   glassRoughness: 0,
-  causticStrength: 4.2,
-  causticSoftness: 1.15,
-  causticBloom: 0.25,
+  causticStrength: 4.6,
+  causticSoftness: 0.85,
+  causticBloom: 0.35,
+  causticPhotons: CAUSTIC_PHOTONS_PER_FRAME,
   causticEnabled: true,
 };
 
@@ -264,12 +273,14 @@ setStatus('building glass caustics…');
 const caustics = createCausticEngine({
   THREE,
   renderer,
-  grid: 768,
-  targetPhotons: 1_200_000,
+  grid: CAUSTIC_GRID,
+  targetPhotons: CAUSTIC_TARGET_PHOTONS,
+  photonBudget: params.causticPhotons,
+  resolveInterval: CAUSTIC_RESOLVE_INTERVAL,
   mode: 'refract',
   ior: params.ior,
   dispersion: params.dispersion,
-  thickness: params.thickness,
+  thickness: params.causticAbsorption,
   receiver: causticReceiverFloor({ y: 0, width: 8, height: 8 }),
 });
 caustics.setLight(params.spotX, params.spotY, params.spotZ);
@@ -277,8 +288,7 @@ caustics.setStrength(params.causticStrength);
 caustics.setSoftness(params.causticSoftness);
 caustics.setBloom(params.causticBloom);
 caustics.setThrowFalloff(1 / (5 * 5));
-// Through-mesh exit is O(tris) per photon — keep batches modest.
-caustics.setPhotonBudget(60000);
+caustics.setReceiverAlbedo(floorMat.color.r, floorMat.color.g, floorMat.color.b);
 caustics.overlayMesh.userData.maxjsVisible = false;
 scene.add(caustics.overlayMesh);
 
@@ -317,20 +327,24 @@ function bakeCaster() {
 }
 bakeCaster();
 
-function applyGlass() {
+function applyGlassOptics() {
   for (const m of [glassClear, glassTint, glassDense]) {
     m.ior = params.ior;
     m.dispersion = params.dispersion;
-    m.roughness = params.glassRoughness;
     m.needsUpdate = true;
   }
   glassDense.ior = Math.min(2.2, params.ior + 0.18);
   glassDense.dispersion = Math.min(0.5, params.dispersion * 1.35);
   caustics.setIor(params.ior);
   caustics.setDispersion(params.dispersion);
-  caustics.setThickness(params.thickness);
+}
+
+function applyGlassRoughness() {
+  for (const m of [glassClear, glassTint, glassDense]) m.roughness = params.glassRoughness;
   caustics.setRoughness(Math.max(0.01, params.glassRoughness));
 }
+
+const _spotDir = new THREE.Vector3();
 
 function applySpot() {
   spot.intensity = params.spotIntensity;
@@ -341,6 +355,9 @@ function applySpot() {
   spot.target.position.set(params.targetX, params.targetY, params.targetZ);
   spot.target.updateMatrixWorld();
   caustics.setLight(params.spotX, params.spotY, params.spotZ);
+  caustics.setLightIntensity(params.spotIntensity);
+  caustics.setLightColor(spot.color.r, spot.color.g, spot.color.b);
+  caustics.setLightCone(_spotDir.subVectors(spot.target.position, spot.position), spot.angle, spot.penumbra);
 }
 
 function applyExposure() {
@@ -354,11 +371,28 @@ function applyCausticLook() {
   caustics.overlayMesh.visible = params.causticEnabled;
 }
 
-applyGlass();
+applyGlassOptics();
+applyGlassRoughness();
 applySpot();
 applyExposure();
 applyCausticLook();
-hideStatus();
+
+let causticStatusActive = true;
+let lastCausticPercent = -1;
+function updateCausticStatus(state) {
+  if (state.converged) {
+    if (causticStatusActive) hideStatus();
+    causticStatusActive = false;
+    lastCausticPercent = 100;
+    return;
+  }
+  const percent = Math.min(99, Math.floor(100 * state.accum / caustics.targetPhotons));
+  if (!causticStatusActive || percent !== lastCausticPercent) {
+    setStatus(`building glass caustics… ${percent}%`);
+    causticStatusActive = true;
+    lastCausticPercent = percent;
+  }
+}
 
 // ── GUI ─────────────────────────────────────────────────────────────────────
 const gui = new GUI({ title: 'Glass · Caustics' });
@@ -372,16 +406,26 @@ fSpot.add(params, 'spotY', 0.5, 8, 0.05).name('pos Y').onChange(applySpot);
 fSpot.add(params, 'spotZ', -6, 6, 0.05).name('pos Z').onChange(applySpot);
 
 const fGlass = gui.addFolder('Glass');
-fGlass.add(params, 'ior', 1.05, 2.4, 0.01).name('IOR').onChange(applyGlass);
-fGlass.add(params, 'dispersion', 0, 0.45, 0.005).name('dispersion').onChange(applyGlass);
-fGlass.add(params, 'thickness', 0.05, 1.5, 0.01).name('slab thickness').onChange(applyGlass);
-fGlass.add(params, 'glassRoughness', 0, 0.35, 0.005).name('roughness').onChange(applyGlass);
+fGlass.add(params, 'ior', 1.05, 2.4, 0.01).name('IOR').onChange(applyGlassOptics);
+fGlass.add(params, 'dispersion', 0, 0.45, 0.005).name('dispersion').onChange(applyGlassOptics);
+fGlass.add(params, 'glassRoughness', 0, 0.35, 0.005).name('roughness').onChange(applyGlassRoughness);
 
 const fCau = gui.addFolder('Floor caustics');
-fCau.add(params, 'causticEnabled').name('enabled').onChange(applyCausticLook);
-fCau.add(params, 'causticStrength', 0, 8, 0.05).name('strength').onChange(applyCausticLook);
-fCau.add(params, 'causticSoftness', 0.1, 2, 0.01).name('softness').onChange(applyCausticLook);
-fCau.add(params, 'causticBloom', 0, 1.5, 0.01).name('bloom').onChange(applyCausticLook);
+fCau.add(params, 'causticEnabled').name('enabled').onChange((v) => {
+  caustics.overlayMesh.visible = v;
+  if (!v) {
+    hideStatus();
+    causticStatusActive = false;
+    lastCausticPercent = -1;
+  }
+});
+fCau.add(params, 'causticStrength', 0, 8, 0.05).name('strength').onChange((v) => caustics.setStrength(v));
+fCau.add(params, 'causticSoftness', 0.1, 2, 0.01).name('softness').onChange((v) => caustics.setSoftness(v));
+fCau.add(params, 'causticBloom', 0, 1.5, 0.01).name('bloom').onChange((v) => caustics.setBloom(v));
+fCau.add(params, 'causticAbsorption', 0.05, 1.5, 0.01).name('absorption').onChange((v) => caustics.setThickness(v));
+fCau.add(params, 'causticPhotons', 30000, 180000, 5000).name('photons/frame').onChange((v) => {
+  caustics.setPhotonBudget(v);
+});
 
 gui.add(params, 'exposure', 0.2, 3, 0.01).name('exposure').onChange(applyExposure);
 
@@ -401,7 +445,10 @@ window.spot = spot;
 // ── Render loop ─────────────────────────────────────────────────────────────
 renderer.setAnimationLoop(() => {
   controls.update();
-  if (params.causticEnabled) caustics.update();
+  if (params.causticEnabled) {
+    const state = caustics.update();
+    updateCausticStatus(state);
+  }
   renderer.render(scene, camera);
 });
 </script>

@@ -4,44 +4,69 @@
 // reflective METAL or refractive GLASS caustic entirely in TSL compute passes
 // and resolves it into a StorageTexture that any receiver plane can sample.
 //
-// PORTABILITY: this module imports ONLY `three/tsl` (build-agnostic) and takes
-// the THREE namespace as a parameter — so the SAME file vendors byte-identical
-// into any host build. Pass THREE from whatever your build exposes the WebGPU
+// PORTABILITY: this module's only external import is `three/tsl`
+// (build-agnostic); the tiny BVH builder is local and dependency-free. The
+// engine takes the THREE namespace as a parameter, so the same files work in
+// any host build. Pass THREE from whatever your build exposes the WebGPU
 // classes under: `import * as THREE from 'three'` when an importmap maps three
 // to three.webgpu.js (speedball), or `import * as THREE from 'three/webgpu'`
 // under a bundler where bare `three` is the WebGL core (Vite / sigils).
 //
 // Pipeline (all on the GPU, no CPU readback):
 //   emit   : one compute thread per photon; samples the caster, reflects OR
-//            refracts (thin-slab double bend) the light, hits the receiver,
+//            refracts through the mesh, hits the receiver,
 //            atomic-splats fixed-point energy into a u32 density grid
 //            (WGSL has no float atomics -> u32 fixed point). Glass mode uses
 //            3 channel grids so dispersion traces R/G/B to their refracted hits.
 //   convert: u32 grid -> float density buffer.
 //   blur   : separable Gaussian density estimation (crisp cusps).
-//   max    : atomicMax reduction of the blurred peak -> auto-exposure.
-//   bloom  : threshold the bright cores, wide Gaussian -> hot-cusp halo.
+//   bloom  : threshold physically scaled bright cores, wide Gaussian -> hot-cusp halo.
 //   resolve: gamma crush + bloom + tint + HDR tonemap -> RGBA16F StorageTexture.
 //   overlay: caller adds `overlayMesh` and samples the texture additively.
 //
 // Progressive: the grid accumulates across frames (never cleared except on
 // markDirty()) so it converges noisy->sharp in a few frames, then holds. A full
-// rebake of millions of photons costs <1ms of GPU time.
+// rebake of millions of photons converges over a short burst of frames.
 //
 // EMISSION SEAM: `buildEmit()` below is analytic (a curved door panel + two
 // torus wheels) — the reference emitter that validates the look. To throw
 // caustics off REAL geometry, use setCasterMesh(). All photon-tracing lives
 // here in speedball; that is the canonical path.
 
+import { buildCausticBvh, CAUSTIC_BVH_NODE_STRIDE } from './caustic_bvh.js';
 import {
-    Fn, If, Loop, Return, instanceIndex, uniform, storage, textureStore, texture, uv,
-    atomicAdd, atomicLoad, atomicMax, atomicStore,
+    Fn, If, Loop, Break, Return, instanceIndex, uniform, storage, textureStore, texture, uv,
+    atomicAdd, atomicLoad, atomicStore,
     float, int, uint, vec3, vec4, uvec2,
-    select, max, min, abs, sqrt, sin, cos, exp, pow, floor, ceil,
+    select, max, min, abs, sqrt, sin, cos, exp, floor, ceil,
     dot, normalize, reflect, clamp, cross,
 } from 'three/tsl';
 
 const PI = Math.PI;
+const DEFAULT_REFLECT_TARGET_PHOTONS = 3_000_000;
+const DEFAULT_GLASS_TARGET_PHOTONS = 3_000_000;
+const DEFAULT_REFLECT_PHOTONS_PER_UPDATE = 300_000;
+const DEFAULT_GLASS_PHOTONS_PER_UPDATE = 90_000;
+const DEFAULT_GLASS_RESOLVE_INTERVAL = 2;
+const DEFAULT_LIGHT_INTENSITY = 80;
+const CAUSTIC_RESPONSE_SCALE = 6.0;
+// The response scale was authored around a roughly 10 m^2 demo caster. Keep
+// that calibration while making brightness respond correctly to mesh scale.
+const REFERENCE_CASTER_AREA = 10.0;
+
+// Fraunhofer C/d/F wavelengths: a compact Cauchy dispersion fit for RGB photon
+// bands. `dispersion=1` spans roughly 0.09 IOR between red and blue.
+const FRAUNHOFER_C_NM = 656.3; // red
+const FRAUNHOFER_D_NM = 587.6; // center
+const FRAUNHOFER_F_NM = 486.1; // blue
+const INV_LAMBDA_C2 = 1 / (FRAUNHOFER_C_NM * FRAUNHOFER_C_NM);
+const INV_LAMBDA_D2 = 1 / (FRAUNHOFER_D_NM * FRAUNHOFER_D_NM);
+const INV_LAMBDA_F2 = 1 / (FRAUNHOFER_F_NM * FRAUNHOFER_F_NM);
+const DISPERSION_IOR_SPAN = 0.09;
+const DISPERSION_DENOM = INV_LAMBDA_F2 - INV_LAMBDA_C2;
+const DISPERSION_RED_WEIGHT = (INV_LAMBDA_C2 - INV_LAMBDA_D2) / DISPERSION_DENOM;
+const DISPERSION_GREEN_WEIGHT = 0;
+const DISPERSION_BLUE_WEIGHT = (INV_LAMBDA_F2 - INV_LAMBDA_D2) / DISPERSION_DENOM;
 
 // Receiver-plane presets for createCausticEngine({ receiver }).
 //  - floor: horizontal y=y plane (the default).
@@ -65,19 +90,23 @@ export const CAUSTIC_METALS = {
  * @param {object}  opts.THREE               the three namespace exposing WebGPU classes
  * @param {import('three').WebGPURenderer} opts.renderer
  * @param {number} [opts.grid=768]            caustic grid resolution (WxH)
- * @param {number} [opts.targetPhotons=3e6]   photons accumulated before "converged"
+ * @param {number} [opts.targetPhotons]       photons accumulated before "converged" (glass defaults higher)
+ * @param {number} [opts.photonBudget]        photons traced per update
+ * @param {number} [opts.resolveInterval]     accumulation batches between full density resolves
  * @param {object} [opts.receiver]            receiver plane extents (world units)
  * @param {'reflect'|'refract'} [opts.mode='reflect']  metal reflection vs glass refraction
  * @param {number} [opts.ior=1.5]             glass index of refraction (refract mode)
- * @param {number} [opts.dispersion=0]        Abbe-style IOR spread across R/G/B (refract)
- * @param {number} [opts.thickness=0.55]      thin-slab travel distance inside glass (refract)
+ * @param {number} [opts.dispersion=0]        Cauchy-style IOR spread across R/G/B (refract)
+ * @param {number} [opts.thickness=0.55]      glass optical-depth scale (refract)
  * @returns engine handle: { overlayMesh, texture, uniforms, update(), setters, dispose() }
  */
 export function createCausticEngine({
     THREE,
     renderer,
     grid = 768,
-    targetPhotons = 3_000_000,
+    targetPhotons = undefined,
+    photonBudget = undefined,
+    resolveInterval = undefined,
     // Receiver plane the caustic lands on. `null` = the classic floor (y=0).
     // Otherwise a plane: { origin, normal (faces the incoming rays), uAxis, vAxis, width, height }.
     // (Not named `floor` — that would shadow the imported TSL floor() used in the kernels.)
@@ -90,8 +119,12 @@ export function createCausticEngine({
     if (!THREE) throw new Error('createCausticEngine requires the THREE namespace (pass { THREE, renderer }).');
     const isGlass = mode === 'refract';
     const W = grid, H = grid, cells = W * H;
+    const cleanPhotonCount = (n, fallback) => Math.max(1000, Math.floor(Number.isFinite(n) ? n : fallback));
+    const cleanUnit = (n, fallback = 1) => Math.max(0, Number.isFinite(n) ? n : fallback);
+    let photonTarget = cleanPhotonCount(targetPhotons, (
+        isGlass ? DEFAULT_GLASS_TARGET_PHOTONS : DEFAULT_REFLECT_TARGET_PHOTONS
+    ));
     const SCALE = 256.0;       // fixed-point scale for atomic energy deposit
-    const MAXSCALE = 64.0;     // fixed-point scale for the atomicMax auto-exposure
     const U32_MAX = 4.2e9;     // clamp ceiling below 2^32 to avoid atomic wrap
     // Normalized receiver frame (defaults reproduce the original floor exactly).
     const R = (() => {
@@ -106,15 +139,24 @@ export function createCausticEngine({
             height: d.height ?? 7,
         };
     })();
+    const densityNormBase = cells / Math.max(1e-6, R.width * R.height);
 
     const params = {
-        photonBudget: 300000,
+        photonBudget: cleanPhotonCount(photonBudget, (
+            isGlass ? DEFAULT_GLASS_PHOTONS_PER_UPDATE : DEFAULT_REFLECT_PHOTONS_PER_UPDATE
+        )),
+        resolveInterval: Math.max(1, Math.floor(Number.isFinite(resolveInterval)
+            ? resolveInterval
+            : (isGlass ? DEFAULT_GLASS_RESOLVE_INTERVAL : 1))),
         strength: isGlass ? 4.2 : 2.2,         // overlay additive opacity
         softness: isGlass ? 1.15 : 0.9,         // streak footprint + density-estimate bandwidth
         bloom: isGlass ? 0.25 : 0.7,
         roughness: isGlass ? 0.02 : 0.035,
         tint: isGlass ? [1.0, 1.0, 1.0] : CAUSTIC_METALS.chrome.rgb.slice(),
         light: [-2.2, 3.4, -1.45],
+        lightPower: 1,
+        lightColor: [1, 1, 1],
+        receiverAlbedo: [1, 1, 1],
         ior: Math.max(1.01, ior),
         dispersion: Math.max(0, dispersion),
         thickness: Math.max(0.02, thickness),
@@ -128,7 +170,6 @@ export function createCausticEngine({
     const gridR = storage(makeStorage(new Uint32Array(cells)), 'uint', cells).toAtomic();
     const gridG = isGlass ? storage(makeStorage(new Uint32Array(cells)), 'uint', cells).toAtomic() : gridR;
     const gridB = isGlass ? storage(makeStorage(new Uint32Array(cells)), 'uint', cells).toAtomic() : gridR;
-    const maxB = storage(makeStorage(new Uint32Array(1)), 'uint', 1).toAtomic();
     const densF = storage(makeStorage(new Float32Array(cells)), 'float', cells);
     const densG = isGlass ? storage(makeStorage(new Float32Array(cells)), 'float', cells) : densF;
     const densB = isGlass ? storage(makeStorage(new Float32Array(cells)), 'float', cells) : densF;
@@ -138,7 +179,7 @@ export function createCausticEngine({
     const sharpBb = isGlass ? storage(makeStorage(new Float32Array(cells)), 'float', cells) : sharpB;
     const brightB = storage(makeStorage(new Float32Array(cells)), 'float', cells);
     const bloomB = storage(makeStorage(new Float32Array(cells)), 'float', cells);
-    const storageAttrs = [gridR, maxB, densF, tmpB, sharpB, brightB, bloomB];
+    const storageAttrs = [gridR, densF, tmpB, sharpB, brightB, bloomB];
     if (isGlass) storageAttrs.push(gridG, gridB, densG, densB, sharpG, sharpBb);
 
     // RGBA16F: storage-capable + HDR. sRGB storage formats are NOT storage-capable
@@ -155,6 +196,11 @@ export function createCausticEngine({
         wheel0Mat: uniform(new THREE.Matrix4()),
         wheel1Mat: uniform(new THREE.Matrix4()),
         metalRoughness: uniform(params.roughness),
+        sampleScale: uniform(1),
+        lightPower: uniform(params.lightPower),
+        lightColor: uniform(new THREE.Vector3(...params.lightColor)),
+        receiverAlbedo: uniform(new THREE.Vector3(...params.receiverAlbedo)),
+        casterAreaScale: uniform(1),
         causticWidth: uniform(params.softness),
         sharpSigma: uniform(1.0),
         bloomSigma: uniform(12.0),
@@ -163,6 +209,10 @@ export function createCausticEngine({
         // soft t-cull: energy *= 1/(1 + t^2*throwSoft). 0 disables (classic
         // look); 1/reach^2 halves a photon's weight at throw distance `reach`.
         throwSoft: uniform(0),
+        spotDir: uniform(new THREE.Vector3(0, -1, 0)),
+        spotCosInner: uniform(-1),
+        spotCosOuter: uniform(-1),
+        spotEnabled: uniform(0),
         ior: uniform(params.ior),
         dispersion: uniform(params.dispersion),
         thickness: uniform(params.thickness),
@@ -172,8 +222,10 @@ export function createCausticEngine({
     // photons are emitted off a real triangle mesh instead of the analytic
     // door/wheels). Geometry is baked to WORLD space on upload.
     let emitMode = 'analytic';
-    let meshPos = null, meshNrm = null, meshIdx = null, meshCdf = null;
+    let meshPos = null, meshNrm = null, meshIdx = null, meshAccel = null;
     let meshTriCount = 0, meshSearchIters = 1;
+    let meshBvhNodeCount = 0, meshBvhNodeBase = 0, meshBvhTriBase = 0;
+    let meshSurfaceArea = REFERENCE_CASTER_AREA;
     const meshAttrs = []; // StorageBufferAttributes to dispose on rebuild
 
     // ── RNG (PCG) ────────────────────────────────────────────────────
@@ -222,6 +274,17 @@ export function createCausticEngine({
         const ok = k.greaterThan(float(0));
         const dir = I.mul(eta).add(N.mul(eta.mul(cosi).sub(sqrt(max(k, float(0))))));
         return select(ok, normalize(dir), vec3(0));
+    };
+
+    const spotWeight = (dirFromLight) => {
+        const cone = clamp(
+            dot(dirFromLight, U.spotDir).sub(U.spotCosOuter)
+                .div(max(U.spotCosInner.sub(U.spotCosOuter), float(1e-4))),
+            float(0),
+            float(1),
+        );
+        const feather = cone.mul(cone).mul(float(3).sub(cone.mul(2)));
+        return select(U.spotEnabled.greaterThan(float(0.5)), feather, float(1));
     };
 
     const splatStreak = (grid, dir, hitOrigin, energy) => {
@@ -294,7 +357,7 @@ export function createCausticEngine({
                         const throwAtten = float(1).div(t.mul(t).mul(U.throwSoft).add(1));
                         const e = energy.mul(cosHit).mul(throwAtten);
                         const fx = uu.div(R.width).add(0.5).mul(float(W)).sub(0.5);
-                    const fy = float(0.5).add(vv.div(R.height)).mul(float(H)).sub(0.5);
+                        const fy = float(0.5).add(vv.div(R.height)).mul(float(H)).sub(0.5);
                         const x0 = int(floor(fx));
                         const y0 = int(floor(fy));
                         const txf = fx.sub(float(x0));
@@ -315,7 +378,9 @@ export function createCausticEngine({
         const incident = normalize(toP);
         const ndl = max(float(0), dot(incident, wn).mul(-1));
         If(ndl.lessThanEqual(float(0.0001)), () => { Return(); });
-        const baseEnergy = ndl.mul(sourceGain).mul(float(8).div(distSq));
+        const cone = spotWeight(incident);
+        If(cone.lessThanEqual(float(0.0001)), () => { Return(); });
+        const baseEnergy = ndl.mul(cone).mul(sourceGain).mul(float(8).div(distSq));
         const reflected = normalize(reflect(incident, wn));
         splatStreak(gridR, reflected, wp, baseEnergy);
     };
@@ -386,45 +451,95 @@ export function createCausticEngine({
     function buildMeshEmit(count) {
         const triCount = meshTriCount;
         const iters = meshSearchIters;
+        const bvhNodeCount = meshBvhNodeCount;
+        const bvhNodeBase = uint(meshBvhNodeBase);
+        const bvhTriBase = uint(meshBvhTriBase);
         const fetchP = (i) => { const b = i.mul(uint(3)); return vec3(meshPos.element(b), meshPos.element(b.add(uint(1))), meshPos.element(b.add(uint(2)))); };
         const fetchN = (i) => { const b = i.mul(uint(3)); return vec3(meshNrm.element(b), meshNrm.element(b.add(uint(1))), meshNrm.element(b.add(uint(2)))); };
 
-        // Brute-force closest-hit against the caster mesh along a ray.
-        // Fine for demo-scale glass (a few thousand tris); not a BVH.
+        // Stackless closest-hit over the CPU-built, threaded mesh BVH. Interior
+        // nodes descend to cursor+1; misses and completed leaves jump to the
+        // first node after their subtree.
         const meshIntersect = (ro, rd, tMin, tMaxOut, hitP, hitN) => {
             const bestT = float(tMaxOut).toVar();
             const found = float(0).toVar();
-            Loop({ start: uint(0), end: uint(triCount), type: 'uint', condition: '<' }, ({ i: t }) => {
-                const base = t.mul(uint(3));
-                const a = fetchP(meshIdx.element(base));
-                const b = fetchP(meshIdx.element(base.add(uint(1))));
-                const c = fetchP(meshIdx.element(base.add(uint(2))));
-                const e1 = b.sub(a);
-                const e2 = c.sub(a);
-                const pvec = cross(rd, e2);
-                const det = dot(e1, pvec);
-                // Skip near-parallel; allow either winding (glass is double-sided).
-                If(abs(det).greaterThan(float(1e-6)), () => {
-                    const invDet = float(1).div(det);
-                    const tvec = ro.sub(a);
-                    const u = dot(tvec, pvec).mul(invDet);
-                    If(u.greaterThanEqual(float(0)).and(u.lessThanEqual(float(1))), () => {
-                        const qvec = cross(tvec, e1);
-                        const v = dot(rd, qvec).mul(invDet);
-                        If(v.greaterThanEqual(float(0)).and(u.add(v).lessThanEqual(float(1))), () => {
-                            const tt = dot(e2, qvec).mul(invDet);
-                            If(tt.greaterThan(tMin).and(tt.lessThan(bestT)), () => {
-                                bestT.assign(tt);
-                                found.assign(float(1));
-                                const na = fetchN(meshIdx.element(base));
-                                const nb = fetchN(meshIdx.element(base.add(uint(1))));
-                                const nc = fetchN(meshIdx.element(base.add(uint(2))));
-                                const w0 = float(1).sub(u).sub(v);
-                                hitP.assign(ro.add(rd.mul(tt)));
-                                hitN.assign(normalize(na.mul(w0).add(nb.mul(u)).add(nc.mul(v))));
+            // Avoid 0 * infinity at slab boundaries for axis-aligned rays.
+            const safeDir = (d) => select(
+                abs(d).greaterThan(float(1e-8)),
+                d,
+                select(d.lessThan(float(0)), float(-1e-8), float(1e-8)),
+            );
+            const invD = vec3(
+                float(1).div(safeDir(rd.x)),
+                float(1).div(safeDir(rd.y)),
+                float(1).div(safeDir(rd.z)),
+            );
+            const cursor = uint(0).toVar();
+            Loop({ start: uint(0), end: uint(bvhNodeCount), type: 'uint', condition: '<' }, () => {
+                If(cursor.greaterThanEqual(uint(bvhNodeCount)), () => { Break(); });
+                const node = bvhNodeBase.add(cursor.mul(uint(CAUSTIC_BVH_NODE_STRIDE)));
+                const bmin = vec3(
+                    meshAccel.element(node),
+                    meshAccel.element(node.add(uint(1))),
+                    meshAccel.element(node.add(uint(2))),
+                );
+                const bmax = vec3(
+                    meshAccel.element(node.add(uint(3))),
+                    meshAccel.element(node.add(uint(4))),
+                    meshAccel.element(node.add(uint(5))),
+                );
+                const miss = uint(meshAccel.element(node.add(uint(6))));
+                const triOffset = uint(meshAccel.element(node.add(uint(7))));
+                const leafTriCount = uint(meshAccel.element(node.add(uint(8))));
+                const t0 = bmin.sub(ro).mul(invD);
+                const t1 = bmax.sub(ro).mul(invD);
+                const tsmall = min(t0, t1);
+                const tbig = max(t0, t1);
+                const tNear = max(max(tsmall.x, tsmall.y), tsmall.z);
+                const tFar = min(min(tbig.x, tbig.y), tbig.z);
+
+                If(tFar.greaterThanEqual(max(tNear, tMin)).and(tNear.lessThan(bestT)), () => {
+                    If(leafTriCount.equal(uint(0)), () => {
+                        cursor.assign(cursor.add(uint(1)));
+                    }).Else(() => {
+                        Loop({ start: uint(0), end: leafTriCount, type: 'uint', condition: '<' }, ({ i }) => {
+                            const tri = uint(meshAccel.element(bvhTriBase.add(triOffset).add(i)));
+                            const base = tri.mul(uint(3));
+                            const a = fetchP(meshIdx.element(base));
+                            const b = fetchP(meshIdx.element(base.add(uint(1))));
+                            const c = fetchP(meshIdx.element(base.add(uint(2))));
+                            const e1 = b.sub(a);
+                            const e2 = c.sub(a);
+                            const pvec = cross(rd, e2);
+                            const det = dot(e1, pvec);
+                            // Skip near-parallel; allow either winding (glass is double-sided).
+                            If(abs(det).greaterThan(float(1e-6)), () => {
+                                const invDet = float(1).div(det);
+                                const tvec = ro.sub(a);
+                                const u = dot(tvec, pvec).mul(invDet);
+                                If(u.greaterThanEqual(float(0)).and(u.lessThanEqual(float(1))), () => {
+                                    const qvec = cross(tvec, e1);
+                                    const v = dot(rd, qvec).mul(invDet);
+                                    If(v.greaterThanEqual(float(0)).and(u.add(v).lessThanEqual(float(1))), () => {
+                                        const tt = dot(e2, qvec).mul(invDet);
+                                        If(tt.greaterThan(tMin).and(tt.lessThan(bestT)), () => {
+                                            bestT.assign(tt);
+                                            found.assign(float(1));
+                                            const na = fetchN(meshIdx.element(base));
+                                            const nb = fetchN(meshIdx.element(base.add(uint(1))));
+                                            const nc = fetchN(meshIdx.element(base.add(uint(2))));
+                                            const w0 = float(1).sub(u).sub(v);
+                                            hitP.assign(ro.add(rd.mul(tt)));
+                                            hitN.assign(normalize(na.mul(w0).add(nb.mul(u)).add(nc.mul(v))));
+                                        });
+                                    });
+                                });
                             });
                         });
+                        cursor.assign(miss);
                     });
+                }).Else(() => {
+                    cursor.assign(miss);
                 });
             });
             return found;
@@ -441,8 +556,8 @@ export function createCausticEngine({
             const hi = int(triCount - 1).toVar();
             Loop({ start: uint(0), end: uint(iters), type: 'uint', condition: '<' }, () => {
                 const mid = int(floor(float(lo.add(hi)).mul(0.5)));
-                If(meshCdf.element(uint(mid)).lessThan(r), () => { lo.assign(mid.add(int(1))); });
-                If(meshCdf.element(uint(mid)).greaterThanEqual(r), () => { hi.assign(mid); });
+                If(meshAccel.element(uint(mid)).lessThan(r), () => { lo.assign(mid.add(int(1))); });
+                If(meshAccel.element(uint(mid)).greaterThanEqual(r), () => { hi.assign(mid); });
             });
             const base = uint(lo).mul(uint(3));
             const i0 = meshIdx.element(base);
@@ -459,7 +574,7 @@ export function createCausticEngine({
             const wn = normalize(fetchN(i0).mul(b0).add(fetchN(i1).mul(b1)).add(fetchN(i2).mul(b2))).toVar();
 
             if (!isGlass) {
-                emitTrace(wp, wn, float(1.0));
+                emitTrace(wp, wn, U.casterAreaScale);
                 return;
             }
 
@@ -472,17 +587,18 @@ export function createCausticEngine({
             // produce the base hotspots / streak artifacts.
             const ndl = max(float(0), dot(incident, wn).mul(-1));
             If(ndl.lessThanEqual(float(0.08)), () => { Return(); });
+            const cone = spotWeight(incident);
+            If(cone.lessThanEqual(float(0.0001)), () => { Return(); });
             const nEntry = wn;
-            const baseEnergy = ndl.mul(float(14).div(distSq));
+            const baseEnergy = ndl.mul(cone).mul(U.casterAreaScale).mul(float(14).div(distSq));
 
-            // Trace each color band through the actual mesh. The UI dispersion
-            // value is art-facing, so map it to a small physical IOR spread:
-            // blue bends slightly more than green, red slightly less.
+            // Trace Fraunhofer C/d/F bands through the actual mesh. The UI
+            // dispersion value scales a Cauchy-like 1/lambda^2 IOR curve.
             const nCenter = max(U.ior, float(1.01));
-            const iorSpread = U.dispersion.mul(float(0.035));
-            const nRed = max(float(1.01), nCenter.sub(iorSpread));
-            const nGreen = nCenter;
-            const nBlue = nCenter.add(iorSpread);
+            const iorSpan = U.dispersion.mul(float(DISPERSION_IOR_SPAN));
+            const nRed = max(float(1.01), nCenter.add(iorSpan.mul(float(DISPERSION_RED_WEIGHT))));
+            const nGreen = max(float(1.01), nCenter.add(iorSpan.mul(float(DISPERSION_GREEN_WEIGHT))));
+            const nBlue = max(float(1.01), nCenter.add(iorSpan.mul(float(DISPERSION_BLUE_WEIGHT))));
 
             const traceGlassBand = (grid, nGlass) => {
                 const etaIn = float(1).div(nGlass);
@@ -518,7 +634,10 @@ export function createCausticEngine({
                                         const om2 = float(1).sub(cosi2);
                                         const F2 = R0.add(float(1).sub(R0).mul(om2.mul(om2).mul(om2).mul(om2).mul(om2)));
                                         const T = float(1).sub(F1).mul(float(1).sub(F2));
-                                        splatPoint(grid, out, hitP, baseEnergy.mul(T), incident);
+                                        const glassPath = hitP.sub(wp);
+                                        const pathLen = sqrt(max(dot(glassPath, glassPath), float(0)));
+                                        const absorption = exp(pathLen.mul(max(U.thickness, float(0.02))).mul(float(-0.18)));
+                                        splatPoint(grid, out, hitP, baseEnergy.mul(T).mul(absorption), incident);
                                     });
                                 });
                             });
@@ -547,10 +666,10 @@ export function createCausticEngine({
     const convert = Fn(() => {
         const idx = instanceIndex.toVar();
         If(idx.greaterThanEqual(uint(cells)), () => { Return(); });
-        densF.element(idx).assign(float(atomicLoad(gridR.element(idx))).div(float(SCALE)));
+        densF.element(idx).assign(float(atomicLoad(gridR.element(idx))).div(float(SCALE)).mul(U.sampleScale));
         if (isGlass) {
-            densG.element(idx).assign(float(atomicLoad(gridG.element(idx))).div(float(SCALE)));
-            densB.element(idx).assign(float(atomicLoad(gridB.element(idx))).div(float(SCALE)));
+            densG.element(idx).assign(float(atomicLoad(gridG.element(idx))).div(float(SCALE)).mul(U.sampleScale));
+            densB.element(idx).assign(float(atomicLoad(gridB.element(idx))).div(float(SCALE)).mul(U.sampleScale));
         }
     })().compute(cells);
 
@@ -587,28 +706,16 @@ export function createCausticEngine({
     const bloomH = makeBlur(brightB, tmpB, true, U.bloomSigma);
     const bloomV = makeBlur(tmpB, bloomB, false, U.bloomSigma);
 
-    const clearMax = Fn(() => { atomicStore(maxB.element(uint(0)), uint(0)); })().compute(1);
-
-    const reduceMax = Fn(() => {
-        const idx = instanceIndex.toVar();
-        If(idx.greaterThanEqual(uint(cells)), () => { Return(); });
-        // Peak over luminance so auto-exposure stays stable across RGB fans.
-        const lum = isGlass
-            ? max(sharpB.element(idx), max(sharpG.element(idx), sharpBb.element(idx)))
-            : sharpB.element(idx);
-        const q = uint(clamp(lum.mul(float(MAXSCALE)), float(0), float(U32_MAX)));
-        atomicMax(maxB.element(uint(0)), q);
-    })().compute(cells);
-
     const threshold = Fn(() => {
         const idx = instanceIndex.toVar();
         If(idx.greaterThanEqual(uint(cells)), () => { Return(); });
-        const invMax = float(MAXSCALE).div(max(float(atomicLoad(maxB.element(uint(0)))), float(1)));
         const lum = isGlass
             ? max(sharpB.element(idx), max(sharpG.element(idx), sharpBb.element(idx)))
             : sharpB.element(idx);
-        const nd = lum.mul(invMax);
-        brightB.element(idx).assign(max(float(0), nd.sub(float(0.4))));
+        const response = U.lightColor.mul(U.receiverAlbedo).mul(U.tint)
+            .mul(U.lightPower).mul(float(CAUSTIC_RESPONSE_SCALE / PI));
+        const responsePeak = max(response.x, max(response.y, response.z));
+        brightB.element(idx).assign(max(float(0), lum.mul(responsePeak).sub(float(0.55))));
     })().compute(cells);
 
     const resolve = Fn(() => {
@@ -616,31 +723,25 @@ export function createCausticEngine({
         If(idx.greaterThanEqual(uint(cells)), () => { Return(); });
         const px = idx.mod(uint(W));
         const py = idx.div(uint(W));
-        const invMax = float(MAXSCALE).div(max(float(atomicLoad(maxB.element(uint(0)))), float(1)));
+        const response = U.lightColor.mul(U.receiverAlbedo).mul(U.tint)
+            .mul(U.lightPower).mul(float(CAUSTIC_RESPONSE_SCALE / PI));
         if (isGlass) {
-            const nr = max(sharpB.element(idx).mul(invMax), float(0));
-            const ng = max(sharpG.element(idx).mul(invMax), float(0));
-            const nb = max(sharpBb.element(idx).mul(invMax), float(0));
-            // Soft crush; keep RGB ratios (no per-channel white-hot).
-            const cr = pow(nr, float(1.25));
-            const cg = pow(ng, float(1.25));
-            const cb = pow(nb, float(1.25));
-            const bloom = bloomB.element(idx).mul(U.bloomGain).mul(0.25);
-            const vr = float(1).sub(exp(cr.add(bloom).mul(-1.0)));
-            const vg = float(1).sub(exp(cg.add(bloom).mul(-1.0)));
-            const vb = float(1).sub(exp(cb.add(bloom).mul(-1.0)));
-            textureStore(causticTex, uvec2(px, py), vec4(
-                vr.mul(U.tint.x), vg.mul(U.tint.y), vb.mul(U.tint.z), float(1),
-            ));
+            // bloomB is already thresholded in physical-response space. Do not
+            // multiply by responsePeak again (that made light intensity square).
+            const bloom = bloomB.element(idx).mul(U.bloomGain).mul(float(0.28));
+            const rr = max(sharpB.element(idx).mul(response.x), float(0)).add(bloom);
+            const gg = max(sharpG.element(idx).mul(response.y), float(0)).add(bloom);
+            const bb = max(sharpBb.element(idx).mul(response.z), float(0)).add(bloom);
+            const vr = float(1).sub(exp(rr.mul(-1.0)));
+            const vg = float(1).sub(exp(gg.mul(-1.0)));
+            const vb = float(1).sub(exp(bb.mul(-1.0)));
+            textureStore(causticTex, uvec2(px, py), vec4(vr, vg, vb, float(1)));
         } else {
-            const nd = max(sharpB.element(idx).mul(invMax), float(0));
-            const core = pow(nd, float(2.6));
-            const I = core.add(bloomB.element(idx).mul(U.bloomGain));
-            const v = float(1).sub(exp(I.mul(-1.6)));
-            const hot = max(float(0), v.sub(float(0.75)).div(float(0.25)));
-            const rr = v.mul(U.tint.x.add(float(1).sub(U.tint.x).mul(hot)));
-            const gg = v.mul(U.tint.y.add(float(1).sub(U.tint.y).mul(hot)));
-            const bb = v.mul(U.tint.z.add(float(1).sub(U.tint.z).mul(hot)));
+            const core = max(sharpB.element(idx), float(0));
+            const bloom = bloomB.element(idx).mul(U.bloomGain);
+            const rr = float(1).sub(exp(core.mul(response.x).add(bloom).mul(-1.2)));
+            const gg = float(1).sub(exp(core.mul(response.y).add(bloom).mul(-1.2)));
+            const bb = float(1).sub(exp(core.mul(response.z).add(bloom).mul(-1.2)));
             textureStore(causticTex, uvec2(px, py), vec4(rr, gg, bb, float(1)));
         }
     })().compute(cells);
@@ -650,7 +751,7 @@ export function createCausticEngine({
     overlayMat.colorNode = texture(causticTex, uv());
     overlayMat.transparent = true;
     overlayMat.blending = THREE.AdditiveBlending;
-    overlayMat.depthTest = false;
+    overlayMat.depthTest = true;
     overlayMat.depthWrite = false;
     overlayMat.toneMapped = false;
     overlayMat.opacity = params.strength;
@@ -666,7 +767,9 @@ export function createCausticEngine({
     overlayMesh.renderOrder = 1000;
 
     // ── progressive dispatch ─────────────────────────────────────────
-    let dirty = true, accum = 0, converged = false, emit = null, emitCount = 0;
+    let dirty = true, needsDensityResolve = true, needsBloomResolve = true, needsFinalResolve = true;
+    let forceResolve = true, batchesSinceResolve = 0;
+    let accum = 0, converged = false, emit = null, emitCount = 0;
 
     function syncUniforms() {
         U.lightPos.value.set(params.light[0], params.light[1], params.light[2]);
@@ -688,47 +791,100 @@ export function createCausticEngine({
         return emit;
     }
 
-    function markDirty() { dirty = true; }
+    function syncSampleScale(totalPhotons) {
+        U.sampleScale.value = densityNormBase / Math.max(1, totalPhotons);
+    }
+
+    function resolveCurrent() {
+        if (needsDensityResolve) {
+            renderer.compute(convert);
+            renderer.compute(sharpH); renderer.compute(sharpV);
+            if (isGlass) {
+                renderer.compute(sharpHG); renderer.compute(sharpVG);
+                renderer.compute(sharpHB); renderer.compute(sharpVB);
+            }
+            needsDensityResolve = false;
+            needsBloomResolve = true;
+            needsFinalResolve = true;
+        }
+        if (needsBloomResolve) {
+            renderer.compute(threshold);
+            renderer.compute(bloomH); renderer.compute(bloomV);
+            needsBloomResolve = false;
+            needsFinalResolve = true;
+        }
+        if (needsFinalResolve) {
+            renderer.compute(resolve);
+            needsFinalResolve = false;
+        }
+        forceResolve = false;
+        batchesSinceResolve = 0;
+    }
+
+    function markAccumulationDirty() {
+        needsDensityResolve = true; needsBloomResolve = true; needsFinalResolve = true;
+    }
+    function markTraceDirty() { dirty = true; markAccumulationDirty(); forceResolve = true; }
+    function markDensityDirty() { markAccumulationDirty(); forceResolve = true; }
+    function markLookDirty() { needsBloomResolve = true; needsFinalResolve = true; forceResolve = true; }
+    function markFinalDirty() { needsFinalResolve = true; forceResolve = true; }
+    function markDirty() { markTraceDirty(); }
 
     // Call once per frame. Returns { accum, converged }.
     function update() {
         if (dirty) {
             renderer.compute(clearGrid);
             accum = 0; converged = false; dirty = false;
+            batchesSinceResolve = 0;
             U.frameSeed.value = (0x51f15e + Math.floor(params.light[0] * 1000) + Math.floor(params.light[1] * 100)) >>> 0;
         }
-        if (converged) return { accum, converged };
+        if (converged) {
+            if (needsDensityResolve || needsBloomResolve || needsFinalResolve) {
+                syncSampleScale(accum);
+                resolveCurrent();
+            }
+            return { accum, converged };
+        }
         const batch = Math.max(1000, params.photonBudget | 0);
         const e = ensureEmit(batch);
+        const nextAccum = accum + batch;
         U.frameSeed.value = (U.frameSeed.value + 1) >>> 0;
         renderer.compute(e);
-        renderer.compute(convert);
-        renderer.compute(sharpH); renderer.compute(sharpV);
-        if (isGlass) {
-            renderer.compute(sharpHG); renderer.compute(sharpVG);
-            renderer.compute(sharpHB); renderer.compute(sharpVB);
+        accum = nextAccum;
+        if (accum >= photonTarget) converged = true;
+        markAccumulationDirty();
+        batchesSinceResolve++;
+        if (forceResolve || accum === batch || converged || batchesSinceResolve >= params.resolveInterval) {
+            syncSampleScale(accum);
+            resolveCurrent();
         }
-        renderer.compute(clearMax); renderer.compute(reduceMax);
-        renderer.compute(threshold);
-        renderer.compute(bloomH); renderer.compute(bloomV);
-        renderer.compute(resolve);
-        accum += batch;
-        if (accum >= targetPhotons) converged = true;
         return { accum, converged };
     }
 
     // ── setters ──────────────────────────────────────────────────────
-    function setLight(x, y, z) { params.light = [x, y, z]; U.lightPos.value.set(x, y, z); markDirty(); }
+    function setLight(x, y, z) {
+        if (Math.abs(params.light[0] - x) < 1e-6
+            && Math.abs(params.light[1] - y) < 1e-6
+            && Math.abs(params.light[2] - z) < 1e-6) {
+            return;
+        }
+        params.light = [x, y, z];
+        U.lightPos.value.set(x, y, z);
+        markTraceDirty();
+    }
     function setCasterMatrices(doorMat, wheel0Mat, wheel1Mat) {
-        if (doorMat) U.doorMat.value.copy(doorMat);
-        if (wheel0Mat) U.wheel0Mat.value.copy(wheel0Mat);
-        if (wheel1Mat) U.wheel1Mat.value.copy(wheel1Mat);
-        markDirty();
+        let changed = false;
+        if (doorMat && !U.doorMat.value.equals(doorMat)) { U.doorMat.value.copy(doorMat); changed = true; }
+        if (wheel0Mat && !U.wheel0Mat.value.equals(wheel0Mat)) { U.wheel0Mat.value.copy(wheel0Mat); changed = true; }
+        if (wheel1Mat && !U.wheel1Mat.value.equals(wheel1Mat)) { U.wheel1Mat.value.copy(wheel1Mat); changed = true; }
+        if (changed) markTraceDirty();
     }
     function setMetal(name) {
         const p = CAUSTIC_METALS[name] || CAUSTIC_METALS.chrome;
+        if (Math.abs(params.roughness - p.roughness) < 1e-6
+            && p.rgb.every((v, i) => Math.abs(params.tint[i] - v) < 1e-6)) return;
         params.tint = p.rgb.slice(); params.roughness = p.roughness;
-        syncUniforms(); markDirty();
+        syncUniforms(); markTraceDirty();
     }
     // Switch to MESH emission: bake `mesh` (a THREE.Mesh) to world space, build a
     // per-triangle area CDF, upload geometry to storage, and emit photons off it.
@@ -779,47 +935,182 @@ export function createCausticEngine({
             acc += 0.5 * e1.subVectors(b, a).cross(e2.subVectors(c, a)).length();
             cdf[t] = acc;
         }
-        const inv = acc > 0 ? 1 / acc : 0;
+        if (acc <= 1e-10) throw new Error('setCasterMesh: geometry has zero surface area');
+        const inv = 1 / acc;
         for (let t = 0; t < triCount; t++) cdf[t] *= inv;
         cdf[triCount - 1] = 1.0; // guard the search's upper bound
 
+        // Pack CDF + threaded BVH + leaf triangle order into one float storage
+        // buffer. Keeping these tables together leaves the glass emitter at
+        // seven storage bindings, below WebGPU's portable per-stage minimum.
+        const bvh = buildCausticBvh(wpos, idxArr);
+        if (triCount > 0x00FFFFFF || bvh.nodeCount > 0x00FFFFFF) {
+            throw new Error('setCasterMesh: caustic BVH exceeds exact float-index range');
+        }
+        const nodeBase = cdf.length;
+        const triBase = nodeBase + bvh.nodes.length;
+        const accel = new Float32Array(triBase + bvh.triangles.length);
+        accel.set(cdf, 0);
+        accel.set(bvh.nodes, nodeBase);
+        for (let i = 0; i < bvh.triangles.length; i++) accel[triBase + i] = bvh.triangles[i];
+
         for (const at of meshAttrs) at?.dispose?.();
         meshAttrs.length = 0;
-        const posA = makeStorage(wpos), nrmA = makeStorage(wnrm), idxA = makeStorage(idxArr), cdfA = makeStorage(cdf);
-        meshAttrs.push(posA, nrmA, idxA, cdfA);
+        const posA = makeStorage(wpos), nrmA = makeStorage(wnrm), idxA = makeStorage(idxArr), accelA = makeStorage(accel);
+        meshAttrs.push(posA, nrmA, idxA, accelA);
         meshPos = storage(posA, 'float', wpos.length);
         meshNrm = storage(nrmA, 'float', wnrm.length);
         meshIdx = storage(idxA, 'uint', idxArr.length);
-        meshCdf = storage(cdfA, 'float', triCount);
+        meshAccel = storage(accelA, 'float', accel.length);
         meshTriCount = triCount;
         meshSearchIters = Math.max(1, Math.ceil(Math.log2(Math.max(2, triCount))) + 1);
+        meshBvhNodeCount = bvh.nodeCount;
+        meshBvhNodeBase = nodeBase;
+        meshBvhTriBase = triBase;
+        meshSurfaceArea = acc;
+        U.casterAreaScale.value = acc / REFERENCE_CASTER_AREA;
         emitMode = 'mesh';
         emitCount = -1; // force ensureEmit to rebuild with the mesh emitter
-        markDirty();
+        markTraceDirty();
     }
-    function setMetalTint(r, g, b) { params.tint = [r, g, b]; U.tint.value.set(r, g, b); }
-    function setRoughness(v) { params.roughness = v; syncUniforms(); markDirty(); }
-    function setSoftness(v) { params.softness = v; syncUniforms(); markDirty(); }
-    function setBloom(v) { params.bloom = v; U.bloomGain.value = v * 2.0; }  // resolve-only; no restart
-    function setStrength(v) { params.strength = v; overlayMat.opacity = v; }
-    function setPhotonBudget(n) { params.photonBudget = n; }
+    function setMetalTint(r, g, b) {
+        const next = [cleanUnit(r, params.tint[0]), cleanUnit(g, params.tint[1]), cleanUnit(b, params.tint[2])];
+        if (next.every((v, i) => Math.abs(params.tint[i] - v) < 1e-6)) return;
+        params.tint = next;
+        U.tint.value.set(next[0], next[1], next[2]);
+        markLookDirty();
+    }
+    function setRoughness(v) {
+        const next = Math.max(0, Number.isFinite(v) ? v : params.roughness);
+        if (Math.abs(params.roughness - next) < 1e-6) return;
+        params.roughness = next;
+        syncUniforms();
+        if (isGlass) markDensityDirty();
+        else markTraceDirty();
+    }
+    function setSoftness(v) {
+        const next = Math.max(0.05, Number.isFinite(v) ? v : params.softness);
+        if (Math.abs(params.softness - next) < 1e-6) return;
+        params.softness = next;
+        syncUniforms();
+        if (isGlass) markDensityDirty();
+        else markTraceDirty();
+    }
+    function setBloom(v) {
+        const next = Math.max(0, Number.isFinite(v) ? v : params.bloom);
+        if (Math.abs(params.bloom - next) < 1e-6) return;
+        params.bloom = next;
+        U.bloomGain.value = next * 2.0;
+        markFinalDirty();
+    }
+    function setStrength(v) {
+        const next = Math.max(0, Number.isFinite(v) ? v : params.strength);
+        if (Math.abs(params.strength - next) < 1e-6) return;
+        params.strength = next;
+        overlayMat.opacity = next;
+    }
+    function setPhotonBudget(n) { params.photonBudget = cleanPhotonCount(n, params.photonBudget); }
+    function setResolveInterval(n) {
+        params.resolveInterval = Math.max(1, Math.floor(Number.isFinite(n) ? n : params.resolveInterval));
+    }
+    function setTargetPhotons(n) {
+        const next = cleanPhotonCount(n, photonTarget);
+        if (photonTarget === next) return;
+        photonTarget = next;
+        converged = accum >= photonTarget;
+    }
+    function setLightIntensity(intensity, referenceIntensity = DEFAULT_LIGHT_INTENSITY) {
+        const ref = Number.isFinite(referenceIntensity) && referenceIntensity > 0 ? referenceIntensity : DEFAULT_LIGHT_INTENSITY;
+        const next = cleanUnit(intensity, 0) / ref;
+        if (Math.abs(params.lightPower - next) < 1e-6) return;
+        params.lightPower = next;
+        U.lightPower.value = next;
+        markLookDirty();
+    }
+    function setLightColor(r, g, b) {
+        const next = [
+            cleanUnit(r, params.lightColor[0]),
+            cleanUnit(g, params.lightColor[1]),
+            cleanUnit(b, params.lightColor[2]),
+        ];
+        if (next.every((v, i) => Math.abs(params.lightColor[i] - v) < 1e-6)) return;
+        params.lightColor = next;
+        U.lightColor.value.set(next[0], next[1], next[2]);
+        markLookDirty();
+    }
+    function setReceiverAlbedo(r, g, b) {
+        const next = [
+            cleanUnit(r, params.receiverAlbedo[0]),
+            cleanUnit(g, params.receiverAlbedo[1]),
+            cleanUnit(b, params.receiverAlbedo[2]),
+        ];
+        if (next.every((v, i) => Math.abs(params.receiverAlbedo[i] - v) < 1e-6)) return;
+        params.receiverAlbedo = next;
+        U.receiverAlbedo.value.set(next[0], next[1], next[2]);
+        markLookDirty();
+    }
+    function setLightCone(direction, angleRad = Math.PI / 2, penumbra = 0) {
+        if (!direction) {
+            if (U.spotEnabled.value === 0) return;
+            U.spotEnabled.value = 0;
+            markTraceDirty();
+            return;
+        }
+        const dir = direction.isVector3
+            ? direction.clone()
+            : new THREE.Vector3(direction[0] ?? 0, direction[1] ?? -1, direction[2] ?? 0);
+        if (dir.lengthSq() < 1e-8) {
+            if (U.spotEnabled.value === 0) return;
+            U.spotEnabled.value = 0;
+            markTraceDirty();
+            return;
+        }
+        const angle = Math.min(Math.max(Number.isFinite(angleRad) ? angleRad : Math.PI / 2, 0.001), Math.PI * 0.499);
+        const p = Math.min(Math.max(Number.isFinite(penumbra) ? penumbra : 0, 0), 0.999);
+        const innerAngle = Math.max(0.0005, angle * (1 - p));
+        dir.normalize();
+        const cosInner = Math.cos(innerAngle);
+        const cosOuter = Math.cos(angle);
+        if (U.spotEnabled.value > 0.5
+            && U.spotDir.value.distanceToSquared(dir) < 1e-10
+            && Math.abs(U.spotCosInner.value - cosInner) < 1e-6
+            && Math.abs(U.spotCosOuter.value - cosOuter) < 1e-6) {
+            return;
+        }
+        U.spotDir.value.copy(dir);
+        U.spotCosInner.value = cosInner;
+        U.spotCosOuter.value = cosOuter;
+        U.spotEnabled.value = 1;
+        markTraceDirty();
+    }
     // Soft t-cull strength (see U.throwSoft). Pass 1/reach^2 for a half-weight
     // throw distance of `reach` world units; 0 restores the classic open throw.
-    function setThrowFalloff(v) { U.throwSoft.value = Math.max(0, v); markDirty(); }
+    function setThrowFalloff(v) {
+        const next = Math.max(0, Number.isFinite(v) ? v : U.throwSoft.value);
+        if (Math.abs(U.throwSoft.value - next) < 1e-6) return;
+        U.throwSoft.value = next;
+        markTraceDirty();
+    }
     function setIor(v) {
-        params.ior = Math.max(1.01, v);
-        U.ior.value = params.ior;
-        markDirty();
+        const next = Math.max(1.01, Number.isFinite(v) ? v : params.ior);
+        if (Math.abs(params.ior - next) < 1e-6) return;
+        params.ior = next;
+        U.ior.value = next;
+        markTraceDirty();
     }
     function setDispersion(v) {
-        params.dispersion = Math.max(0, v);
-        U.dispersion.value = params.dispersion;
-        markDirty();
+        const next = Math.max(0, Number.isFinite(v) ? v : params.dispersion);
+        if (Math.abs(params.dispersion - next) < 1e-6) return;
+        params.dispersion = next;
+        U.dispersion.value = next;
+        markTraceDirty();
     }
     function setThickness(v) {
-        params.thickness = Math.max(0.02, v);
-        U.thickness.value = params.thickness;
-        markDirty();
+        const next = Math.max(0.02, Number.isFinite(v) ? v : params.thickness);
+        if (Math.abs(params.thickness - next) < 1e-6) return;
+        params.thickness = next;
+        U.thickness.value = next;
+        markTraceDirty();
     }
 
     function dispose() {
@@ -836,10 +1127,15 @@ export function createCausticEngine({
         mode: isGlass ? 'refract' : 'reflect',
         update,
         setLight, setCasterMatrices, setCasterMesh, setMetal, setMetalTint,
-        setRoughness, setSoftness, setBloom, setStrength, setPhotonBudget, setThrowFalloff,
-        setIor, setDispersion, setThickness,
+        setRoughness, setSoftness, setBloom, setStrength, setPhotonBudget, setResolveInterval, setTargetPhotons,
+        setLightIntensity, setLightColor, setReceiverAlbedo, setLightCone,
+        setThrowFalloff, setIor, setDispersion, setThickness,
         markDirty, dispose,
         get accum() { return accum; },
         get converged() { return converged; },
+        get photonBudget() { return params.photonBudget; },
+        get resolveInterval() { return params.resolveInterval; },
+        get targetPhotons() { return photonTarget; },
+        get casterArea() { return meshSurfaceArea; },
     };
 }
