@@ -1,13 +1,18 @@
 .playwright-mcp/
 .codex-*
 
-# Docs / working notes — keep untracked. README.md, CHANGELOG.md, and the
-# Sponza scene README stay tracked; everything else *.md is ignored.
+# Docs / working notes — keep untracked. README.md, the Sponza scene README,
+# and docs/CHANGELOG.md stay tracked; everything else *.md is ignored. The
+# 4-line /docs/ dance is required: un-ignore the dir, re-ignore its contents,
+# then whitelist the file — a bare negation can't reach inside an ignored
+# directory.
 *.md
 !README.md
-!CHANGELOG.md
 !Sponza/README.md
 /docs/
+!/docs/
+/docs/*
+!/docs/CHANGELOG.md
 
 # Local debug/WIP pages — the public repo and GitHub Pages ship only the
 # Sponza demo (index.html).
@@ -30,3 +35,6 @@ desktop.ini
 /dist/
 /build/
 /.cache/
+
+# Smoke tests stay local-only (npm test runs them from the working copy).
+scripts/*-smoke.mjs

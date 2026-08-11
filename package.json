@@ -30,6 +30,7 @@
     "url": "https://github.com/cl0nazepamm/speedball/issues"
   },
   "files": [
+    "docs/CHANGELOG.md",
     "js/caustic_bvh.js",
     "js/caustic_engine.js",
     "js/gi_clustered_lights_node.js",

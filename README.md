@@ -168,6 +168,10 @@ Light records are stride 17 floats (slot [16] = emitter class) and material
 records stride 28 (slot [25] = NIR albedo); these extra fields are inert for
 GI and exist for the night-vision render mode of downstream consumers.
 
+## Changelog
+
+Release history lives in [docs/CHANGELOG.md](docs/CHANGELOG.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
