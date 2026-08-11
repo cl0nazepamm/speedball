@@ -189,6 +189,6 @@ assert.match(tracerSrc, /gpu\?\.built !== built/, 'late PT completion cannot pub
 
 const probesSrc = await readFile(new URL('../js/gi_probes.js', import.meta.url), 'utf8');
 assert.match(probesSrc, /await built\.updateDeformsAsync/);
-assert.match(probesSrc, /cachedBuilt !== built/, 'late Halo completion cannot publish into a replacement field');
+assert.match(probesSrc, /cachedBuilt !== built/, 'late Speedball completion cannot publish into a replacement field');
 
 console.log('gi async deform refit smoke: ok');

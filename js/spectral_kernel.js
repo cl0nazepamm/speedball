@@ -25,7 +25,7 @@
 //               (powershot-threejs/infrared, setInputMode("nir")).
 //
 // The BVH traversal + JH-spectral/env/PBR shading emitters live in
-// spectral_traverse.js (shared byte-identically with the HALO-GI probe kernel).
+// spectral_traverse.js (shared byte-identically with the Speedball GI probe kernel).
 
 import * as TSL from 'three/tsl';
 
@@ -176,7 +176,7 @@ export function buildKernels({
 
     // ── shared traversal + shading emitters (BVH closest/any-hit, JH spectral,
     // env, PBR map sampling) bound to this kernel's storage + uniforms. Extracted
-    // to spectral_traverse.js so the HALO-GI probe kernel reuses identical logic
+    // to spectral_traverse.js so the Speedball GI probe kernel reuses identical logic
     // against the same resident BVH (no second acceleration structure).
     const trav = buildTraversal({
         storages: { bvhNodes, triIndex, vertexData, triMaterial, materials },

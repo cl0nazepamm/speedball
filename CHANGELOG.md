@@ -30,7 +30,7 @@ All notable changes to Speedball GI are documented here. This project follows
 - Frame-paced large deform refits so their 2 ms slices now yield through the
   next animation frame instead of chaining `scheduler.yield()` continuations
   ahead of paint. Normal-only settle packets update packed shading data without
-  refitting BLAS/TLAS bounds. HALO also resumes from interaction at a conservative
+  refitting BLAS/TLAS bounds. Speedball also resumes from interaction at a conservative
   ray budget, can throttle down to 2,048 rays on weak GPUs, and grows gradually
   after frame cadence recovers; stopped timeline scrubs therefore cannot turn
   the deferred catch-up lane into a sustained ~12 fps tail.
@@ -141,7 +141,7 @@ All notable changes to Speedball GI are documented here. This project follows
 ## [0.6.4] — 2026-07-13
 
 - Fixed unbounded WebGPU storage growth after settled animated-scene rebuilds.
-  HALO-GI now disposes obsolete compute nodes before releasing their bindings,
+  Speedball GI now disposes obsolete compute nodes before releasing their bindings,
   and explicitly evicts standalone `StorageBufferAttribute` resources from the
   Three r185 attribute manager so GPU buffers and renderer memory bookkeeping
   are actually released.
