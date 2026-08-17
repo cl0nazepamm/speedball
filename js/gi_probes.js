@@ -53,10 +53,10 @@ const TILE = OCT_RES + 2 * BORDER; // 8×8 atlas tile
 // The legacy boolean remains exact (`true` = ultra, `false` = off), while named
 // tiers let applications buy only the angular bandwidth they actually need.
 export const REFLECTION_QUALITY_TIERS = Object.freeze({
-    off: Object.freeze({ name: 'off', rough: false, glossy: false, glossyOct: 0, glossyUpdateInterval: 0, dominantGlossy: false, roughnessLimit: 0 }),
-    rough: Object.freeze({ name: 'rough', rough: true, glossy: false, glossyOct: 0, glossyUpdateInterval: 0, dominantGlossy: false, roughnessLimit: 1 }),
-    high: Object.freeze({ name: 'high', rough: true, glossy: true, glossyOct: 8, glossyUpdateInterval: 2, dominantGlossy: true, roughnessLimit: 1 }),
-    ultra: Object.freeze({ name: 'ultra', rough: true, glossy: true, glossyOct: 16, glossyUpdateInterval: 1, dominantGlossy: false, roughnessLimit: 1 }),
+    off: Object.freeze({ name: 'off', rough: false, glossy: false, glossyOct: 0, glossyUpdateInterval: 0, roughnessLimit: 0 }),
+    rough: Object.freeze({ name: 'rough', rough: true, glossy: false, glossyOct: 0, glossyUpdateInterval: 0, roughnessLimit: 1 }),
+    high: Object.freeze({ name: 'high', rough: true, glossy: true, glossyOct: 8, glossyUpdateInterval: 2, roughnessLimit: 1 }),
+    ultra: Object.freeze({ name: 'ultra', rough: true, glossy: true, glossyOct: 16, glossyUpdateInterval: 1, roughnessLimit: 1 }),
 });
 
 export function resolveReflectionQuality(reflectionQuality, roughReflections = false) {
@@ -269,7 +269,6 @@ export class GiProbeNode extends LightingNode {
         this._structGen = 0;     // bumps on grid resize / atlas realloc / cascade-count change ONLY
         this._roughReflectionsConfigured = false;
         this._glossyReflectionsConfigured = false;
-        this._dominantGlossy = false;
         this._glossyOctRes = 1;
         this._glossyTile = 1;
         this.intensity = 1.0;
@@ -393,16 +392,13 @@ export class GiProbeNode extends LightingNode {
         const glossy = rough && config?.glossy === true;
         const glossyOct = glossy ? Math.max(1, Math.round(config.glossyOct) || 1) : 1;
         const glossyTile = glossy ? glossyOct + 2 * BORDER : 1;
-        const dominantGlossy = glossy && config?.dominantGlossy === true;
         const changed = rough !== this._roughReflectionsConfigured
             || glossy !== this._glossyReflectionsConfigured
-            || glossyOct !== this._glossyOctRes
-            || dominantGlossy !== this._dominantGlossy;
+            || glossyOct !== this._glossyOctRes;
         this._roughReflectionsConfigured = rough;
         this._glossyReflectionsConfigured = glossy;
         this._glossyOctRes = glossyOct;
         this._glossyTile = glossyTile;
-        this._dominantGlossy = dominantGlossy;
         if (changed) this._structGen++;
     }
     setChebyStrength(v) { if (Number.isFinite(v)) { this.chebyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); touchGiUniforms(); } }
@@ -592,7 +588,10 @@ export class GiProbeNode extends LightingNode {
         return Fn(() => {
             const res = this.resNode[c];
             const cell = this.gridSizeNode[c].div(res.sub(1.0).max(vec3(1.0)));
-            const gridF = P.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
+            // Probe interpolation is a spatial lookup and must use the actual surface
+            // position. P carries the outward normal bias exclusively for visibility;
+            // letting it drive gridF makes the selected cage move when normal bias moves.
+            const gridF = reflectionP.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
             const baseF = gridF.floor().clamp(vec3(0.0), res.sub(2.0).max(vec3(0.0)));
             const frac = gridF.sub(baseF).clamp(0.0, 1.0);
             const Nn = Nvis.normalize();
@@ -640,14 +639,6 @@ export class GiProbeNode extends LightingNode {
             const wsum = float(0.0).toVar();
             const roughWsum = float(0.0).toVar();
             const glossyWsum = this._glossyReflectionsConfigured ? float(0.0).toVar() : null;
-            // Smooth reflections use only the spatially dominant cage corner in the
-            // high tier. Diffuse and the broad lobe keep their stable trilinear gather;
-            // ultra deliberately retains the historical eight glossy taps.
-            const dominantI = this._dominantGlossy
-                ? select(frac.x.greaterThanEqual(float(0.5)), uint(1), uint(0))
-                    .add(select(frac.y.greaterThanEqual(float(0.5)), uint(2), uint(0)))
-                    .add(select(frac.z.greaterThanEqual(float(0.5)), uint(4), uint(0)))
-                : null;
             Loop({ start: uint(0), end: uint(8), type: 'uint', condition: '<' }, ({ i }) => {
                 const dx = i.bitAnd(uint(1)).toFloat();
                 const dy = i.shiftRight(uint(1)).bitAnd(uint(1)).toFloat();
@@ -664,16 +655,14 @@ export class GiProbeNode extends LightingNode {
                 wsum.addAssign(w);
                 const wantsRough = roughLobeMix.greaterThan(float(0.0));
                 const wantsGlossy = this._glossyReflectionsConfigured
-                    ? (this._dominantGlossy
-                        ? roughLobeMix.lessThan(float(1.0)).and(i.equal(dominantI))
-                        : roughLobeMix.lessThan(float(1.0)))
+                    ? roughLobeMix.lessThan(float(1.0))
                     : null;
                 const wantsThisTap = this._glossyReflectionsConfigured ? wantsRough.or(wantsGlossy) : wantsRough;
                 If(reflectionWeight.greaterThan(float(0.0)).and(wantsThisTap), () => {
                     const row = pz.mul(res.y).add(py);
                     // Parallax-aware probe lookup. The depth atlas gives a directional
                     // mean radius around this probe. Intersect the fragment reflection
-                    // ray P+tR with that sphere, then fetch radiance in the direction
+                    // ray reflectionP+tR with that sphere, then fetch radiance in the direction
                     // from the actual probe origin to the shared hit proxy. This makes
                     // neighbouring probes agree on local silhouettes instead of all
                     // sampling the same world direction from different origins.
@@ -720,8 +709,7 @@ export class GiProbeNode extends LightingNode {
                                 float(0.0),
                             );
                             // SSR-style confidence idea without screen-space dependence:
-                            // smooth reflections prefer the dominant local probe and probes
-                            // whose depth proxy actually supports the reprojected hit.
+                            // prefer probes whose depth proxy supports the reprojected hit.
                             const confidence = mix(float(0.2), float(1.0), parallaxWeight);
                             const glossyProbeW = reflectionProbeW.mul(confidence);
                             glossyAcc.addAssign(glossy.mul(glossyProbeW));
@@ -755,7 +743,9 @@ export class GiProbeNode extends LightingNode {
         if (!useFine) return this._sampleCombinedCascadeLooped(P, reflectionP, Nvis, Ndir, Rdir, reflectionWeight, roughLobeMix, 0, dualDetail);
 
         return Fn(() => {
-            const f = P.sub(this.gridMinNode[1]).div(this.gridSizeNode[1].max(vec3(1e-6)));
+            // Cascade ownership is spatial too; normal bias must not move a receiver
+            // across the fine-volume blend band.
+            const f = reflectionP.sub(this.gridMinNode[1]).div(this.gridSizeNode[1].max(vec3(1e-6)));
             const fLo = tslMin(tslMin(f.x, f.y), f.z);
             const fHi = tslMin(tslMin(float(1.0).sub(f.x), float(1.0).sub(f.y)), float(1.0).sub(f.z));
             const edge = tslMin(fLo, fHi);
@@ -3572,7 +3562,7 @@ export function createProbeField({
             glossyOct: glossyReflectionsEnabled ? glossyOctRes : 0,
             glossyTile: glossyReflectionsEnabled ? glossyTile : 0,
             glossyUpdateInterval,
-            glossyProbeGather: glossyReflectionsEnabled ? (reflectionConfig.dominantGlossy ? 1 : 8) : 0,
+            glossyProbeGather: glossyReflectionsEnabled ? 8 : 0,
             glossyAtlas: glossyReflectionsEnabled ? [C.glossyAtlasW, C.glossyAtlasH] : [0, 0],
             cascades, cascade: ci, budgetRays: tickBudgetRays,
         }; },

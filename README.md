@@ -67,7 +67,7 @@ or BVH traversal:
 - **`off`** — zero reflection buffers, atlases, compute, or material sampling.
 - **`rough`** — the stable power-8 lobe in the compact 6x6 cache only.
 - **`high`** — rough plus an 8x8 power-64 glossy cache. Glossy texels are
-  interleaved over two solves and smooth receivers sample their dominant probe.
+  interleaved over two solves and receivers blend continuously across eight probes.
 - **`ultra`** — the legacy `roughReflections: true` path: 16x16 glossy resolution,
   every texel every solve, and eight glossy receiver probes.
 

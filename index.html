@@ -461,7 +461,7 @@ gi = installSpeedballGI({
   divisions: params.giDivisions,
   hysteresis: 0.95,
   // Balanced local reflections: 8x8 glossy texels, interleaved half-rate resolve,
-  // and a dominant-probe glossy receiver. Use `ultra` for the legacy 16x16/8-tap path.
+  // and a continuous 8-probe receiver. Use `ultra` for a 16x16/full-rate cache.
   reflectionQuality: params.giReflectionQuality,
   reflectionIntensity: params.giReflectionIntensity,
   roughnessLimit: 1,
