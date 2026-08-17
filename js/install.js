@@ -193,6 +193,20 @@ export function installSpeedballGI({
         _pos.copy(cam.position); _quat.copy(cam.quaternion);
         return moved;
     };
+    const _drawingSize = new THREE.Vector2();
+    let drawingWidth = -1;
+    let drawingHeight = -1;
+    const presentationSizeChanged = () => {
+        if (typeof renderer.getDrawingBufferSize !== 'function') return false;
+        renderer.getDrawingBufferSize(_drawingSize);
+        const width = Math.round(_drawingSize.x);
+        const height = Math.round(_drawingSize.y);
+        const changed = drawingWidth >= 0 && (width !== drawingWidth || height !== drawingHeight);
+        drawingWidth = width;
+        drawingHeight = height;
+        return changed;
+    };
+    presentationSizeChanged();
 
     return {
         ...gi,          // createProbeField returns plain closures (no `this`) — safe to spread
@@ -203,6 +217,7 @@ export function installSpeedballGI({
         update({ camera: cam = camera, playing = false } = {}) {
             const now = _now();
             if (cameraMoved(cam)) lastInteraction = now;
+            if (presentationSizeChanged()) gi.resetFramePacing();
             gi.tick({ idleMs: now - lastInteraction, playing });
         },
 

@@ -987,6 +987,7 @@ export function createProbeField({
             solveDtEma: 0,
             refreshStarted: false,
             ticksSinceRot: 0,
+            probeCoverageSinceRot: 0,
             glossyPhase: 0,
             prevAtlasW: 0, prevAtlasH: 0, prevGlossyAtlasW: 0, prevGlossyAtlasH: 0, prevProbeTotal: 0,
             needsClear: true, needsClassify: true,
@@ -1024,9 +1025,10 @@ export function createProbeField({
     // older build when it resumes.
     let buildGeneration = 0;
     let manualVolumes = null; // explicit probe volumes (Probe Origin boxes); null = auto-fit scene
-    // needsClassify / needsClear / probeCursor / refreshStarted / ticksSinceRot / prev*
+    // needsClassify / needsClear / probeCursor / refreshStarted / ticksSinceRot /
+    // probeCoverageSinceRot / prev*
     // are now PER-CASCADE (see makeCascade); frameCounter is SHARED (one ray-set rotation
-    // advanced only on C0's pass boundary — both cascades read the same U.frameJitter).
+    // advanced only from C0's accumulated coverage — both cascades read U.frameJitter).
     let rebuildBackoff = 0;   // ticks remaining before retrying after a failed/empty rebuild (A7)
     // ── auto-throttle (the hard rule: never lag the browser). The per-tick ray budget
     // adapts to the observed tick cadence: halve when frames slip, creep back up when
@@ -1040,6 +1042,14 @@ export function createProbeField({
     let budgetCooldown = 0;   // ticks to hold after a shrink before growing again (damps sawtooth)
     let inFlight = false;
     let disposed = false;
+
+    // A canvas resize/fullscreen transition can produce one slow presentation frame even
+    // though GI workload did not change. Discard that interval from the budget controller;
+    // keep the learned ray budget and temporal history intact.
+    function resetFramePacing() {
+        lastTickAt = 0;
+        tickDtEma = 0;
+    }
     let frameCounter = 0;
     let quantStep = 1;        // translation deadband (~quarter cell) for the geo signature (A1)
     let lightQuant = 1;       // scene-relative position deadband for the light signature (B4)
@@ -2441,6 +2451,8 @@ export function createProbeField({
             C.lastSolveAt = 0;
             C.solveDtEma = 0;
             C.refreshStarted = false;
+            C.ticksSinceRot = 0;
+            C.probeCoverageSinceRot = 0;
             C.glossyPhase = 0;
             C.needsClear = false;             // reuse the live atlas history (no black flash)
             C.needsClassify = true;           // refresh per-probe state for the new geometry
@@ -2472,6 +2484,8 @@ export function createProbeField({
         C.lastSolveAt = 0;
         C.solveDtEma = 0;
         C.refreshStarted = false;
+        C.ticksSinceRot = 0;
+        C.probeCoverageSinceRot = 0;
         C.glossyPhase = 0;
         C.needsClear = true;      // fresh StorageTextures aren't guaranteed zeroed
         C.needsClassify = true;
@@ -2894,18 +2908,21 @@ export function createProbeField({
                 );
                 C.U.probeOffset.value = C.probeCursor >>> 0;
                 C.U.updatedCount.value = updated >>> 0;
-                // (B1) Ray-set rotation shares ONE frameJitter, advanced ONLY on C0's pass
-                // boundary. Both cascades read the same U.frameJitter, so rayDir(k,jitter)
+                // (B1) Ray-set rotation shares ONE frameJitter, advanced ONLY from C0's
+                // accumulated probe coverage. Both cascades read the same U.frameJitter, so rayDir(k,jitter)
                 // stays byte-identical between trace and blend for whichever cascade runs
                 // this tick (rotation happens BEFORE any dispatch). When the WHOLE union
                 // solves every tick, rotate EVERY tick: re-blending the same deterministic
                 // ray set for ROT_MIN_TICKS pulls each texel ~26% toward that one estimate
                 // and then steps to the next — a visible ~10 Hz pulse, worst on the fine
                 // cascade (near-wall probes swing hard between ray sets). A fresh set per
-                // tick is a proper 5%-per-update Monte-Carlo accumulation instead. Multi-
-                // tick (round-robin) passes keep the ROT_MIN_TICKS spacing as before.
+                // tick is a proper 5%-per-update Monte-Carlo accumulation instead. Partial
+                // batches rotate once their accumulated work covers the field and the minimum
+                // spacing has elapsed. This must not depend on the cursor landing on exactly
+                // zero: many batch sizes never do so until hundreds of updates later.
                 C.ticksSinceRot++;
-                if (ci === 0 && C.probeCursor === 0 && (fullPassPerTick || C.ticksSinceRot >= ROT_MIN_TICKS)) {
+                const coverageComplete = C.probeCoverageSinceRot >= C.probeTotal;
+                if (ci === 0 && (fullPassPerTick || (coverageComplete && C.ticksSinceRot >= ROT_MIN_TICKS))) {
                     if (C.refreshStarted && !debugFreezeRayJitter) {
                         frameCounter = (frameCounter + 1) >>> 0;
                         U.frameJitter.value = debugFrameJitterOverride ?? ((frameCounter * 0.61803398875) % 1);
@@ -2914,8 +2931,10 @@ export function createProbeField({
                     }
                     C.refreshStarted = true;
                     C.ticksSinceRot = 0;
+                    C.probeCoverageSinceRot = 0;
                 }
                 C.probeCursor = C.probeTotal > 0 ? (C.probeCursor + updated) % C.probeTotal : 0;
+                C.probeCoverageSinceRot += updated;
 
                 // (A5) One-time-per-rebuild prep for cascade C ONLY. clear (full rebuild only)
                 // + the cheap uploadState (ALWAYS — sole writer of stateAtlas; skipping it
@@ -3425,6 +3444,7 @@ export function createProbeField({
     return {
         node,
         tick,
+        resetFramePacing,
         setEnabled,
         setIntensity: (v) => node.setIntensity(v),
         // Uniform/live. The structural atlas allocation is chosen once with
@@ -3620,6 +3640,7 @@ export function createProbeField({
                 needsClassify: C.needsClassify,
                 refreshStarted: C.refreshStarted,
                 ticksSinceRot: C.ticksSinceRot,
+                probeCoverageSinceRot: C.probeCoverageSinceRot,
                 hasGpu: !!C.gpu,
                 minCell: C.minCell,
             })),
