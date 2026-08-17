@@ -12,7 +12,10 @@
 export { installSpeedballGI, excludeFromGI, prepareMaterialsForGI } from './install.js';
 
 // Core BVH-traced DDGI probe field (octahedral, infinite-bounce, idle-gated).
-export { createProbeField, getGiProbeNode, GiProbeNode } from './gi_probes.js';
+export {
+    createProbeField, getGiProbeNode, GiProbeNode,
+    REFLECTION_QUALITY_TIERS, resolveReflectionQuality,
+} from './gi_probes.js';
 
 // Lights node that injects the GI term into every PBR material.
 // setNirDirectSensing flips the DIRECT term of emitter-class-'ir' lights between

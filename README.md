@@ -36,7 +36,7 @@ import { installSpeedballGI } from 'speedball-gi';
 // At SETUP before the first render / renderer.setAnimationLoop():
 const gi = installSpeedballGI({
   renderer, scene, camera,
-  roughReflections: true, // optional glossy + rough local reflections; reuses DDGI rays
+  reflectionQuality: 'high', // off | rough | high | ultra; reuses DDGI rays
   // reflectionSkyFallback: true, // only when setSky() should replace a missing environment map
 });
 
@@ -60,17 +60,31 @@ has already run, three has cached a non-GI lights node and GI will fail.
 
 ## Local DDGI reflections
 
-Pass **`roughReflections: true`** at creation time to build rough and glossy
-local-radiance lobes from the rays Speedball already traces. It adds no reflection
-rays or BVH traversal. Diffuse, depth, and the stable power-8 rough lobe keep the
-compact 6x6 octahedral cache; smooth materials use a separate 16x16, power-64
-glossy cache with support-aware temporal history. That high-resolution resolve is
-one additional dispatch per steady probe solve while the opt-in feature is enabled;
-new atlas allocations also receive a one-time clear.
+Choose a structural **`reflectionQuality`** at creation time. Every tier builds
+local-radiance lobes from rays Speedball already traces, adding no reflection rays
+or BVH traversal:
+
+- **`off`** — zero reflection buffers, atlases, compute, or material sampling.
+- **`rough`** — the stable power-8 lobe in the compact 6x6 cache only.
+- **`high`** — rough plus an 8x8 power-64 glossy cache. Glossy texels are
+  interleaved over two solves and smooth receivers sample their dominant probe.
+- **`ultra`** — the legacy `roughReflections: true` path: 16x16 glossy resolution,
+  every texel every solve, and eight glossy receiver probes.
+
+The old boolean remains compatible: `roughReflections: false` maps to `off`, and
+`roughReflections: true` maps to `ultra`. A named tier overrides the boolean.
+The bundled Sponza demo exposes the four modes under **SPEEDBALL GI → Quality →
+reflection quality**. Changing it reloads the page because the tier changes GPU
+buffers, bindings, compute kernels, and material graphs.
 
 The physical receiver reuses the diffuse gather's probe visibility, applies
 depth-moment parallax correction to each reflection lookup, and samples only the
-lobe(s) required by material roughness. The result stays in Three's native
+lobe(s) required by material roughness. Local reflections run through the full
+roughness range (`roughnessLimit` 1). Override at creation with `roughnessLimit` or
+live with `gi.setRoughnessLimit(0..1)`. Set
+`material.userData.speedballReflections = false` before material compilation for a
+zero-sampling per-material opt-out (then set `material.needsUpdate = true` if changed
+later). The result stays in Three's native
 `context.radiance` path, so Standard/Physical BRDF, metallic F0, Fresnel, and DFG
 remain Three's responsibility.
 
@@ -91,8 +105,9 @@ Changing this ownership at runtime reconverges through the normal temporal histo
 set it at creation when the layer boundary must be established before first solve.
 
 The whole feature is opt-in, so existing integrations keep their allocation,
-shader, and image path. Its live contribution is
-`gi.setReflectionIntensity(0..1)`.
+shader, and image path. `gi.setReflectionIntensity(0..1)` changes its live
+contribution; intensity zero skips receiver taps but structural `off` is the mode
+that also removes reflection compute and memory.
 
 ## Clustered lighting (secondary mode)
 

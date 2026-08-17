@@ -97,8 +97,10 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @param {number}  [opts.intensity=10]        canonical demo tuning (Sponza)
  * @param {number}  [opts.divisions=16]        probes along the longest grid axis
  * @param {number}  [opts.hysteresis=0.9]      temporal stability (higher = steadier / slower)
- * @param {boolean} [opts.roughReflections=false] reuse DDGI rays for glossy + rough local reflections; opt-in keeps legacy path allocation-free
+ * @param {boolean} [opts.roughReflections=false] legacy reflection switch (`true` = ultra, `false` = off)
+ * @param {'off'|'rough'|'high'|'ultra'} [opts.reflectionQuality] structural reflection tier; overrides roughReflections
  * @param {number}  [opts.reflectionIntensity=1] local-vs-environment reflection coverage blend, 0..1
+ * @param {number}  [opts.roughnessLimit] skip local receiver work above this material roughness; pinned at 1 when omitted
  * @param {boolean} [opts.reflectionSkyFallback=false] fill reflection misses from setSky() SH instead of leaving them for PMREM/SSR
  * @param {object}  [opts.lights]              max light counts for the batched lights node
  * @param {boolean|object} [opts.clusteredLighting=false]  SECONDARY MODE (three r185+): Forward+
@@ -125,7 +127,9 @@ export function installSpeedballGI({
     divisions = 16,
     hysteresis = 0.9,
     roughReflections = false,
+    reflectionQuality = null,
     reflectionIntensity = 1,
+    roughnessLimit = null,
     reflectionSkyFallback = false,
     lights = { maxDirectionalLights: 4, maxPointLights: 16, maxSpotLights: 16, maxHemisphereLights: 2 },
     clusteredLighting = false,
@@ -168,7 +172,9 @@ export function installSpeedballGI({
         hysteresis,
         divisions,
         roughReflections,
+        reflectionQuality,
         reflectionIntensity,
+        roughnessLimit,
         reflectionSkyFallback,
         clusteredLighting: clustered,
         onRebuilt: markMaterialsDirty,

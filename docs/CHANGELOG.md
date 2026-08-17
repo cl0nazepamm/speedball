@@ -5,6 +5,15 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Added structural local-reflection quality tiers: `off`, `rough`, `high`, and
+  `ultra`. The Sponza demo now uses `high`, which resolves an 8x8 glossy cache
+  on interleaved two-phase texels and samples one dominant glossy probe; legacy
+  `roughReflections: true` maps to the unchanged 16x16/every-solve `ultra`
+  quality contract. The live receiver cutoff is `roughnessLimit` (pinned at 1,
+  hidden from the Quality panel). Added the compile-time
+  `material.userData.speedballReflections = false` opt-out. The
+  Sponza Quality panel now exposes the four structural tiers and reloads while
+  retaining scene/query state when the selection changes.
 - Light reactivity now rides THROUGH motion: the light-signature check and
   `refreshLights()` moved out of the rest-only gate in `tick()`. Lights are
   refresh-class (in-place buffer refill — no BVH, no compile, bounded
