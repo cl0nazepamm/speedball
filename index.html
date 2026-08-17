@@ -89,7 +89,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
 import { positionWorld, normalWorld, pass } from 'three/tsl';
-import { FilmPipeline, FILM_PRESETS, FILM_PRESET_KEYS, applyFilmPreset, filmPass } from 'powershot-threejs';
+import { FilmPipeline, FILM_PRESETS, applyFilmPreset, filmPass } from 'powershot-threejs';
 import { installSpeedballGI, excludeFromGI, prepareMaterialsForGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
 import { createSpectralTracer } from './js/spectral_tracer.js';
@@ -277,12 +277,11 @@ const params = {
   // in an integrator — so there is no factor that makes the two agree by
   // construction. This is the knob for matching them by eye.
   ptSamplesPerFrame: 1, ptSampleLimit: 2048, ptEnvIntensity: 16,
-  // PowerShot film emulation (experimental — not persisted). Tuned baseline applies
-  // after the Kodak stock preset so the sliders and shader uniforms agree on load.
-  filmEnabled: true, filmStock: 'kodak_500t', filmAmount: 1.0, filmExposure: 2.5, filmGamma: 0.6,
+  // PowerShot film (pinned look — one Film checkbox). Kodak 500T + these overrides.
+  filmEnabled: true, filmStock: 'kodak_500t', filmAmount: 1.0, filmExposure: 1.55, filmGamma: 0.6,
   filmGrain: 0, filmGrainSize: 2.35, filmGrainSat: 0.8,
   filmHalation: 0, filmHalThreshold: 0.45, filmHalSoftness: 0.46, filmHalRadius: 1.8, filmHalColor: [1.0, 0.35, 0.08],
-  filmWeave: 0.48, filmFlicker: 0.12, filmPrintExposure: 0, filmPrintWarmth: 0, filmNegative: false,
+  filmWeave: 0, filmFlicker: 0, filmPrintExposure: -0.16, filmPrintWarmth: -0.17, filmNegative: false,
 };
 // Hosted Sponza always starts from these canonical values. Do not restore or persist
 // GUI tweaks here; a public demo should recover to the intended look on every reload.
@@ -491,7 +490,6 @@ addGiPanel(gui, gi, params, {
     if (quality !== REFLECTION_QUALITY) reloadWithStructuralSetting('reflections', quality, 'high');
   },
 });
-gui.add(params, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => { renderer.toneMappingExposure = v; });   // uncapped
 window.gi = gi; // console handle for poking
 window.gui = gui;
 window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = gi.markMaterialsDirty; // diagnostics
@@ -506,8 +504,7 @@ window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = 
 const film = new FilmPipeline(renderer);
 applyFilmPreset(film.ctx, FILM_PRESETS[params.filmStock]);
 const P = film.ctx.P;
-// Tuned baseline overrides. Apply after the stock preset so the initial Sponza look is
-// deterministic and the GUI numbers match the shader uniforms.
+// Tuned baseline overrides. Apply after the stock preset so the look is deterministic.
 film.ctx.power.value = params.filmAmount;        // 1.0 = full film, no blend with source
 P.exposure.value = params.filmExposure;          // photographic stops on the LINEAR input; −0.5 ≈ the scene's display exposure (0.7 = −0.5 stops) so mid-gray lands on the film's 0.18 reference
 P.inputGamma.value = params.filmGamma;           // pre-H&D exposure-domain shaping (film default 0.65), NOT an sRGB decode
@@ -521,7 +518,7 @@ P.halRadius.value = params.filmHalRadius;
 P.halColor.value.fromArray(params.filmHalColor);
 P.weave.value = params.filmWeave;
 P.flicker.value = params.filmFlicker;
-P.printExposure.value = params.filmPrintExposure * 0.301;   // slider is in stops → log10 density (matches max.js)
+P.printExposure.value = params.filmPrintExposure * 0.301;   // stops → log10 density (matches max.js)
 P.printWarmth.value = params.filmPrintWarmth;
 P.negativeView.value = params.filmNegative ? 1 : 0;
 const post = new THREE.PostProcessing(renderer);
@@ -529,29 +526,24 @@ post.outputColorTransform = false;               // film already emits display-e
 post.outputNode = filmPass(pass(scene, camera), film);   // SCENE-LINEAR in (no renderOutput) — the film owns the transfer
 window.film = film;
 
-// Every knob below is a point-op uniform → live, no recompile, no hitch.
-const fFilm = gui.addFolder('Film (PowerShot)');
-const filmCtrls = [];   // preset-backed controllers, refreshed when the stock changes
-fFilm.add(params, 'filmEnabled').name('enabled');
-fFilm.add(params, 'filmStock', FILM_PRESET_KEYS).name('stock').onChange((v) => {
-  applyFilmPreset(film.ctx, FILM_PRESETS[v]);     // rewrites the preset-backed uniforms…
-  P.exposure.value = params.filmExposure;         // exposure is a creative override — keep the user's
-  P.halStrength.value = 0;                        // halation off — no Quality tab
-  P.grainStrength.value = 0;                      // grain off — no Quality tab
-  params.filmWeave = P.weave.value;
-  params.filmFlicker = P.flicker.value;
-  filmCtrls.forEach((c) => c.updateDisplay());
+let displayExposure = params.exposure;
+params.exposure = params.filmEnabled ? params.filmExposure : displayExposure;
+if (!params.filmEnabled) renderer.toneMappingExposure = displayExposure;
+const exposureCtrl = gui.add(params, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => {
+  if (params.filmEnabled) {
+    params.filmExposure = v;
+    P.exposure.value = v;
+  } else {
+    displayExposure = v;
+    renderer.toneMappingExposure = v;
+  }
 });
-fFilm.add(params, 'filmAmount', 0, 1, 0.01).name('amount').onChange((v) => { film.ctx.power.value = v; });
-fFilm.add(params, 'filmExposure', -3, 3, 0.01).name('exposure (stops)').onChange((v) => { P.exposure.value = v; });
-fFilm.add(params, 'filmGamma', 0.4, 1.5, 0.01).name('input gamma').onChange((v) => { P.inputGamma.value = v; });
-fFilm.add(params, 'filmNegative').name('negative view').onChange((v) => { P.negativeView.value = v ? 1 : 0; });
-
-const fGate = fFilm.addFolder('Gate / Print');
-filmCtrls.push(fGate.add(params, 'filmWeave', 0, 3, 0.01).name('gate weave').onChange((v) => { P.weave.value = v; }));
-filmCtrls.push(fGate.add(params, 'filmFlicker', 0, 1, 0.01).name('flicker').onChange((v) => { P.flicker.value = v; }));
-fGate.add(params, 'filmPrintExposure', -1, 1, 0.01).name('print exposure (stops)').onChange((v) => { P.printExposure.value = v * 0.301; });
-fGate.add(params, 'filmPrintWarmth', -1, 1, 0.01).name('print warmth').onChange((v) => { P.printWarmth.value = v; });
+gui.add(params, 'filmEnabled').name('Film').onChange((on) => {
+  params.exposure = on ? params.filmExposure : displayExposure;
+  if (on) P.exposure.value = params.filmExposure;
+  else renderer.toneMappingExposure = displayExposure;
+  exposureCtrl.updateDisplay();
+});
 
 // ── Centre sphere ─────────────────────────────────────────────────────────────
 const fBall = gui.addFolder('Centre sphere');
