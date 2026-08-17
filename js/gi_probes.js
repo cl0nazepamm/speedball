@@ -1058,6 +1058,7 @@ export function createProbeField({
     let checkCounter = 0;
     let lastIdleMs = Infinity;
     let lastMoving = false;
+    let lastPlaying = false;
     let lastRestOnly = true;
     let lastSolveList = '';
     let lastUpdatedCount = 0;
@@ -1074,7 +1075,10 @@ export function createProbeField({
         // derived from this first, then normalized once with hysteresisExponent.
         hysteresis: uniform(THREE.MathUtils.clamp(hysteresis, 0, 0.99)),
         hysteresisExponent: uniform(1.0),
-        depthSharpness: uniform(50.0),  // cosine power → depth tracks nearest occluder crisply
+        // Raw cosine exponent. Seven is already a ~25 degree half-power cone and
+        // about 7.5 effective samples at the default 64 rays; the old implicit 50
+        // collapsed the estimate to roughly one ray and made visibility brittle.
+        depthSharpness: uniform(7.0),
         radianceClamp: uniform(8.0),    // cap the multibounce feedback term (anti-runaway)
         classifyStrength: uniform(0.0), // gates relocation APPLY (mirrors node.classifyStrengthNode)
         filterStrength: uniform(1.0),   // CORE denoise: 0 = filter off (harness baseline), 1 = full intra-tile spatial filter
@@ -2699,13 +2703,19 @@ export function createProbeField({
         const playing = opts.playing === true;
         const moving = idleMs < GI_IDLE_MS || playing;
         const wasMoving = lastMoving;
+        const wasPlaying = lastPlaying;
         lastIdleMs = idleMs;
         lastMoving = moving;
-        if (!moving && wasMoving) {
+        lastPlaying = playing;
+        if (!moving && wasMoving && (!continuous || wasPlaying)) {
             // Scrub/playback release can expose a geometry catch-up/refit on
             // the same first idle frames. Never resume a strict-idle field at
             // its stale pre-interaction maximum ray budget and make those
-            // bounded CPU slices compete with a full GPU solve.
+            // bounded CPU slices compete with a full GPU solve. Continuous-mode
+            // GUI/camera interaction never paused the solve, though: clamping
+            // that live budget on release creates a visible full-pass -> sparse-
+            // batch cadence cliff, so leave it untouched unless playback itself
+            // just stopped and the rest-only scene scans may need to catch up.
             tickBudgetRays = probeBudgetAfterInteraction(tickBudgetRays);
             tickDtEma = 0;
             lastTickAt = 0;
@@ -3578,6 +3588,7 @@ export function createProbeField({
         _debugState: () => ({
             idleMs: lastIdleMs,
             moving: lastMoving,
+            playing: lastPlaying,
             restOnly: lastRestOnly,
             continuous,
             dirty,

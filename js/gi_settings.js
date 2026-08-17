@@ -86,7 +86,12 @@ export function addGiPanel(gui, gi, params, {
     }
     fQ.add(params, 'giNormalBias', 0, 4, 0.05).name('normal bias').onChange((v) => { gi.setNormalBias(v); onInteract(); });
     fQ.add(params, 'giRadianceClamp', 0, 32, 0.5).name('radiance clamp').onChange((v) => { gi.setRadianceClamp(v); onInteract(); });
-    fQ.add(params, 'giDepthSharpness', 0, 200, 1).name('depth sharpness').onChange((v) => { gi.setDepthSharpness(v); onInteract(); });
+    // This is the raw cosine exponent, not a percentage. At the default 64 rays,
+    // power 7 already leaves only ~7.5 effective samples per directional texel;
+    // the former 0..200 range put almost the entire slider in an undersampled,
+    // nearest-ray regime. Keep the demo in its useful 64-ray range. The API setter
+    // still accepts larger powers for integrations that deliberately use more rays.
+    fQ.add(params, 'giDepthSharpness', 0, 7, 0.1).name('depth sharpness').onChange((v) => { gi.setDepthSharpness(v); onInteract(); });
     fQ.add(params, 'giLeak', 0, 1, 0.05).name('chebyshev strength').onChange((v) => { gi.setChebyStrength(v); onInteract(); });
     if (typeof gi.setSkyIntensity === 'function') {
         fQ.add(params, 'giSky', 0, 2, 0.05).name('sky light').onChange((v) => { gi.setSkyIntensity(v); onInteract(); });
