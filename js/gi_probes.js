@@ -114,6 +114,10 @@ const GI_CHEBY_BIAS_CELL = 0.08;       // Chebyshev SELF-OCCLUSION tolerance as 
                                        // visibility through real walls is preserved.
 const MAX_TRIANGLES = 4_000_000;
 const MAX_LIGHTS = 64;             // matches spectral_scene LIGHT_STRIDE table
+const GI_LIGHTS_PER_CELL = 16;
+const GI_LIGHT_CELL_STRIDE = GI_LIGHTS_PER_CELL + 1;
+const GI_LIGHT_CELL_OVERFLOW = GI_LIGHTS_PER_CELL + 1;
+const giLightDataCount = () => MAX_LIGHTS * _LIGHT_STRIDE;
 // ── reactivity: respond to live light/geometry edits ──
 // There is deliberately NO global reactive/low-hysteresis burst here. Edits
 // (lights, sky, transforms, trace-side knobs, rebuilds) flow through the trace
@@ -141,7 +145,7 @@ const DEFORM_CHECK_INTERVAL = 12;  // ticks between DEFORM checks (same-topology
 const GI_IDLE_MS = 200;            // ms of camera/sync quiet before GI work resumes
 const REBUILD_BACKOFF_TICKS = 45;  // ticks to wait after a failed/empty rebuild before retrying
 const PROBE_COMPUTE_KEYS = [
-    'traceKernel', 'blendKernel', 'glossyKernel', 'uploadKernel',
+    'traceKernel', 'blendKernel', 'glossyKernel', 'uploadKernel', 'lightGridKernel',
     'clearAtlasKernel', 'clearGlossyAtlasKernel', 'classifyKernel', 'uploadStateKernel',
 ];
 const PROBE_BVH_BUFFER_KEYS = ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights'];
@@ -920,6 +924,7 @@ export function createProbeField({
         };
     }
     const casc = [makeCascade(), makeCascade()];
+    const c0LightCellCount = () => Math.max(1, casc[0].res.x - 1) * Math.max(1, casc[0].res.y - 1) * Math.max(1, casc[0].res.z - 1);
 
     let continuous = true;    // DEFAULT ON: keep the bounded GPU solve running while the camera
                               // moves — heavy build steps still wait for rest, so the no-hitch
@@ -933,15 +938,15 @@ export function createProbeField({
     let cachedBuilt = null;
     // ── clustered-lighting mode (opt-in, structural at creation) ──
     // The raster side draws EVERY light through GiClusteredLightsNode; the GI lane
-    // keeps its "NEE over ALL lights" kernel by budgeting to a FIXED MAX_LIGHTS-slot
-    // arena filled by importance selection (see selectGiLights). Because the arena
-    // never changes size, light-count drift lands in the count uniform + an in-place
-    // refill — the clustered mode NEVER escalates a light edit to a BVH rebuild.
+    // budgets to a FIXED MAX_LIGHTS-slot arena filled by importance selection (see
+    // selectGiLights). Cell-list overflow and out-of-grid hits must fall back to that
+    // full arena so capacity and placement can never change the image.
     // With clusteredLighting:false every branch below is dead and the legacy
     // build/refresh path is byte-identical.
     const clusteredGi = clusteredLighting === true;
     let giLightArena = null;     // Float32Array(MAX_LIGHTS * _LIGHT_STRIDE), allocated at first fill
     let giSelectedCount = 0;
+    let giLightGridDirty = false;
     let buildDirty = true;
     // Monotonic invalidation token for the CPU soup. A native/browser scene
     // update can arrive while buildSpectralScene is yielding to material-map
@@ -1206,6 +1211,7 @@ export function createProbeField({
     // same-dim rebuild. Returns the gpu object; the caller stores it in C.gpu.
     function buildKernels(built, C, reuse = null) {
         const U = C.U;                       // per-cascade + shared uniforms (folded by reference)
+        const isC0 = C === casc[0];
         const probeTotal = C.probeTotal;     // shadow the old flat name → per-cascade
         const atlasW = C.atlasW, atlasH = C.atlasH;
         const res = C.res;
@@ -1226,7 +1232,13 @@ export function createProbeField({
         const vertexData = storage(buffers.vertexData, 'float', buffers.vertexData.count).toReadOnly();
         const triMaterial = storage(buffers.triMaterial, 'uint', buffers.triMaterial.count).toReadOnly();
         const materials = storage(buffers.materials, 'float', buffers.materials.count).toReadOnly();
-        const lights = storage(buffers.lights, 'float', buffers.lights.count).toReadOnly();
+        // The clustered cell lists occupy the float arena's suffix. Keeping light
+        // records and exact-small-integer indices in ONE binding is structural:
+        // the trace kernel already uses the portable WebGPU baseline of eight
+        // storage buffers, so a separate grid binding makes its pipeline invalid.
+        const lightStorage = storage(buffers.lights, 'float', buffers.lights.count);
+        const lights = clusteredGi ? lightStorage : lightStorage.toReadOnly();
+        const lightGridCellCount = clusteredGi ? c0LightCellCount() : 0;
 
         const Utrav = {
             nodeCount: uniform(built.nodeCount >>> 0, 'uint'),
@@ -1335,6 +1347,53 @@ export function createProbeField({
         })();
 
         const loadLightVec3 = (base, off) => vec3(lights.element(base.add(uint(off))), lights.element(base.add(uint(off + 1))), lights.element(base.add(uint(off + 2))));
+        let lightGridKernel = null;
+        if (clusteredGi) {
+            const gridU = casc[0].U;
+            lightGridKernel = Fn(() => {
+                const cellIndex = instanceIndex.toVar();
+                If(cellIndex.greaterThanEqual(uint(lightGridCellCount)), () => { Return(); });
+                const cellsX = gridU.resX.sub(uint(1));
+                const cellsY = gridU.resY.sub(uint(1));
+                const ix = cellIndex.mod(cellsX);
+                const iy = cellIndex.div(cellsX).mod(cellsY);
+                const iz = cellIndex.div(cellsX.mul(cellsY));
+                const cellSize = vec3(
+                    gridU.gridSize.x.div(float(cellsX)),
+                    gridU.gridSize.y.div(float(cellsY)),
+                    gridU.gridSize.z.div(float(gridU.resZ.sub(uint(1)))),
+                );
+                const cellMin = gridU.gridMin.add(vec3(float(ix), float(iy), float(iz)).mul(cellSize));
+                const cellMax = cellMin.add(cellSize);
+                const listBase = uint(giLightDataCount()).add(cellIndex.mul(uint(GI_LIGHT_CELL_STRIDE)));
+                const count = uint(0).toVar();
+                Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
+                    const lb = li.mul(uint(_LIGHT_STRIDE));
+                    const ltype = lights.element(lb);
+                    const lpos = loadLightVec3(lb, 1);
+                    const lrange = lights.element(lb.add(uint(10)));
+                    const dx = tslMax(tslMax(cellMin.x.sub(lpos.x), float(0.0)), lpos.x.sub(cellMax.x));
+                    const dy = tslMax(tslMax(cellMin.y.sub(lpos.y), float(0.0)), lpos.y.sub(cellMax.y));
+                    const dz = tslMax(tslMax(cellMin.z.sub(lpos.z), float(0.0)), lpos.z.sub(cellMax.z));
+                    // Membership must be conservative: false positives cost work;
+                    // a boundary false negative changes radiance.
+                    const paddedRange = lrange.add(tslMax(float(1e-4), lrange.mul(float(1e-5))));
+                    const intersects = dx.mul(dx).add(dy.mul(dy)).add(dz.mul(dz)).lessThanEqual(paddedRange.mul(paddedRange));
+                    const member = ltype.lessThan(float(0.5)).or(lrange.lessThanEqual(float(0.0))).or(intersects);
+                    If(member, () => {
+                        If(count.lessThan(uint(GI_LIGHTS_PER_CELL)), () => {
+                            lights.element(listBase.add(uint(1)).add(count)).assign(float(li));
+                        });
+                        count.addAssign(uint(1));
+                    });
+                });
+                lights.element(listBase).assign(float(select(
+                    count.greaterThan(uint(GI_LIGHTS_PER_CELL)),
+                    uint(GI_LIGHT_CELL_OVERFLOW),
+                    count,
+                )));
+            })().compute(lightGridCellCount);
+        }
 
         // sample the (last-frame) atlas irradiance at world (P,N) — for multibounce.
         const sampleAtlas = (P, N) => {
@@ -1463,51 +1522,115 @@ export function createProbeField({
                     });
                 }
 
-                // NEE over ALL lights (count small; loop avoids sampling noise).
-                Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
-                    // stride matches spectral_scene LIGHT_STRIDE (17: [16] is the
-                    // emitter class — probes are RGB-domain except for the band
-                    // gate below: class-4 IR illuminators only exist when the
-                    // imager senses NIR, so their promoted (k,k,k) is scaled by
-                    // U.nirGate (0 in the visible band, 1 under NV).
-                    const lb = li.mul(uint(17)).toVar();
-                    const ltype = lights.element(lb);
-                    const lpos = loadLightVec3(lb, 1);
-                    const ldir = loadLightVec3(lb, 4);
-                    const eclass = lights.element(lb.add(uint(16)));
-                    const isIr = tslAbs(eclass.sub(float(4.0))).lessThan(float(0.25));
-                    const lcol = loadLightVec3(lb, 7).mul(select(isIr, U.nirGate.mul(U.nirGain), float(1.0)));
-                    const lrange = lights.element(lb.add(uint(10)));
-                    const ldecay = lights.element(lb.add(uint(11)));
-                    const lcosAngle = lights.element(lb.add(uint(12)));
-                    const lcosPen = lights.element(lb.add(uint(13)));
-                    const isDir = ltype.lessThan(float(0.5));
-                    const isSpot = float(ltype.sub(float(2.0)).abs()).lessThan(float(0.5));
-                    const toLight = select(isDir, ldir.mul(-1.0), lpos.sub(hitPos));
-                    const dist = select(isDir, float(1e4), tslMax(length(toLight), float(1e-4)));
-                    const wi = normalize(toLight);
-                    const ndl = tslMax(dot(ng, wi), float(0.0));
-                    // fold the light's peak into the gate so band-gated (black) lights
-                    // skip the shadow ray entirely, not just shade to zero.
-                    const lpeak = tslMax(tslMax(lcol.x, lcol.y), lcol.z);
-                    If(ndl.mul(lpeak).greaterThan(float(0.0)), () => {
-                        const blocked = traverseAny(hitPos, wi, dist.sub(traceBias));
-                        If(blocked.lessThan(float(0.5)), () => {
-                            const falloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
-                            const rr = dist.div(tslMax(lrange, float(1e-4)));
-                            const rr2 = rr.mul(rr);
-                            const win = clamp(float(1.0).sub(rr2.mul(rr2)), float(0.0), float(1.0));
-                            const ranged = falloff.mul(win.mul(win));
-                            const posAtten = select(lrange.greaterThan(float(0.0)), ranged, falloff);
-                            const distAtten = select(isDir, float(1.0), posAtten);
-                            const angleCos = dot(wi, ldir).mul(-1.0);
-                            const spotAtten = clamp(angleCos.sub(lcosAngle).div(tslMax(lcosPen.sub(lcosAngle), float(1e-4))), float(0.0), float(1.0));
-                            const atten = distAtten.mul(select(isSpot, spotAtten, float(1.0)));
-                            const diffuse = kd.mul(float(1.0).div(float(PI)));
-                            radiance.addAssign(diffuse.mul(ndl).mul(lcol).mul(atten).mul(U.debugDirectScale));
+                if (clusteredGi) {
+                    const shadeLight = (li) => {
+                        const lb = li.mul(uint(_LIGHT_STRIDE)).toVar();
+                        const ltype = lights.element(lb);
+                        const lpos = loadLightVec3(lb, 1);
+                        const ldir = loadLightVec3(lb, 4);
+                        const lrange = lights.element(lb.add(uint(10)));
+                        const isDir = ltype.lessThan(float(0.5));
+                        const toLight = select(isDir, ldir.mul(-1.0), lpos.sub(hitPos));
+                        const dist = select(isDir, float(1e4), tslMax(length(toLight), float(1e-4)));
+                        const wi = normalize(toLight);
+                        const ndl = tslMax(dot(ng, wi), float(0.0));
+                        const reachesHit = isDir.or(lrange.lessThanEqual(float(0.0))).or(dist.lessThan(lrange));
+                        If(ndl.greaterThan(float(0.0)).and(reachesHit), () => {
+                            const eclass = lights.element(lb.add(uint(16)));
+                            const isIr = tslAbs(eclass.sub(float(4.0))).lessThan(float(0.25));
+                            const lcol = loadLightVec3(lb, 7).mul(select(isIr, U.nirGate.mul(U.nirGain), float(1.0)));
+                            // Band-gated lights must stay black before the shadow query.
+                            const lpeak = tslMax(tslMax(lcol.x, lcol.y), lcol.z);
+                            If(ndl.mul(lpeak).greaterThan(float(0.0)), () => {
+                                const ldecay = lights.element(lb.add(uint(11)));
+                                const lcosAngle = lights.element(lb.add(uint(12)));
+                                const lcosPen = lights.element(lb.add(uint(13)));
+                                const isSpot = float(ltype.sub(float(2.0)).abs()).lessThan(float(0.5));
+                                const blocked = traverseAny(hitPos, wi, dist.sub(traceBias));
+                                If(blocked.lessThan(float(0.5)), () => {
+                                    const falloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
+                                    const rr = dist.div(tslMax(lrange, float(1e-4)));
+                                    const rr2 = rr.mul(rr);
+                                    const win = clamp(float(1.0).sub(rr2.mul(rr2)), float(0.0), float(1.0));
+                                    const ranged = falloff.mul(win.mul(win));
+                                    const posAtten = select(lrange.greaterThan(float(0.0)), ranged, falloff);
+                                    const distAtten = select(isDir, float(1.0), posAtten);
+                                    const angleCos = dot(wi, ldir).mul(-1.0);
+                                    const spotAtten = clamp(angleCos.sub(lcosAngle).div(tslMax(lcosPen.sub(lcosAngle), float(1e-4))), float(0.0), float(1.0));
+                                    const atten = distAtten.mul(select(isSpot, spotAtten, float(1.0)));
+                                    const diffuse = kd.mul(float(1.0).div(float(PI)));
+                                    radiance.addAssign(diffuse.mul(ndl).mul(lcol).mul(atten).mul(U.debugDirectScale));
+                                });
+                            });
+                        });
+                    };
+
+                    const gridU = casc[0].U;
+                    const cellCount = vec3(float(gridU.resX), float(gridU.resY), float(gridU.resZ)).sub(vec3(1.0));
+                    const cellSize = gridU.gridSize.div(cellCount);
+                    const cellF = hitPos.sub(gridU.gridMin).div(cellSize).floor();
+                    const outside = cellF.x.lessThan(float(0.0)).or(cellF.y.lessThan(float(0.0))).or(cellF.z.lessThan(float(0.0)))
+                        .or(cellF.x.greaterThanEqual(cellCount.x)).or(cellF.y.greaterThanEqual(cellCount.y)).or(cellF.z.greaterThanEqual(cellCount.z));
+                    const safeCell = cellF.clamp(vec3(0.0), cellCount.sub(vec3(1.0)));
+                    const cx = uint(safeCell.x), cy = uint(safeCell.y), cz = uint(safeCell.z);
+                    const cellsX = gridU.resX.sub(uint(1)), cellsY = gridU.resY.sub(uint(1));
+                    const cellIndex = cz.mul(cellsX.mul(cellsY)).add(cy.mul(cellsX)).add(cx);
+                    const listBase = uint(giLightDataCount()).add(cellIndex.mul(uint(GI_LIGHT_CELL_STRIDE)));
+                    const listCount = uint(lights.element(listBase));
+                    If(outside.or(listCount.greaterThan(uint(GI_LIGHTS_PER_CELL))), () => {
+                        Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => { shadeLight(li); });
+                    }).Else(() => {
+                        Loop({ start: uint(0), end: listCount, type: 'uint', condition: '<' }, ({ i }) => {
+                            shadeLight(uint(lights.element(listBase.add(uint(1)).add(i))));
                         });
                     });
-                });
+                } else {
+                    // NEE over ALL lights (count small; loop avoids sampling noise).
+                    Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
+                        // stride matches spectral_scene LIGHT_STRIDE (17: [16] is the
+                        // emitter class — probes are RGB-domain except for the band
+                        // gate below: class-4 IR illuminators only exist when the
+                        // imager senses NIR, so their promoted (k,k,k) is scaled by
+                        // U.nirGate (0 in the visible band, 1 under NV).
+                        const lb = li.mul(uint(17)).toVar();
+                        const ltype = lights.element(lb);
+                        const lpos = loadLightVec3(lb, 1);
+                        const ldir = loadLightVec3(lb, 4);
+                        const eclass = lights.element(lb.add(uint(16)));
+                        const isIr = tslAbs(eclass.sub(float(4.0))).lessThan(float(0.25));
+                        const lcol = loadLightVec3(lb, 7).mul(select(isIr, U.nirGate.mul(U.nirGain), float(1.0)));
+                        const lrange = lights.element(lb.add(uint(10)));
+                        const ldecay = lights.element(lb.add(uint(11)));
+                        const lcosAngle = lights.element(lb.add(uint(12)));
+                        const lcosPen = lights.element(lb.add(uint(13)));
+                        const isDir = ltype.lessThan(float(0.5));
+                        const isSpot = float(ltype.sub(float(2.0)).abs()).lessThan(float(0.5));
+                        const toLight = select(isDir, ldir.mul(-1.0), lpos.sub(hitPos));
+                        const dist = select(isDir, float(1e4), tslMax(length(toLight), float(1e-4)));
+                        const wi = normalize(toLight);
+                        const ndl = tslMax(dot(ng, wi), float(0.0));
+                        // fold the light's peak into the gate so band-gated (black) lights
+                        // skip the shadow ray entirely, not just shade to zero.
+                        const lpeak = tslMax(tslMax(lcol.x, lcol.y), lcol.z);
+                        If(ndl.mul(lpeak).greaterThan(float(0.0)).and(isDir.or(lrange.lessThanEqual(float(0.0))).or(dist.lessThan(lrange))), () => {
+                            const blocked = traverseAny(hitPos, wi, dist.sub(traceBias));
+                            If(blocked.lessThan(float(0.5)), () => {
+                                const falloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
+                                const rr = dist.div(tslMax(lrange, float(1e-4)));
+                                const rr2 = rr.mul(rr);
+                                const win = clamp(float(1.0).sub(rr2.mul(rr2)), float(0.0), float(1.0));
+                                const ranged = falloff.mul(win.mul(win));
+                                const posAtten = select(lrange.greaterThan(float(0.0)), ranged, falloff);
+                                const distAtten = select(isDir, float(1.0), posAtten);
+                                const angleCos = dot(wi, ldir).mul(-1.0);
+                                const spotAtten = clamp(angleCos.sub(lcosAngle).div(tslMax(lcosPen.sub(lcosAngle), float(1e-4))), float(0.0), float(1.0));
+                                const atten = distAtten.mul(select(isSpot, spotAtten, float(1.0)));
+                                const diffuse = kd.mul(float(1.0).div(float(PI)));
+                                radiance.addAssign(diffuse.mul(ndl).mul(lcol).mul(atten).mul(U.debugDirectScale));
+                            });
+                        });
+                    });
+                }
 
                 // multibounce: add last frame's irradiance × albedo (the atlas is
                 // re-uploaded every tick, so this reads a valid prior field; on
@@ -2021,10 +2144,11 @@ export function createProbeField({
 
         return {
             buffers, traceKernel, blendKernel, glossyKernel, uploadKernel,
-            clearAtlasKernel, clearGlossyAtlasKernel, classifyKernel, uploadStateKernel,
+            clearAtlasKernel, clearGlossyAtlasKernel, classifyKernel, uploadStateKernel, lightGridKernel,
             atlas, roughSpecularAtlas, glossySpecularAtlas, depthAtlas, stateAtlas,
             irrBuffer, roughSpecularBuffer, glossySpecularBuffer, glossyWeightBuffer,
             depthBuffer, stateBuffer, rayBuffer,
+            lightGridCellCount,
             maps: built.maps, lightCount: clusteredGi ? giSelectedCount : built.lightCount,
         };
     }
@@ -2200,7 +2324,8 @@ export function createProbeField({
         const sameDim = !!C.gpu
             && atlasW === C.prevAtlasW && atlasH === C.prevAtlasH
             && C.glossyAtlasW === C.prevGlossyAtlasW && C.glossyAtlasH === C.prevGlossyAtlasH
-            && probeTotal === C.prevProbeTotal;
+            && probeTotal === C.prevProbeTotal
+            && (!clusteredGi || C.gpu.lightGridCellCount === c0LightCellCount());
         if (sameDim) {
             const prev = C.gpu;
             const reuse = {
@@ -2261,6 +2386,17 @@ export function createProbeField({
         C.needsClear = true;      // fresh StorageTextures aren't guaranteed zeroed
         C.needsClassify = true;
         return true;              // recompile occurred
+    }
+
+    async function flushGiLightGrid(cascadeIndex = null) {
+        if (!clusteredGi) return;
+        // Clear before submission so a concurrent light refill cannot be lost.
+        giLightGridDirty = false;
+        const targets = cascadeIndex === null ? casc : [casc[cascadeIndex]];
+        for (const C of targets) {
+            const kernel = C?.gpu?.lightGridKernel;
+            if (kernel) await renderer.computeAsync(kernel);
+        }
     }
 
     // STAGE 0 of the staggered build: (re)compute BOTH cascades' dims off the SHARED soup
@@ -2423,6 +2559,11 @@ export function createProbeField({
         const c1SameDim = c1WasReady && buildCascadeCount >= 2
             && casc[1].atlasW === casc[1].prevAtlasW && casc[1].atlasH === casc[1].prevAtlasH && casc[1].probeTotal === casc[1].prevProbeTotal;
         const recompiled = buildOneCascade(built, 0);
+        if (clusteredGi) {
+            giLightGridDirty = true;
+            await flushGiLightGrid(0);
+            if (disposed) return false;
+        }
         if (buildCascadeCount < 2) {
             // No fine cascade this build → single-grid shader + dispose C1, finish now.
             node.setCascadeCount(1);
@@ -2447,11 +2588,12 @@ export function createProbeField({
 
     // STAGE 1: build C1 only (one idle tick after C0), then flip cascadeCountNode to 2 so
     // the fragment starts blending the fine cascade. Runs behind the SAME idle gate as C0.
-    function advanceBuildStageC1() {
+    async function advanceBuildStageC1() {
         const built = cachedBuilt;
         if (!built) { buildStage = 2; return; }
         const genBefore = node._structGen;
         const recompiled = buildOneCascade(built, 1);
+        if (clusteredGi) await flushGiLightGrid(1);
         node.setCascadeCount(2);  // C1 online → fragment blends fine cascade
         buildStage = 2;
         // C1's setGrid/setAtlases + setCascadeCount bump _structGen only on the full path;
@@ -2512,7 +2654,7 @@ export function createProbeField({
         if (buildStage < 2) {
             if (!restOnly) return;
             inFlight = true;
-            try { advanceBuildStageC1(); } finally { inFlight = false; }
+            try { await advanceBuildStageC1(); } finally { inFlight = false; }
             return;
         }
 
@@ -2563,6 +2705,11 @@ export function createProbeField({
             const ls = lightSignature();
             if (lastLightSig !== null && ls !== lastLightSig) refreshLights();
             lastLightSig = ls;
+        }
+        if (clusteredGi && giLightGridDirty) {
+            inFlight = true;
+            try { await flushGiLightGrid(); } finally { inFlight = false; }
+            if (disposed || dirty || giLightGridDirty) return;
         }
         if (restOnly) {
             if (checkCounter % XFORM_CHECK_INTERVAL === 0) {
@@ -3000,7 +3147,9 @@ export function createProbeField({
         return scored.map(([, i]) => records[i]);
     }
     function fillGiLightArena(records) {
-        const need = MAX_LIGHTS * _LIGHT_STRIDE;
+        // Float32 represents every small cell count/index exactly. Packing the
+        // lists after the fixed record arena avoids a ninth storage binding.
+        const need = giLightDataCount() + c0LightCellCount() * GI_LIGHT_CELL_STRIDE;
         if (!giLightArena || giLightArena.length !== need) giLightArena = new Float32Array(need);
         const selected = selectGiLights(records);
         giLightArena.fill(0);
@@ -3031,6 +3180,7 @@ export function createProbeField({
                 g.lightCount = giSelectedCount;
                 g.buffers.lights.needsUpdate = true;
             }
+            giLightGridDirty = true;
             return;
         }
         if (records.length !== casc[0].gpu.lightCount) { requestRebuild(); return; }

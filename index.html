@@ -2,68 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>SPEEDBALL GI — standalone (WebGPU DDGI + Sky)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0A0D12">
+<title>SPEEDBALL GI — real-time DDGI for three.js WebGPU</title>
+<link rel="icon" href="data:,">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="./css/concrete_connect.css">
-<style>
-  /* Concrete Connect / E16 branding (see css/concrete_connect.css). */
-  :root { --mono: 'JetBrains Mono', ui-monospace, "Cascadia Code", Menlo, monospace; }
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #9a9a9a; color: #111;
-    font: 12px/1.5 var(--mono); }
-  #c { display: block; width: 100vw; height: 100vh; touch-action: none; }
-
-  /* ── HUD: clean text overlay (no panel) ─────────────────────────────────── */
-  #hud { position: fixed; left: 14px; top: 12px; pointer-events: none; max-width: 46ch; z-index: 10;
-    color: #f2f2f2; text-shadow: 0 1px 2px #000, 0 0 2px #000c; }
-  #hud .title { font: 800 13px/1.5 Verdana, system-ui, sans-serif; letter-spacing: 0.12em; text-transform: uppercase; }
-  #hud .sub { color: #d6d6d6; }
-
-  /* ── status / loading overlay ───────────────────────────────────────────── */
-  #status { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
-    padding: 14px 22px; color: #111; white-space: pre; text-align: center;
-    background: linear-gradient(to bottom, #eeeeee, #b8b8b8); border: 1px solid #242424; border-radius: 6px;
-    box-shadow: 6px 8px 20px rgba(0,0,0,0.45), inset 1px 1px 2px rgba(255,255,255,0.9);
-    font: 700 11px/1.5 var(--mono); text-shadow: 1px 1px 0 #fff; }
-  #status.err { border-color: #6b2330; color: #7a0e1c; background: linear-gradient(to bottom, #f0dede, #cc9a9a); text-shadow: none; }
-  #status.hide { display: none; }
-
-  /* ── lil-gui: concrete skin ─────────────────────────────────────────────── */
-  .lil-gui { --width: 300px; --font-size: 11px;
-    --background-color: #cccccc; --text-color: #141414;
-    --title-background-color: #b8b8b8; --title-text-color: #050505;
-    --widget-color: #909090; --hover-color: #9e9e9e; --focus-color: #ababab;
-    --number-color: #0b3d6b; --string-color: #3a5f2a;
-    --font-family: Verdana, system-ui, sans-serif; --font-family-mono: var(--mono);
-    --widget-height: 20px; }
-  .lil-gui.root { border: 1px solid #242424; border-radius: 8px 8px 3px 3px;
-    background: linear-gradient(to bottom, #e4e4e4, #bcbcbc);
-    box-shadow: 7px 9px 24px rgba(0,0,0,0.48), inset 1px 1px 2px rgba(255,255,255,0.96); }
-  .lil-gui.root > .title { background: linear-gradient(to bottom, #d9d9d9 0%, #bdbdbd 44%, #8f8f8f 50%, #b8b8b8 100%);
-    border-bottom: 1px solid #555; color: #050505; text-shadow: 1px 1px 0 #fff;
-    font: 800 11px/1 Verdana, system-ui, sans-serif; letter-spacing: 0.10em; text-transform: uppercase; }
-  .lil-gui .children { background: transparent; }
-  .lil-gui .title { text-shadow: 1px 1px 0 rgba(255,255,255,0.45); }
-
-  @media (max-width: 700px), (max-height: 560px) {
-    #hud { left: 10px; top: max(8px, env(safe-area-inset-top)); max-width: calc(100vw - 20px); }
-    #hud .title { font-size: 11px; letter-spacing: 0.08em; }
-    #hud .sub { display: none; }
-    #status { width: min(320px, calc(100vw - 32px)); box-sizing: border-box; white-space: pre-wrap; }
-    .lil-gui { --width: calc(100vw - 16px); --font-size: 12px; --widget-height: 26px; }
-    .lil-gui.root {
-      position: fixed !important;
-      left: 8px !important; right: 8px !important; top: auto !important;
-      bottom: calc(8px + env(safe-area-inset-bottom, 0px)) !important;
-      width: auto !important; max-height: min(34vh, 360px); overflow-y: auto;
-      overscroll-behavior: contain; touch-action: pan-y;
-    }
-    .lil-gui.root.closed { max-height: 32px; overflow: hidden; }
-    .lil-gui.root > .title { min-height: 28px; }
-  }
-</style>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700;800&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./css/dossier.css">
 <script type="importmap">
 {
   "imports": {
@@ -72,7 +18,7 @@
     "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.tsl.js",
     "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.0/examples/jsm/",
     "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.10/build/index.module.js",
-    "powershot-threejs": "https://cdn.jsdelivr.net/npm/powershot-threejs@0.5.0/src/index.js"
+    "powershot-threejs": "https://cdn.jsdelivr.net/npm/powershot-threejs@0.8.1/src/index.js"
   },
   "scopes": {
     "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.10/": { "three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.module.js" }
@@ -82,11 +28,59 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="hud">
-  <div class="title">SPEEDBALL GI</div>
-  <span class="sub">drag to orbit · scroll to zoom · sun = azimuth/elevation · <a href="./dispersion.html" style="color:#9ec8ff;pointer-events:auto;text-decoration:none">glass dispersion</a> · <a href="./clustered.html" style="color:#9ec8ff;pointer-events:auto;text-decoration:none">clustered lighting</a></span>
+<div id="bootwash"></div>
+
+<div id="ui">
+  <header class="topstrip">
+    <div class="brand">
+      <a class="brand-pill" href="https://github.com/cl0nazepamm/speedball" target="_blank" rel="noreferrer">SPEEDBALL<i class="arrow"></i></a>
+      <div class="brand-mark">GI</div>
+      <div class="brand-meta">
+        <span>REAL-TIME DDGI / <b>WEBGPU</b></span>
+        <span>SPECIMEN <b id="scene-meta">SPONZA + PREETHAM SKY</b></span>
+      </div>
+    </div>
+
+    <div class="topcenter">
+      <span class="live">SOLVER</span>
+      <i class="sep"></i>
+      <span id="engine-note">BVH-TRACED · INFINITE BOUNCE · NO BAKE</span>
+    </div>
+
+    <nav class="nav">
+      <!-- Scene: Sponza sunlit, Sponza under the 50-light no-sun clustered grid,
+           or Bistro. Each reloads — the clustered lights node is chosen at install
+           time, and the models are far too heavy to swap in place. -->
+      <div class="seg" role="group" aria-label="Scene">
+        <button id="scene-sun" type="button" aria-pressed="true">SPONZA</button>
+        <button id="scene-cluster" type="button" aria-pressed="false">CLUSTER</button>
+        <button id="scene-bistro" type="button" aria-pressed="false">BISTRO</button>
+      </div>
+      <i class="divider"></i>
+      <!-- Light-transport engine. Exclusive: only one runs at a time. -->
+      <div class="seg" role="group" aria-label="Engine">
+        <button id="engine-raster" type="button" aria-pressed="true">RASTER</button>
+        <button id="engine-pt" type="button" aria-pressed="false">PATH TRACE</button>
+      </div>
+      <i class="divider"></i>
+      <button id="gui-toggle" type="button" aria-pressed="true"><span class="num">[ ]</span>CONTROLS</button>
+    </nav>
+  </header>
+
+  <!-- Transport: drives the centre sphere so the GI lane can be watched reacting
+       to real motion rather than to a still frame. -->
+  <div class="transport" id="transport">
+    <button id="play" type="button" aria-pressed="false" title="Play the sphere animation">
+      <i class="glyph" aria-hidden="true"></i><span class="label">ANIMATE</span>
+    </button>
+    <i class="rule"></i>
+    <div class="readout"><span class="k">Engine</span><span class="v" id="t-engine">RASTER</span></div>
+    <i class="rule"></i>
+    <div class="readout"><span class="k" id="t-metric-k">FPS</span><span class="v" id="t-metric">—</span></div>
+  </div>
 </div>
-<div id="status">initializing WebGPU…</div>
+
+<div id="status"><i class="reg tl"></i><i class="reg br"></i><span id="status-msg">initializing WebGPU…</span></div>
 
 <script type="module">
 import * as THREE from 'three';
@@ -96,12 +90,78 @@ import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
 import { positionWorld, normalWorld, pass } from 'three/tsl';
 import { FilmPipeline, FILM_PRESETS, FILM_PRESET_KEYS, applyFilmPreset, filmPass } from 'powershot-threejs';
-import { installSpeedballGI, excludeFromGI } from './js/index.js';
+import { installSpeedballGI, excludeFromGI, prepareMaterialsForGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
+import { createSpectralTracer } from './js/spectral_tracer.js';
 
+// ── Scene ──────────────────────────────────────────────────────────────────────
+// 'sun'     — Sponza's sunlit atrium: Preetham sky + directional sun.
+// 'cluster' — Sponza with no sky, no sun, no ambient: a 50-point-light grid drawn
+//             by the Forward+ clustered lights node, GI on its fixed
+//             importance-budgeted arena.
+// 'bistro'  — Amazon Lumberyard Bistro under the same sky/sun rig. Two orders of
+//             magnitude more geometry than Sponza, so it is the scale test.
+//
+// The scene is a URL parameter and NOT a live toggle on purpose. clusteredLighting
+// is an install-time decision (the lights factory must be in place before any lit
+// material compiles), and swapping a 191MB model in place would mean disposing
+// every geometry, material and texture of the old one mid-frame. Reloading is the
+// honest way to change either.
+const SCENES = {
+  sun:     { model: 'sponza', clustered: false },
+  cluster: { model: 'sponza', clustered: true  },
+  bistro:  { model: 'bistro', clustered: false },
+};
+const SCENE_MODE = SCENES[new URLSearchParams(location.search).get('scene')] ? new URLSearchParams(location.search).get('scene') : 'sun';
+const CLUSTER = SCENES[SCENE_MODE].clustered;
+
+// Per-model load config. `hero` is a dialed-in camera; models without one are
+// auto-framed from their own bounds (use window.dumpCamera() to bake one in).
+const MODELS = {
+  sponza: {
+    url: './Sponza/glTF/Sponza.gltf',
+    meta: 'SPONZA + PREETHAM SKY',
+    hero: { cam: [1.1982, 4.5833, -3.463], target: [-3.2952, 4.4996, -3.2815] },
+    ballHeight: 0.30,   // fraction of model height above its floor
+    // This Sponza glTF imports with scalar metalness = 1 on stone/fabric. Fixed
+    // per-material below rather than through prepareMaterialsForGI, because it
+    // also wants roughness floored much higher than the library default.
+    prep: 'sponza',
+  },
+  bistro: {
+    url: './Bistro/Bistro_Godot.glb',
+    meta: 'BISTRO + PREETHAM SKY',
+    // Street-level view onto the café terrace — the shot Bistro is known for.
+    hero: { cam: [-14.9916, 1.1808, -5.3656], target: [15.2637, 3.2573, 2.6702] },
+    ballHeight: 0.22,    // Bistro's floor sits well above its bounds minimum
+    // Bistro has genuine metal and glass. Flattening it the way Sponza needs
+    // would destroy the look, so use the library's own conservative normalizer.
+    prep: 'library',
+    // Bistro's albedos and scale are not Sponza's: at Sponza's sun and film
+    // exposure it clips to white across most of the frame. These are the look
+    // overrides that put it back on the film's shoulder. The sphere scales too —
+    // a 0.55-unit ball is invisible in a 108-unit street.
+    look: {
+      sunIntensity: 3, filmExposure: 0.4, giIntensity: 12,
+      ballRadius: 1.2, ballOrbit: 7, ballBob: 1.5,
+    },
+  },
+};
+const MODEL = MODELS[SCENES[SCENE_MODE].model];
+
+// ── Dossier chrome handles (see css/dossier.css) ───────────────────────────────
+const uiEl = document.getElementById('ui');
 const statusEl = document.getElementById('status');
-const setStatus = (msg, err = false) => { statusEl.textContent = msg; statusEl.classList.toggle('err', err); statusEl.classList.remove('hide'); };
-const hideStatus = () => statusEl.classList.add('hide');
+const statusMsgEl = document.getElementById('status-msg');
+const bootWashEl = document.getElementById('bootwash');
+// The plate keeps its registration crosses, so write the copy into the inner span
+// rather than replacing the whole subtree.
+const setStatus = (msg, err = false) => {
+  statusMsgEl.textContent = msg;
+  statusEl.classList.toggle('err', err);
+  statusEl.classList.remove('hide');
+};
+const hideStatus = () => { statusEl.classList.add('hide'); bootWashEl.classList.add('hide'); };
 window.addEventListener('error', (e) => setStatus('Error:\n' + (e.error?.stack || e.message), true));
 window.addEventListener('unhandledrejection', (e) => setStatus('Error:\n' + (e.reason?.stack || e.reason), true));
 
@@ -115,8 +175,13 @@ renderer.toneMappingExposure = 0.7;
 await renderer.init();
 if (renderer.backend?.isWebGPUBackend !== true) {
   setStatus('WebGPU not available.\nThis demo needs a WebGPU-capable browser\n(Chrome/Edge 121+, or Firefox Nightly).', true);
+  uiEl.classList.add('ready');
   throw new Error('WebGPU unavailable');
 }
+// Backend is up: raise the chrome and drop the drafting-grid wash. The boot plate
+// stays on top of it until Sponza finishes loading.
+uiEl.classList.add('ready');
+bootWashEl.classList.add('hide');
 
 // SPEEDBALL GI is installed in one call further down (installSpeedballGI), which
 // wires the lights factory, the material-dirty pass, and idle-gated solving.
@@ -129,39 +194,70 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 
 // ── Sky (Preetham, WebGPU) + sun ──────────────────────────────────────────────
+// Cluster mode is deliberately unlit from above: every photon in it comes from
+// the point-light grid, so the sky, sun and fill are never added to the scene.
 const sky = new SkyMesh();
 sky.scale.setScalar(1500);                 // within the camera far plane (no z-precision hit)
 excludeFromGI(sky);                         // keep the sky OUT of the GI BVH / auto-fit
-scene.add(sky);
 
 const sun = new THREE.DirectionalLight(0xffffff, 3.2);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.bias = -0.0004;
 sun.shadow.normalBias = 0.05;
-scene.add(sun);
-scene.add(sun.target);
 
 // Tiny pre-convergence safety fill; SPEEDBALL probes carry the real sky ambient.
 const hemi = new THREE.HemisphereLight(0x9fc6ff, 0x4a4036, 0.05);
-scene.add(hemi);
+
+if (CLUSTER) {
+  scene.background = new THREE.Color(0x000000);
+} else {
+  scene.add(sky);
+  scene.add(sun);
+  scene.add(sun.target);
+  scene.add(hemi);
+}
 
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// The sun shadow is re-rendered ON DEMAND, not every frame. Measured on Bistro:
+// the shadow pass is 1534 extra draw calls and doubles the triangles submitted
+// (2526 draws / 4.88M tris per frame, vs 992 / 2.44M without it) — for a sun that
+// only moves when someone drags a slider. refreshSunConsumers() already sets
+// sun.shadow.needsUpdate on every sun change, and the render loop flags it while
+// the transport animates the sphere, so the map is current exactly when it
+// matters and free the rest of the time.
+//
+// It MUST be the light's own flag. three's WebGPU ShadowNode.updateBefore gates on
+// `shadow.needsUpdate || shadow.autoUpdate` and never consults
+// renderer.shadowMap.autoUpdate — that one is WebGL-path only, and setting it here
+// silently does nothing.
+sun.shadow.autoUpdate = false;
 
 // ── Parameters & controls ─────────────────────────────────────────────────────
 const params = {
   // New demo defaults (dialed-in look — film graded, on by default).
-  azimuth: 119, elevation: 62.5, turbidity: 3, rayleigh: 0.6,
+  azimuth: 119, elevation: 62.5, turbidity: 10, rayleigh: 0.6,
   sunIntensity: 20, exposure: 1,
   giEnabled: true, giIntensity: 20, giDivisions: 16, giCascades: 1, giContinuous: true, showProbes: false,
   // quality knobs (defaults mirror gi_probes.js). smoothness is pinned to 1 (no slider).
   giRays: 64, giHysteresis: 0.6, giHysteresisNormalize: true, giNormalBias: 1.75,
   giRadianceClamp: 8, giDepthSharpness: 0, giLeak: 0.8, giSolid: 0, giSky: 2, giNormalDetail: 1, giReflectionIntensity: 1,
   giChangeThreshold: 2.5, giSnapAmount: 0.30, giFireflyClamp: 6.0,   // adaptive temporal blend
-  // Centered Sponza corridor hero view.
+  // Centered Sponza corridor hero view. Cluster mode pulls back to a wide
+  // down-the-atrium view so the whole light grid is on screen at once.
   camX: 1.1982, camY: 4.5833, camZ: -3.463,
   targetX: -3.2952, targetY: 4.4996, targetZ: -3.2815,
+  // Centre sphere + its transport animation.
+  ballRadius: 0.55, ballRoughness: 0.06, ballOrbit: 2.6, ballSpeed: 0.22, ballBob: 0.55,
+  // Cluster mode: the point-light grid.
+  lightCount: 50, lightIntensity: 8, lightRange: 7, markers: true,
+  // Spectral path tracer. ptEnvIntensity is an EYEBALL match, not a conversion:
+  // the raster GI lane multiplies its sky term by giSky and its bounce by
+  // giIntensity, and giIntensity is an artistic gain with no physical counterpart
+  // in an integrator — so there is no factor that makes the two agree by
+  // construction. This is the knob for matching them by eye.
+  ptSamplesPerFrame: 1, ptSampleLimit: 2048, ptEnvIntensity: 16,
   // PowerShot film emulation (experimental — not persisted). Tuned baseline applies
   // after the Kodak stock preset so the sliders and shader uniforms agree on load.
   filmEnabled: true, filmStock: 'kodak_500t', filmAmount: 1.0, filmExposure: 2.5, filmGamma: 0.6,
@@ -171,6 +267,21 @@ const params = {
 };
 // Hosted Sponza always starts from these canonical values. Do not restore or persist
 // GUI tweaks here; a public demo should recover to the intended look on every reload.
+
+if (CLUSTER) {
+  // Wide down-the-atrium hero view — shows the whole 10×5 light grid at once.
+  params.camX = 9.5; params.camY = 6.8; params.camZ = -0.2;
+  params.targetX = -6; params.targetY = 3.2; params.targetZ = 0.1;
+  params.exposure = 1;
+  params.filmEnabled = false;   // the grid's saturated point lights already carry the look
+}
+// Per-model look overrides (exposure, sun, GI gain) applied over the Sponza baseline.
+if (MODEL.look) Object.assign(params, MODEL.look);
+// …and the model's hero view, so applyCamera() frames the right scene.
+if (MODEL.hero) {
+  [params.camX, params.camY, params.camZ] = MODEL.hero.cam;
+  [params.targetX, params.targetY, params.targetZ] = MODEL.hero.target;
+}
 
 function applyCamera() {
   camera.position.set(params.camX, params.camY, params.camZ);
@@ -196,6 +307,7 @@ const _giSkyGround = new THREE.Color();
 
 function updateGiSky() {
   if (!gi?.setSky) return;
+  if (CLUSTER) return;   // no sky in cluster mode — the grid is the only source
   // Compute-safe sky injection: approximate the sun-free SkyMesh dome as low-frequency
   // SH-9 on the CPU, then the probe kernel reads only 9 vec3 uniforms. No texture
   // sampling, no derivatives, no probe memory. The directional sun remains direct-only.
@@ -212,6 +324,7 @@ function updateGiSky() {
 }
 
 function updateSun() {
+  if (CLUSTER) return;
   const phi = THREE.MathUtils.degToRad(90 - params.elevation);  // 0 = zenith
   const theta = THREE.MathUtils.degToRad(params.azimuth);
   sunVec.setFromSphericalCoords(1, phi, theta);
@@ -279,11 +392,18 @@ function installGuiIdleGate(gui) {
   for (const type of ['pointerup', 'mouseup', 'touchend', 'touchcancel', 'blur']) window.addEventListener(type, end, true);
 }
 installGuiIdleGate(gui);
+// CONTROLS in the top strip parks the whole panel off-screen — the render is the
+// specimen, so it has to be possible to clear the glass off it.
+const guiToggleEl = document.getElementById('gui-toggle');
+guiToggleEl.addEventListener('click', () => {
+  const hidden = gui.domElement.classList.toggle('gui-hidden');
+  guiToggleEl.setAttribute('aria-pressed', String(!hidden));
+});
 const compactControls = window.matchMedia('(max-width: 700px), (max-height: 560px)');
 const fSky = gui.addFolder('Sky / Sun');
 fSky.add(params, 'azimuth', 0, 360, 1).name('azimuth°').onChange(updateSun);
 fSky.add(params, 'elevation', -3, 88, 0.5).name('elevation°').onChange(updateSun);
-fSky.add(params, 'turbidity', 0, 20, 0.1).onChange(updateSun);
+// turbidity pinned to 10 (no slider)
 fSky.add(params, 'rayleigh', 0, 8, 0.1).onChange(updateSun);
 fSky.add(params, 'sunIntensity').min(0).step(0.05).name('sun intensity').onChange(updateSun);   // uncapped
 // (the SPEEDBALL GI panel is added after gi is installed below — see addGiPanel)
@@ -326,7 +446,12 @@ gi = installSpeedballGI({
   reflectionIntensity: params.giReflectionIntensity,
   // This demo has a procedural SkyMesh but no PMREM environment. Let probe miss
   // rays provide its explicit distant-specular layer; SSR can still composite later.
-  reflectionSkyFallback: true,
+  // In cluster mode there is no sky at all, so the fallback would only add a lie.
+  reflectionSkyFallback: !CLUSTER,
+  // clusteredLighting swaps the batched DynamicLightsNode for the Forward+
+  // GiClusteredLightsNode (no 16-point batch cap) and switches the GI lane to its
+  // fixed importance-budgeted arena. Install-time only — see SCENE_MODE.
+  clusteredLighting: CLUSTER,
 });
 if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.', true);
 // Push the canonical settings so the GUI and the GI uniforms agree on first paint.
@@ -418,57 +543,253 @@ filmCtrls.push(fGate.add(params, 'filmWeave', 0, 3, 0.01).name('gate weave').onC
 filmCtrls.push(fGate.add(params, 'filmFlicker', 0, 1, 0.01).name('flicker').onChange((v) => { P.flicker.value = v; }));
 fGate.add(params, 'filmPrintExposure', -1, 1, 0.01).name('print exposure (stops)').onChange((v) => { P.printExposure.value = v * 0.301; });
 fGate.add(params, 'filmPrintWarmth', -1, 1, 0.01).name('print warmth').onChange((v) => { P.printWarmth.value = v; });
+
+// ── Centre sphere ─────────────────────────────────────────────────────────────
+const fBall = gui.addFolder('Centre sphere');
+fBall.add(params, 'ballRoughness', 0, 0.6, 0.005).name('roughness').onChange((v) => {
+  if (!ball) return;
+  ball.material.roughness = v;   // rough reflections read straight off the probe field
+  markGiInteraction();
+});
+fBall.add(params, 'ballOrbit', 0, 6, 0.05).name('orbit radius').onChange(markInteraction);
+fBall.add(params, 'ballBob', 0, 2, 0.01).name('bob height').onChange(markInteraction);
+fBall.add(params, 'ballSpeed', 0.02, 1, 0.01).name('speed').onChange(markInteraction);
+
+// ── Cluster mode: light grid controls (this scene mode only) ──────────────────
+if (CLUSTER) {
+  const fLights = gui.addFolder('Light grid');
+  fLights.add(params, 'lightCount', 10, 500, 10).name('light count (stress)').onFinishChange((v) => {
+    rebuildLights(v);
+    gi.forceLightingRefresh();     // count change = arena refill in clustered mode, never a rebuild
+    tracer?.markLightsDirty();
+  });
+  fLights.add(params, 'lightIntensity', 0, 40, 0.1).name('intensity').onChange((v) => {
+    for (const l of pointLights) l.intensity = v;
+    gi.forceLightingRefresh();
+    tracer?.markLightsDirty();
+  });
+  fLights.add(params, 'lightRange', 0, 20, 0.1).name('range').onChange((v) => {
+    for (const l of pointLights) l.distance = v;
+    gi.forceLightingRefresh();     // the light lane catches this within ~6 ticks; kick it for instant response
+    tracer?.markLightsDirty();
+  });
+  fLights.add(params, 'markers').name('markers').onChange((v) => { if (markerMesh) markerMesh.visible = v; });
+}
+
+// ── Spectral path tracer ──────────────────────────────────────────────────────
+// Live setOptions writes only — changing either knob restarts accumulation, which
+// is exactly what should happen when the integrator's terms move.
+const fPt = gui.addFolder('Path tracer');
+fPt.add(params, 'ptSamplesPerFrame', 1, 8, 1).name('samples / frame').onChange((v) => tracer?.setOptions({ samplesPerFrame: v }));
+fPt.add(params, 'ptSampleLimit', 64, 8192, 64).name('SPP limit').onChange((v) => tracer?.setOptions({ sampleLimit: v }));
+fPt.add(params, 'ptEnvIntensity', 0, 64, 0.5).name('sky gain').onChange((v) => {
+  // Read off scene.environmentIntensity per frame by the tracer; a change resets
+  // accumulation, which is correct — the integrand moved.
+  if (skyEnvTexture) scene.environmentIntensity = v;
+});
+
 if (compactControls.matches) gui.close();
 
+// ── Centre sphere + transport ─────────────────────────────────────────────────
+// The sphere is the demo's moving part. Standing still, GI convergence is easy to
+// fake with a long temporal tail; put a mirror ball on a circuit through the
+// atrium and the reflection lane has to keep up every frame. The transport is
+// therefore the honest stress test, not decoration.
+let ball = null;
+let sponzaBounds = null;
+const ballHome = new THREE.Vector3();
+let playing = false;
+let animClock = 0;          // seconds of animation played, paused-time excluded
+let lastAnimMs = 0;
+
+function updateBallAnimation(nowMs) {
+  if (!ball) return;
+  if (!playing) { lastAnimMs = nowMs; return; }
+  // The sphere is the only thing moving, and shadows are on-demand — so a playing
+  // transport is the one case that has to pay for the shadow pass per frame.
+  sun.shadow.needsUpdate = true;
+  const dt = lastAnimMs ? Math.min(0.1, (nowMs - lastAnimMs) / 1000) : 0;
+  lastAnimMs = nowMs;
+  animClock += dt;
+  const t = animClock * params.ballSpeed * Math.PI * 2;
+  // A slow circuit down the atrium's long axis with a vertical bob — the ball
+  // passes the red drapes on one side and the blue on the other, so the colour
+  // its reflection picks up changes continuously.
+  ball.position.set(
+    ballHome.x + Math.sin(t) * params.ballOrbit,
+    ballHome.y + Math.sin(t * 2) * params.ballBob,
+    ballHome.z + Math.cos(t) * params.ballOrbit * 0.35,
+  );
+  ball.rotation.y = t * 0.5;
+  ball.updateMatrixWorld(true);
+  // The raster GI lane has its own change detection and refits the BLAS in place,
+  // so it needs no poke here — but the path tracer syncs transforms only when it
+  // is told to, and every move invalidates its accumulated samples.
+  tracer?.markTransformsDirty();
+}
+
+const playEl = document.getElementById('play');
+const tEngineEl = document.getElementById('t-engine');
+const tMetricEl = document.getElementById('t-metric');
+const tMetricKEl = document.getElementById('t-metric-k');
+function setPlaying(on) {
+  playing = on === true;
+  lastAnimMs = 0;
+  playEl.setAttribute('aria-pressed', String(playing));
+  playEl.querySelector('.label').textContent = playing ? 'PAUSE' : 'ANIMATE';
+  markInteraction();
+}
+playEl.addEventListener('click', () => setPlaying(!playing));
+
+// ── Cluster mode: the point-light grid ────────────────────────────────────────
+const pointLights = [];
+let markerMesh = null;
+
+function rebuildLights(count) {
+  count = Math.max(1, Math.round(count));
+  for (const l of pointLights) scene.remove(l);
+  pointLights.length = 0;
+  if (markerMesh) {
+    scene.remove(markerMesh);
+    markerMesh.geometry.dispose();
+    markerMesh.material.dispose();
+    markerMesh = null;
+  }
+  if (!sponzaBounds) return;
+  const bounds = sponzaBounds;
+  const size = bounds.getSize(new THREE.Vector3());
+  const x0 = bounds.min.x + size.x * 0.08, x1 = bounds.max.x - size.x * 0.08;
+  const z0 = bounds.min.z + size.z * 0.14, z1 = bounds.max.z - size.z * 0.14;
+  // Vertical band: lantern height up through the gallery level, under the vaults.
+  const y0 = bounds.min.y + size.y * 0.16, y1 = bounds.min.y + size.y * 0.62;
+  // 3D grid: Y layers scale with count (50 → 2 layers, 500 → 4), each layer a
+  // ~2:1 x:z grid matching the atrium's long axis.
+  const gy = count < 40 ? 1 : count < 150 ? 2 : count < 350 ? 3 : 4;
+  const perLayer = Math.ceil(count / gy);
+  const gz = Math.max(1, Math.round(Math.sqrt(perLayer / 2)));
+  const gx = Math.max(1, Math.ceil(perLayer / gz));
+  const color = new THREE.Color();
+  for (let idx = 0; idx < count; idx++) {
+    const iy = Math.floor(idx / perLayer);
+    const inLayer = idx % perLayer;
+    const ix = inLayer % gx, iz = Math.floor(inLayer / gx);
+    color.setHSL(idx / count, 0.95, 0.55);
+    const light = new THREE.PointLight(color.clone(), params.lightIntensity, params.lightRange, 2);
+    light.castShadow = false;                      // clustering handles non-shadowed points
+    light.position.set(
+      THREE.MathUtils.lerp(x0, x1, gx > 1 ? ix / (gx - 1) : 0.5),
+      THREE.MathUtils.lerp(y0, y1, gy > 1 ? iy / (gy - 1) : 0.5),
+      THREE.MathUtils.lerp(z0, z1, gz > 1 ? iz / (gz - 1) : 0.5),
+    );
+    scene.add(light);
+    pointLights.push(light);
+  }
+  // Emissive-looking markers so the grid is inspectable (kept OUT of the GI BVH —
+  // excluded meshes don't churn the structure lane on rebuild).
+  const geo = new THREE.SphereGeometry(0.05, 10, 8);
+  const mat = new THREE.MeshBasicMaterial({ toneMapped: false });
+  markerMesh = new THREE.InstancedMesh(geo, mat, pointLights.length);
+  const m = new THREE.Matrix4();
+  for (let i = 0; i < pointLights.length; i++) {
+    m.makeTranslation(pointLights[i].position.x, pointLights[i].position.y, pointLights[i].position.z);
+    markerMesh.setMatrixAt(i, m);
+    markerMesh.setColorAt(i, pointLights[i].color);
+  }
+  markerMesh.instanceMatrix.needsUpdate = true;
+  markerMesh.instanceColor.needsUpdate = true;
+  markerMesh.visible = params.markers;
+  excludeFromGI(markerMesh);
+  scene.add(markerMesh);
+}
+
 // ── Load Sponza ────────────────────────────────────────────────────────────────
-setStatus('loading Sponza…');
-new GLTFLoader().load('./Sponza/glTF/Sponza.gltf', (gltf) => {
-  const sponza = gltf.scene;
-  sponza.traverse((o) => {
+setStatus(`loading ${MODEL.meta.split(' ')[0]}…`);
+new GLTFLoader().load(MODEL.url, (gltf) => {
+  const root = gltf.scene;
+  root.traverse((o) => {
     if (!o.isMesh) return;
     o.castShadow = true;
     o.receiveShadow = true;
+    if (MODEL.prep !== 'sponza') return;
     if (Array.isArray(o.material)) o.material.forEach(prepareSponzaMaterialForGi);
     else prepareSponzaMaterialForGi(o.material);
   });
-  scene.add(sponza);
+  // Bistro carries real metal and glass, so it gets the library's conservative
+  // normalizer rather than Sponza's flatten-everything fix.
+  if (MODEL.prep === 'library') prepareMaterialsForGI(root);
+  scene.add(root);
 
   // frame the camera to the model and size the shadow camera to its bounds
-  const box = new THREE.Box3().setFromObject(sponza);
+  const box = new THREE.Box3().setFromObject(root);
   const size = box.getSize(new THREE.Vector3());
   const radius = Math.max(size.x, size.y, size.z) * 0.5;
-  applyCamera();
+  if (MODEL.hero) {
+    applyCamera();
+  } else {
+    // No dialed-in hero view for this model yet. Frame from OUTSIDE the bounding
+    // box looking in, at a raised 3/4 angle: an interior guess needs to know where
+    // the open space is, and getting that wrong buries the camera inside a wall.
+    // Outside-looking-in is wrong-but-safe for any model. Dial a real view by
+    // hand, then paste window.dumpCamera() into this model's `hero`.
+    const centre = box.getCenter(new THREE.Vector3());
+    const dist = radius * 1.15;
+    camera.position.set(
+      centre.x + dist * 0.75,
+      box.min.y + size.y * 0.62,
+      centre.z + dist * 0.75,
+    );
+    controls.target.set(centre.x, box.min.y + size.y * 0.25, centre.z);
+    controls.update();
+  }
 
-  // A receiver-only pure metal target makes local reflection fidelity inspectable
-  // without letting the diagnostic sphere contaminate its own probe capture.
+  // ── Centre sphere ────────────────────────────────────────────────────────
+  // The hero specimen: a near-mirror metal ball parked on the atrium's centre
+  // line, at standing height. Unlike the old corner diagnostic it is a REAL
+  // scene object — in the GI BVH and in the traced scene — so it occludes
+  // probes, casts a shadow, and shows up under the path tracer. A metal surface
+  // contributes no diffuse bounce either way (SPEEDBALL kills Lambert bounce on
+  // metals), so keeping it in costs the bounce lane nothing.
+  sponzaBounds = box.clone();
+  const centre = box.getCenter(new THREE.Vector3());
+  ballHome.set(centre.x, box.min.y + size.y * (MODEL.ballHeight ?? 0.30), centre.z);
   const metalBall = new THREE.Mesh(
-    new THREE.SphereGeometry(0.4, 48, 32),
-    new THREE.MeshStandardMaterial({ color: 0xc6d0d8, metalness: 1, roughness: 0 }),
+    new THREE.SphereGeometry(params.ballRadius, 64, 40),
+    new THREE.MeshStandardMaterial({ color: 0xc6d0d8, metalness: 1, roughness: params.ballRoughness }),
   );
-  metalBall.name = 'Rough Reflection Metal Ball';
-  const ballDirection = controls.target.clone().sub(camera.position).normalize();
-  metalBall.position.copy(camera.position)
-    .addScaledVector(ballDirection, 2.2)
-    .add(new THREE.Vector3(0, -0.3, 0));
+  metalBall.name = 'Centre Sphere';
+  metalBall.position.copy(ballHome);
   metalBall.castShadow = true;
   metalBall.receiveShadow = true;
-  excludeFromGI(metalBall);
   scene.add(metalBall);
+  ball = metalBall;
 
   camera.near = radius * 0.01; camera.far = radius * 30; camera.updateProjectionMatrix();
   const sc = sun.shadow.camera;
   sc.left = -radius; sc.right = radius; sc.top = radius; sc.bottom = -radius;
   sc.near = 0.1; sc.far = radius * 8; sc.updateProjectionMatrix();
   sky.scale.setScalar(camera.far * 0.5);
+  // The map now costs nothing per frame, so a big scene can afford the resolution
+  // it actually needs: Bistro's shadow camera covers ~5x Sponza's extent, which at
+  // 2048 leaves it starved of texels.
+  if (MODEL.shadowMapSize) sun.shadow.mapSize.setScalar(MODEL.shadowMapSize);
+  sun.shadow.needsUpdate = true;   // first and only render until something moves
+
+  if (CLUSTER) rebuildLights(params.lightCount);
 
   // model is in the scene now → build the probe field over it.
   gi.requestRebuild();
   hideStatus();
   markInteraction();
 }, (xhr) => {
-  if (xhr.total) setStatus('loading Sponza… ' + Math.min(100, Math.round(xhr.loaded / xhr.total * 100)) + '%');
+  if (xhr.total) setStatus(`loading ${MODEL.meta.split(' ')[0]}… ` + Math.min(100, Math.round(xhr.loaded / xhr.total * 100)) + '%');
 }, (err) => {
-  setStatus('Failed to load ./Sponza/glTF/Sponza.gltf\n' + (err?.message || err), true);
+  // Bistro is gitignored (~191MB), so "missing" is the expected state on a fresh
+  // clone rather than a fault — say what to do about it instead of a raw stack.
+  if (MODEL.prep === 'library') {
+    setStatus(`Bistro is not present.\n\nIt is gitignored (~191MB). Put the .glb at\n${MODEL.url}\nor switch back to SPONZA.`, true);
+  } else {
+    setStatus(`Failed to load ${MODEL.url}\n` + (err?.message || err), true);
+  }
 });
 
 // ── Render loop ───────────────────────────────────────────────────────────────
@@ -523,13 +844,295 @@ function updateProbeHelpers() {
   probeHelperMesh.visible = true;
 }
 
+// ── Sky environment for the path tracer ───────────────────────────────────────
+// The Preetham dome is excluded from the traced scene (excludeFromGI), so with no
+// environment the tracer integrates sun-only light while the raster GI enjoys the
+// SH sky — the A/B would be comparing two different worlds. Bake the SAME
+// zenith/horizon/ground model that updateGiSky feeds the probes into a small
+// equirect and hand it to the tracer through the documented
+// scene.userData.maxjsPathTraceEnvironment hook, so both engines integrate one
+// sky definition. No sun disc is drawn into it: the directional sun is already an
+// explicit light record, and painting it here would double-count it.
+const SKY_ENV_W = 128, SKY_ENV_H = 64;
+let skyEnvTexture = null;
+let prevEnvIntensity = null;
+function buildSkyEnvTexture() {
+  updateGiSky();   // refresh _giSky* from the current turbidity/rayleigh/elevation
+  const data = new Float32Array(SKY_ENV_W * SKY_ENV_H * 4);
+  for (let y = 0; y < SKY_ENV_H; y++) {
+    // three's equirectUV puts v = asin(dir.y)/π + 0.5, and DataTexture does not
+    // flip, so row 0 is the nadir and the last row is the zenith.
+    const sinElev = ((y + 0.5) / SKY_ENV_H - 0.5) * 2;
+    const k = Math.pow(Math.abs(sinElev), 0.6);
+    const to = sinElev >= 0 ? _giSkyZenith : _giSkyGround;
+    const r = THREE.MathUtils.lerp(_giSkyHorizon.r, to.r, k);
+    const g = THREE.MathUtils.lerp(_giSkyHorizon.g, to.g, k);
+    const b = THREE.MathUtils.lerp(_giSkyHorizon.b, to.b, k);
+    for (let x = 0; x < SKY_ENV_W; x++) {
+      const i = (y * SKY_ENV_W + x) * 4;
+      data[i] = r; data[i + 1] = g; data[i + 2] = b; data[i + 3] = 1;
+    }
+  }
+  const tex = new THREE.DataTexture(data, SKY_ENV_W, SKY_ENV_H, THREE.RGBAFormat, THREE.FloatType);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.colorSpace = THREE.LinearSRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+function attachSkyEnv() {
+  if (CLUSTER) return;    // no sky in cluster mode; the grid is the only source
+  releaseSkyEnv();
+  skyEnvTexture = buildSkyEnvTexture();
+  scene.userData.maxjsPathTraceEnvironment = skyEnvTexture;
+  // The tracer reads its env gain off scene.environmentIntensity every frame.
+  // Safe to set here: this scene has no scene.environment, so the raster path
+  // never sees it. Save and restore anyway rather than assuming that stays true.
+  prevEnvIntensity = scene.environmentIntensity;
+  scene.environmentIntensity = params.ptEnvIntensity;
+}
+function releaseSkyEnv() {
+  if (scene.userData.maxjsPathTraceEnvironment === skyEnvTexture) {
+    delete scene.userData.maxjsPathTraceEnvironment;
+  }
+  if (prevEnvIntensity !== null) { scene.environmentIntensity = prevEnvIntensity; prevEnvIntensity = null; }
+  skyEnvTexture?.dispose();
+  skyEnvTexture = null;
+}
+
+// ── Light-transport engine: raster GI ↔ spectral path tracer ─────────────────
+// Exclusive by construction. Both engines trace the same BVH-backed scene, so the
+// switch is a fair A/B: same geometry, same lights, same camera — one converges
+// probes and rasterises, the other integrates paths.
+//
+// Teardown discipline (the whole point of an exclusive switch):
+//   • the tracer is DISPOSED on the way out, not just paused — it owns GPU
+//     buffers for the whole scene BVH and would otherwise sit on them;
+//   • the render target is unbound, since the tracer blits through its own;
+//   • the GI field is told the view just moved, so returning to raster does not
+//     dump a full solve into the first frame after the switch;
+//   • the switch is locked while the tracer is arming, so a double-click cannot
+//     leave two engines half-alive.
+let engine = 'raster';
+let tracer = null;
+let prevDamping = null;
+const engineRasterEl = document.getElementById('engine-raster');
+const enginePtEl = document.getElementById('engine-pt');
+const engineNoteEl = document.getElementById('engine-note');
+const RASTER_NOTE = 'BVH-TRACED · INFINITE BOUNCE · NO BAKE';
+const PT_NOTE = 'SPECTRAL PATH TRACE · PROGRESSIVE · GROUND TRUTH';
+
+function disposeTracer() {
+  if (!tracer) return;
+  const t = tracer;
+  tracer = null;                 // drop the handle FIRST: the render loop must not
+  t.dispose();                   // touch a tracer that is mid-teardown
+  renderer.setRenderTarget(null);
+  releaseSkyEnv();               // the baked equirect exists only for the tracer
+  if (prevDamping !== null) { controls.enableDamping = prevDamping; prevDamping = null; }
+}
+
+function setEngine(next) {
+  if (next === engine) return;
+  if (next === 'pt' && !tracer) {
+    // A progressive integrator and a moving subject cancel each other out: every
+    // frame of motion throws the accumulation away. Park the transport so the
+    // first traced image actually converges.
+    if (playing) setPlaying(false);
+    // Damping keeps writing the camera matrix for a second or more after the
+    // mouse is released, and the tracer throws away its accumulation on ANY
+    // camera change — so with damping on the image never banks more than a
+    // sample or two. Park it while tracing; the drag itself stays 1:1, it just
+    // stops coasting, and the frame starts converging the instant you let go.
+    prevDamping = controls.enableDamping;
+    controls.enableDamping = false;
+    controls.update();   // flush the in-flight coast so the first traced frame is at rest
+    enginePtEl.dataset.busy = '1';
+    engineRasterEl.dataset.busy = '1';
+    setStatus('building spectral BVH…');
+    attachSkyEnv();   // must be on the scene BEFORE the tracer builds its scene
+    tracer = createSpectralTracer({
+      renderer, scene, camera,
+      enabled: true,
+      settings: {
+        samplesPerFrame: params.ptSamplesPerFrame,
+        sampleLimit: params.ptSampleLimit,
+        // Primary-miss rays return black. The Preetham sky dome is excluded from
+        // the traced scene (excludeFromGI), so there is no env to show anyway —
+        // claiming one would just be a lie in the background.
+        envBackground: false,
+      },
+      onStatus: (msg) => setStatus(String(msg)),
+      onError: (err) => { console.error('spectral tracer', err); setStatus('Path tracer:\n' + (err?.message || err), true); },
+    });
+    if (!tracer.isSupported()) {
+      setStatus('The spectral path tracer needs WebGPU storage features.', true);
+      disposeTracer();
+      delete enginePtEl.dataset.busy; delete engineRasterEl.dataset.busy;
+      return;
+    }
+    tracer.start();
+    tracer.prebuild();
+    delete enginePtEl.dataset.busy; delete engineRasterEl.dataset.busy;
+    hideStatus();
+  } else if (next === 'raster') {
+    disposeTracer();
+    // Coming back from a trace, the probe field has been sitting un-updated for
+    // however long the trace ran — its temporal state, and the rough-reflection
+    // cache riding on it, are stale. Marking an interaction alone only defers the
+    // solve; it does not ask for one, which leaves the mirror sphere reflecting a
+    // cache that was never refreshed. Force the lighting refresh and a rebuild so
+    // the first settled raster frame is actually current.
+    markGiInteraction();
+    gi?.forceLightingRefresh?.();
+    gi?.requestRebuild?.();
+    renderer.toneMapping = params.filmEnabled ? THREE.NoToneMapping : THREE.NeutralToneMapping;
+    hideStatus();
+  }
+  engine = next;
+  engineRasterEl.setAttribute('aria-pressed', String(engine === 'raster'));
+  enginePtEl.setAttribute('aria-pressed', String(engine === 'pt'));
+  engineNoteEl.textContent = engine === 'pt' ? PT_NOTE : RASTER_NOTE;
+  tEngineEl.textContent = engine === 'pt' ? 'PATH TRACE' : 'RASTER';
+  tEngineEl.classList.toggle('accent', engine === 'pt');
+  window.tracer = tracer;
+  window.overlayStats = () => ({ paints: overlayPaints, previewing: ptPreviewing, engine });
+}
+engineRasterEl.addEventListener('click', () => setEngine('raster'));
+enginePtEl.addEventListener('click', () => setEngine('pt'));
+// A tab close mid-trace must not leave the tracer's scene buffers alive.
+window.addEventListener('pagehide', disposeTracer);
+
+// ── Scene buttons — see SCENE_MODE: install-time, so they reload ─────────────
+document.getElementById('scene-meta').textContent = MODEL.meta;
+for (const [id, mode] of [['scene-sun', 'sun'], ['scene-cluster', 'cluster'], ['scene-bistro', 'bistro']]) {
+  const el = document.getElementById(id);
+  el.setAttribute('aria-pressed', String(SCENE_MODE === mode));
+  el.addEventListener('click', () => {
+    if (SCENE_MODE === mode) return;
+    location.search = mode === 'sun' ? '' : `?scene=${mode}`;
+  });
+}
+
+// ── PT raster overlay ─────────────────────────────────────────────────────────
+// Holding a mouse button on the canvas while path tracing drops to the raster GI
+// frame instantly: it costs ~7ms, it is already resident (the field stays
+// installed while tracing, only its solve is parked), and it shows the same
+// world — so it is the cheap way to look around or reframe without waiting on
+// the integrator.
+//
+// Bound to the drag itself rather than to camera motion: every button on this
+// canvas moves the camera (left orbits, right pans, middle dollies), so pressing
+// one IS the intent to move. Watching the camera matrix instead fires on drift
+// far too small to see and makes the traced image flicker away underneath you.
+// The overlay only takes over presentation — the tracer keeps its accumulation,
+// so letting go shows the traced frame exactly as it was.
+let ptPreviewing = false;
+let overlayPaints = 0;   // diagnostics handle
+
+// Painting the overlay from the ANIMATION LOOP is too late. A traced frame costs
+// ~140ms on this scene, so the loop ticks at ~7Hz: the press sets the flag
+// instantly, but the pixels only change on the next rAF — up to a frame of dead
+// time with the button already down, which reads as "the click didn't register".
+// Paint straight out of the event handler instead. By the time a pointer event is
+// delivered the rAF callback has already returned (single thread), so this is
+// just an extra cheap draw, and it lands on the press rather than after it.
+function paintRasterOverlay() {
+  renderer.toneMapping = THREE.NeutralToneMapping;
+  renderer.render(scene, camera);
+  overlayPaints++;
+}
+const endOverlay = () => { ptPreviewing = false; };
+renderer.domElement.addEventListener('pointerdown', () => {
+  ptPreviewing = true;
+  if (engine === 'pt') paintRasterOverlay();
+}, { capture: true });   // ahead of OrbitControls' own handler
+// Release is watched on the window, not the canvas: a drag that ends off-canvas
+// (or off-window) must still clear, or the overlay latches on forever.
+window.addEventListener('pointerup', endOverlay);
+window.addEventListener('pointercancel', endOverlay);
+window.addEventListener('blur', endOverlay);
+
+// The SOLVER marker in the top strip reflects the real idle gate rather than
+// blinking decoratively: held while the view moves, solving once it rests.
+let solverStateDueMs = 0;
+function updateSolverMarker(nowMs) {
+  if (nowMs < solverStateDueMs) return;
+  solverStateDueMs = nowMs + 200;
+  const solving = engine === 'raster'
+    ? gi?.hasData?.() !== false && performance.now() - lastInteractionMs >= GUI_REST_MS
+    : tracer?.isStarted() === true && !ptPreviewing;
+  uiEl.classList.toggle('solving', solving);
+}
+
+// ── Transport readout: FPS while rastering, sample count while tracing ────────
+let fpsFrames = 0, fpsWindowMs = 0, readoutDueMs = 0;
+function updateTransportReadout(nowMs) {
+  fpsFrames++;
+  if (!fpsWindowMs) fpsWindowMs = nowMs;
+  if (nowMs < readoutDueMs) return;
+  readoutDueMs = nowMs + 250;
+  const span = nowMs - fpsWindowMs;
+  const fps = span > 0 ? Math.round((fpsFrames * 1000) / span) : 0;
+  fpsFrames = 0; fpsWindowMs = nowMs;
+
+  if (engine === 'pt') {
+    // Progressive tracing: samples, not framerate, is the number that matters —
+    // except while the overlay is up, when nothing is being sampled at all and a
+    // frozen spp count would read as a stall rather than as a deliberate skip.
+    if (ptPreviewing) {
+      tMetricKEl.textContent = 'VIEW';
+      tMetricEl.textContent = 'RASTER';
+      tMetricEl.classList.remove('accent');
+    } else {
+      const spp = tracer?.getSampleCount() ?? 0;
+      const done = spp >= params.ptSampleLimit;
+      tMetricKEl.textContent = 'SPP';
+      tMetricEl.textContent = `${spp} / ${params.ptSampleLimit}`;
+      tMetricEl.classList.toggle('accent', done);
+    }
+  } else {
+    tMetricKEl.textContent = 'FPS';
+    tMetricEl.textContent = String(fps).padStart(2, '0');
+    tMetricEl.classList.remove('accent');
+  }
+}
+
 renderer.setAnimationLoop((nowMs) => {
   controls.update();
+  updateBallAnimation(nowMs);
+  updateSolverMarker(nowMs);
+  updateTransportReadout(nowMs);
+
+  if (engine === 'pt') {
+    // Pressed → overlay. FIRST, and unconditionally: nothing below may pre-empt
+    // it. Behind the tracer guards this was dead during the very window it is
+    // most wanted — the initial BVH build returns early on !isSceneBuilt(), so
+    // holding the mouse through a build left the canvas frozen instead of
+    // showing the raster frame.
+    // (The press itself already painted one of these from the event handler; this
+    // is what keeps the overlay live for the rest of the drag — cheap, so the
+    // loop runs at raster rate while the button is down.)
+    if (ptPreviewing) { paintRasterOverlay(); return; }
+    // Path trace owns the rest of the frame outright: no GI solve, no probe
+    // helpers, no film chain. The tracer presents to the canvas itself.
+    if (!tracer) return;
+    if (!tracer.isSceneBuilt()) { tracer.prebuild(); return; }
+    tracer.render();
+    return;
+  }
+
   if (sunGiDirty) flushSunGiRefresh();
   // SPEEDBALL GI self-gates on idle: the BVH build + GPU solve are held while orbiting
   // or dragging a slider (world-space GI is lossless held static), then converge
-  // once the view rests — so a frame hitch can never land mid-interaction.
-  gi?.update({ playing: false });   // idle-gated solve (camera-rest detection is built in)
+  // once the view rests — so a frame hitch can never land mid-interaction. While the
+  // transport is running the scene is genuinely animating, so playing:true tells the
+  // field to keep solving through the motion instead of waiting for a rest that
+  // never comes.
+  gi?.update({ playing });
   updateProbeHelpers();
   if (params.filmEnabled) {
     renderer.toneMapping = THREE.NoToneMapping;       // imager: the film owns the whole transfer curve (scene-linear in)
