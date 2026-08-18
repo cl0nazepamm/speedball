@@ -166,6 +166,7 @@ const PROBE_COMPUTE_KEYS = [
     'clearAtlasKernel', 'clearGlossyAtlasKernel', 'classifyKernel', 'uploadStateKernel',
 ];
 const PROBE_SCENE_BUFFER_KEYS = ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials'];
+const PROBE_SCENE_STORAGE_GROWTH = 1.5;
 // ── denoise uplift (CORE, docs/GI_SPEEDBALL_design.md §11) tunables ──
 const GI_FILTER_K = 8.0;           // spatial filter: variance→edge-stop bandwidth
 const GI_FILTER_EPS = 0.001;       // spatial filter luma² absolute floor (avoids /0 on black)
@@ -436,12 +437,20 @@ export class GiProbeNode extends LightingNode {
         this._structGen++;   // shader tap count changes → one recompile
     }
     setAtlases(c, atlas, depthAtlas, stateAtlas, roughSpecularAtlas = null, glossySpecularAtlas = null) {
-        this._atlas[c] = atlas || null;
-        this._roughSpecularAtlas[c] = roughSpecularAtlas || null;
-        this._glossySpecularAtlas[c] = glossySpecularAtlas || null;
-        this._depthAtlas[c] = depthAtlas || null;
-        this._stateAtlas[c] = stateAtlas || null;
-        this._structGen++;
+        const a = atlas || null, d = depthAtlas || null, s = stateAtlas || null;
+        const rs = roughSpecularAtlas || null, gs = glossySpecularAtlas || null;
+        // Bump only on a real identity change. A no-op call (e.g. disposing an
+        // already-empty cascade on every cascades=1 rebuild) must NOT move the
+        // cacheToken — that fired the whole-scene material-dirty pass per
+        // rebuild and was the dominant churn hitch.
+        const changed = this._atlas[c] !== a || this._depthAtlas[c] !== d || this._stateAtlas[c] !== s
+            || this._roughSpecularAtlas[c] !== rs || this._glossySpecularAtlas[c] !== gs;
+        this._atlas[c] = a;
+        this._roughSpecularAtlas[c] = rs;
+        this._glossySpecularAtlas[c] = gs;
+        this._depthAtlas[c] = d;
+        this._stateAtlas[c] = s;
+        if (changed) this._structGen++;
     }
     // Update the grid placement uniforms only. Uniform .value writes do NOT change
     // a material cache key, so this is churn-free — the same-dim rebuild path uses
@@ -1032,13 +1041,17 @@ export function createProbeField({
     // setDivisions/setRays so those resize the grid/kernels off the cached soup (no hitch).
     let cachedBuilt = null;
     let blasCache = null;    // cross-rebuild BLAS cache (created with the lazy scene builder)
-    // C0/C1 trace the same scene soup. Keep the large immutable/streamed scene
-    // attributes and material maps behind one ref-counted owner instead of
-    // allocating and uploading a duplicate set for every cascade. The active
-    // root owns one ref; every installed cascade kernel owns another. During a
-    // staggered topology rebuild the old C1 therefore keeps the old buffers alive
-    // until stage 1 replaces it, while C0 can already bind the new scene safely.
+    let lastBuildSceneRewritten = false; // this build's scene landed as an in-place arena rewrite
+    // C0/C1 trace the same scene soup. Storage lives in a capacity arena whose
+    // BufferAttribute + TSL-node identities survive structural rebuilds. Build
+    // generations remain ref-counted separately so their material-map textures
+    // stay alive through staggered C0/C1 replacement. On a capacity growth the
+    // old generation also keeps its old arena alive until both kernels move over.
     let sceneResource = null;
+    let sceneStorageGeneration = 0;
+    let sceneStorageRebinds = 0;
+    let sceneStorageRewrites = 0;
+    let sceneStorageLastUpdate = 'none';
     // Lights have an independent lifetime because clustered-grid resizes can
     // replace giLightArena while the geometry/BVH arrays stay byte-identical.
     let lightResource = null;
@@ -1253,6 +1266,31 @@ export function createProbeField({
             && typeof THREE.StorageBufferAttribute === 'function';
     }
 
+    // The compute graph bakes exactly one thing from a specific build: the
+    // material map array textures. Identity-equal maps (including the all-null
+    // case of an untextured scene) make a live kernel fully reusable across an
+    // in-place scene rewrite.
+    function mapsCompatible(a, b) {
+        const ka = Object.keys(a || {});
+        const kb = Object.keys(b || {});
+        if (ka.length !== kb.length) return false;
+        for (const key of ka) if ((a[key] || null) !== ((b || {})[key] || null)) return false;
+        return true;
+    }
+
+    function retainSceneStorage(arena) {
+        if (arena) arena.refs++;
+        return arena;
+    }
+
+    function releaseSceneStorage(arena) {
+        if (!arena || arena.refs <= 0) return;
+        arena.refs--;
+        if (arena.refs === 0) {
+            disposeStorageAttributes(renderer, arena.buffers, PROBE_SCENE_BUFFER_KEYS);
+        }
+    }
+
     function retainSceneResource(resource) {
         if (resource) resource.refs++;
         return resource;
@@ -1262,13 +1300,13 @@ export function createProbeField({
         if (!resource || resource.refs <= 0) return;
         resource.refs--;
         if (resource.refs > 0) return;
-        disposeStorageAttributes(renderer, resource.buffers, PROBE_SCENE_BUFFER_KEYS);
         const disposedMaps = new Set();
         for (const texture of Object.values(resource.maps || {})) {
             if (!texture || disposedMaps.has(texture)) continue;
             disposedMaps.add(texture);
             texture.dispose?.();
         }
+        releaseSceneStorage(resource.storage);
     }
 
     function retainLightResource(resource) {
@@ -1282,37 +1320,159 @@ export function createProbeField({
         if (resource.refs === 0) disposeStorageAttribute(renderer, resource.buffer);
     }
 
-    function createSceneResource(built) {
+    function sceneStorageMaxElements(ArrayType) {
+        const limits = renderer?.backend?.device?.limits;
+        const binding = Number(limits?.maxStorageBufferBindingSize) || STORAGE_BINDING_FALLBACK;
+        const buffer = Number(limits?.maxBufferSize) || binding;
+        return Math.max(1, Math.floor(Math.min(binding, buffer) / ArrayType.BYTES_PER_ELEMENT));
+    }
+
+    function sceneStorageCapacity(required, previous, ArrayType) {
+        const live = Math.max(1, Math.floor(Number(required) || 0));
+        const prior = Math.max(0, Math.floor(Number(previous) || 0));
+        const target = Math.max(
+            live,
+            Math.ceil(live * PROBE_SCENE_STORAGE_GROWTH),
+            prior > 0 ? Math.ceil(prior * PROBE_SCENE_STORAGE_GROWTH) : 0,
+        );
+        const limit = sceneStorageMaxElements(ArrayType);
+        // Preserve today's fail-loud behavior if a live scene itself exceeds the
+        // device binding limit. Otherwise spend all available geometric headroom.
+        return limit >= live ? Math.min(target, limit) : live;
+    }
+
+    function updateSceneTraversalUniforms(Utrav, built) {
+        Utrav.nodeCount.value = built.nodeCount >>> 0;
+        Utrav.tlasNodeCount.value = (built.tlasNodeCount ?? 0) >>> 0;
+        Utrav.instBase.value = (built.instBase ?? 0) >>> 0;
+        Utrav.tlasBase.value = (built.tlasBase ?? 0) >>> 0;
+    }
+
+    function createSceneStorage(built, previous = null) {
+        const buffers = {};
+        const capacities = {};
+        const liveLengths = {};
+        for (const key of PROBE_SCENE_BUFFER_KEYS) {
+            const source = built[key];
+            const ArrayType = source.constructor;
+            const capacity = sceneStorageCapacity(source.length, previous?.capacities?.[key], ArrayType);
+            const array = new ArrayType(capacity);
+            array.set(source);
+            buffers[key] = new THREE.StorageBufferAttribute(array, 1);
+            capacities[key] = capacity;
+            liveLengths[key] = source.length;
+        }
+        const storages = {
+            bvhNodes: storage(buffers.bvhNodes, 'uint', buffers.bvhNodes.count).toReadOnly(),
+            triIndex: storage(buffers.triIndex, 'uint', buffers.triIndex.count).toReadOnly(),
+            vertexData: storage(buffers.vertexData, 'float', buffers.vertexData.count).toReadOnly(),
+            triMaterial: storage(buffers.triMaterial, 'uint', buffers.triMaterial.count).toReadOnly(),
+            materials: storage(buffers.materials, 'float', buffers.materials.count).toReadOnly(),
+        };
+        const traversalUniforms = {
+            nodeCount: uniform(0, 'uint'),
+            tlasNodeCount: uniform(0, 'uint'),
+            instBase: uniform(0, 'uint'),
+            tlasBase: uniform(0, 'uint'),
+            envRotation: uniform(0.0),
+            envIntensity: uniform(1.0),
+        };
+        updateSceneTraversalUniforms(traversalUniforms, built);
+        return {
+            refs: 0,
+            generation: ++sceneStorageGeneration,
+            buffers,
+            storages,
+            traversalUniforms,
+            capacities,
+            liveLengths,
+        };
+    }
+
+    function sceneStorageFits(arena, built) {
+        return !!arena && PROBE_SCENE_BUFFER_KEYS.every((key) => built[key].length <= arena.capacities[key]);
+    }
+
+    function rewriteSceneStorage(arena, built) {
+        for (const key of PROBE_SCENE_BUFFER_KEYS) {
+            const source = built[key];
+            arena.buffers[key].array.set(source, 0);
+            arena.liveLengths[key] = source.length;
+            // Upload only the live prefix. Stale capacity tail is intentionally
+            // left untouched and is unreachable through the exact traversal
+            // count/base uniforms updated below.
+            markStorageDirty(arena.buffers[key], [[0, source.length]]);
+        }
+        updateSceneTraversalUniforms(arena.traversalUniforms, built);
+    }
+
+    function copySceneStorageRanges(key, source, ranges) {
+        const arena = sceneResource?.storage;
+        const attr = arena?.buffers?.[key];
+        if (!attr || !source || source.length > attr.array.length) return false;
+        const uploadRanges = Array.isArray(ranges) && ranges.length > 0
+            ? ranges
+            : [[0, source.length]];
+        for (const [startValue, countValue] of uploadRanges) {
+            const start = Math.max(0, Math.floor(Number(startValue) || 0));
+            const count = Math.max(0, Math.min(
+                Math.floor(Number(countValue) || 0),
+                source.length - start,
+                attr.array.length - start,
+            ));
+            if (count > 0) attr.array.set(source.subarray(start, start + count), start);
+        }
+        markStorageDirty(attr, uploadRanges);
+        return true;
+    }
+
+    function createSceneResource(built, storageArena) {
+        const arena = retainSceneStorage(storageArena);
         return {
             built,
             refs: 1, // active-root ref
-            buffers: {
-                bvhNodes: new THREE.StorageBufferAttribute(built.bvhNodes, 1),
-                triIndex: new THREE.StorageBufferAttribute(built.triIndex, 1),
-                vertexData: new THREE.StorageBufferAttribute(built.vertexData, 1),
-                triMaterial: new THREE.StorageBufferAttribute(built.triMaterial, 1),
-                materials: new THREE.StorageBufferAttribute(built.materials, 1),
-            },
+            storage: arena,
+            buffers: arena.buffers,
+            storages: arena.storages,
+            traversalUniforms: arena.traversalUniforms,
             maps: built.maps,
         };
     }
 
     function createLightResource(array) {
+        const buffer = new THREE.StorageBufferAttribute(array, 1);
+        const storageNode = storage(buffer, 'float', buffer.count);
+        if (!clusteredGi) storageNode.toReadOnly();
         return {
             array,
             refs: 1, // active-root ref
-            buffer: new THREE.StorageBufferAttribute(array, 1),
+            buffer,
+            storage: storageNode,
         };
     }
 
-    // Install the root owners that future cascade kernels retain. New owners are
-    // published before old roots are released so staggered C0/C1 replacement can
-    // safely overlap generations. Existing cascade refs keep the old generation
-    // alive until their compute nodes are disposed.
+    // Install the root owners that future cascade kernels retain. Within capacity,
+    // only the live prefixes and traversal uniforms change; the arena's attributes
+    // and TSL storage nodes remain resident. A generation wrapper keeps its own map
+    // textures alive until staggered C0/C1 replacement drops the last old kernel.
     function prepareSharedResources(built, lightDataChanged = false) {
+        let sceneBuffersRebound = false;
+        let sceneBuffersRewritten = false;
         if (!sceneResource || sceneResource.built !== built) {
             const previous = sceneResource;
-            sceneResource = createSceneResource(built);
+            let arena = previous?.storage || null;
+            if (!sceneStorageFits(arena, built)) {
+                arena = createSceneStorage(built, arena);
+                sceneStorageRebinds++;
+                sceneStorageLastUpdate = previous ? 'grow' : 'allocate';
+                sceneBuffersRebound = true;
+            } else {
+                rewriteSceneStorage(arena, built);
+                sceneStorageRewrites++;
+                sceneStorageLastUpdate = 'rewrite';
+                sceneBuffersRewritten = true;
+            }
+            sceneResource = createSceneResource(built, arena);
             releaseSceneResource(previous);
         }
 
@@ -1327,6 +1487,7 @@ export function createProbeField({
             // same GPU attribute, so one version bump uploads it for both.
             markStorageDirty(lightResource.buffer, null);
         }
+        return { sceneBuffersRebound, sceneBuffersRewritten };
     }
 
     // Same-dim rebuild: free ONLY the previous compute graph + ray scratch and
@@ -1438,27 +1599,20 @@ export function createProbeField({
             ...sharedScene.buffers,
             lights: sharedLights.buffer,
         };
-        const bvhNodes = storage(buffers.bvhNodes, 'uint', buffers.bvhNodes.count).toReadOnly();
-        const triIndex = storage(buffers.triIndex, 'uint', buffers.triIndex.count).toReadOnly();
-        const vertexData = storage(buffers.vertexData, 'float', buffers.vertexData.count).toReadOnly();
-        const triMaterial = storage(buffers.triMaterial, 'uint', buffers.triMaterial.count).toReadOnly();
-        const materials = storage(buffers.materials, 'float', buffers.materials.count).toReadOnly();
+        // These nodes are owned by the capacity arena, not by this kernel build.
+        // A structural rebuild that fits therefore presents the exact same TSL
+        // storage-node and BufferAttribute identities to Three's binding cache.
+        const { bvhNodes, triIndex, vertexData, triMaterial, materials } = sharedScene.storages;
         // The clustered cell lists occupy the float arena's suffix. Keeping light
         // records and exact-small-integer indices in ONE binding is structural:
         // the trace kernel already uses the portable WebGPU baseline of eight
         // storage buffers, so a separate grid binding makes its pipeline invalid.
-        const lightStorage = storage(buffers.lights, 'float', buffers.lights.count);
-        const lights = clusteredGi ? lightStorage : lightStorage.toReadOnly();
+        const lights = sharedLights.storage;
         const lightGridCellCount = clusteredGi ? c0LightCellCount() : 0;
 
-        const Utrav = {
-            nodeCount: uniform(built.nodeCount >>> 0, 'uint'),
-            tlasNodeCount: uniform((built.tlasNodeCount ?? 0) >>> 0, 'uint'),
-            instBase: uniform((built.instBase ?? 0) >>> 0, 'uint'),
-            tlasBase: uniform((built.tlasBase ?? 0) >>> 0, 'uint'),
-            envRotation: uniform(0.0),
-            envIntensity: uniform(1.0),
-        };
+        // Live traversal sizes/bases are resident uniforms. Capacity may be
+        // larger than this build, but no walk can enter the stale tail.
+        const Utrav = sharedScene.traversalUniforms;
         const trav = buildTraversal({
             storages: { bvhNodes, triIndex, vertexData, triMaterial, materials },
             U: Utrav, env: null, lut: null, lutRes: 0, maps: sharedScene.maps,
@@ -2623,7 +2777,7 @@ export function createProbeField({
     // Build (or same-dim-reuse) ONE cascade's kernels+resources and wire its uniforms +
     // node bindings. Handles both the reuse (churn-free) path and the full recompile path
     // for that cascade independently. Does NOT fire onRebuilt (the caller sequences that).
-    function buildOneCascade(built, c) {
+    function buildOneCascade(built, c, opts = {}) {
         const C = casc[c];
         const gridMin = C.gridMin, gridSize = C.gridSize, res = C.res;
         const minCell = C.minCell;
@@ -2640,6 +2794,43 @@ export function createProbeField({
             && (!clusteredGi || C.gpu.lightGridCellCount === c0LightCellCount());
         if (sameDim) {
             const prev = C.gpu;
+            // Kernel-resident fast path: a within-capacity in-place scene rewrite
+            // leaves every binding of the live compute graph valid — the arena
+            // owns the storage nodes and traversal uniforms, the dims are
+            // unchanged, and the material map textures are identity-equal.
+            // Keeping the graph avoids the GPU-process pipeline recompile that
+            // stalls the first dispatch (~190 ms measured on churn.html) even
+            // while the JS thread shows no work at all.
+            if (opts.sceneRewritten && sceneResource
+                && mapsCompatible(prev.sceneResource?.maps, built.maps)) {
+                if (prev.sceneResource !== sceneResource) {
+                    retainSceneResource(sceneResource);
+                    releaseSceneResource(prev.sceneResource);
+                    prev.sceneResource = sceneResource;
+                }
+                C.U.gridMin.value.copy(gridMin);
+                C.U.gridSize.value.copy(gridSize);
+                C.U.lightCount.value = Math.min(MAX_LIGHTS,
+                    clusteredGi ? giSelectedCount : giLegacyLightCount) >>> 0;
+                C.U.maxDist.value = gridSize.length();
+                C.U.cellMin.value = Math.max(1e-4, minCell);
+                C.U.relocClamp.value = 0.45 * minCell;
+                node.updateGridUniforms(
+                    c, gridMin, gridSize, res, atlasW, atlasH,
+                    C.glossyAtlasW, C.glossyAtlasH, C.glossyTilesX,
+                    normalBias, chebyBias,
+                );
+                C.probeCursor = 0;
+                C.lastSolveAt = 0;
+                C.solveDtEma = 0;
+                C.refreshStarted = false;
+                C.ticksSinceRot = 0;
+                C.probeCoverageSinceRot = 0;
+                C.glossyPhase = 0;
+                C.needsClear = false;             // keep the live atlas history (no black flash)
+                C.needsClassify = true;           // refresh per-probe state for the new geometry
+                return false;                     // graph kept — no recompile anywhere
+            }
             const reuse = {
                 atlas: prev.atlas, roughSpecularAtlas: prev.roughSpecularAtlas, glossySpecularAtlas: prev.glossySpecularAtlas,
                 depthAtlas: prev.depthAtlas, stateAtlas: prev.stateAtlas,
@@ -2843,7 +3034,8 @@ export function createProbeField({
         const lightDataChanged = clusteredGi
             ? fillGiLightArena(liveLightRecords).recordDataChanged
             : fillLegacyLightArena(liveLightRecords).recordDataChanged;
-        prepareSharedResources(built, lightDataChanged);
+        const { sceneBuffersRebound, sceneBuffersRewritten } = prepareSharedResources(built, lightDataChanged);
+        lastBuildSceneRewritten = sceneBuffersRewritten && !sceneBuffersRebound;
 
         // ── C1 dims: fine sub-box via the CPU triangle-density histogram (idle-gated). ──
         // A flat/degenerate histogram → treat as cascades=1 for placement (safe fallback).
@@ -2886,7 +3078,7 @@ export function createProbeField({
         const c1WasReady = !!casc[1].gpu;
         const c1SameDim = c1WasReady && buildCascadeCount >= 2
             && casc[1].atlasW === casc[1].prevAtlasW && casc[1].atlasH === casc[1].prevAtlasH && casc[1].probeTotal === casc[1].prevProbeTotal;
-        const recompiled = buildOneCascade(built, 0);
+        const recompiled = buildOneCascade(built, 0, { sceneRewritten: lastBuildSceneRewritten });
         if (clusteredGi) {
             giLightGridDirty = true;
             await flushGiLightGrid();
@@ -2911,7 +3103,7 @@ export function createProbeField({
         // Fire the one-shot recompile the frame C0's data first exists (resize/first-enable
         // path OR a cascade-count change to 1). The same-dim path with no structGen change
         // needs no recompile.
-        if ((recompiled || node._structGen !== genBefore) && typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
+        if ((recompiled || sceneBuffersRebound || node._structGen !== genBefore) && typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
         return true;
     }
 
@@ -2921,7 +3113,7 @@ export function createProbeField({
         const built = cachedBuilt;
         if (!built) { buildStage = 2; fieldEverReady = true; return; }
         const genBefore = node._structGen;
-        const recompiled = buildOneCascade(built, 1);
+        const recompiled = buildOneCascade(built, 1, { sceneRewritten: lastBuildSceneRewritten });
         node.setCascadeCount(2);  // C1 online → fragment blends fine cascade
         buildStage = 2;
         fieldEverReady = true;
@@ -3514,7 +3706,7 @@ export function createProbeField({
         lastTransformInstanceCount = res.updatedInstances | 0;
         lastTlasRefitCount = res.refittedTlasNodes | 0;
         if (Array.isArray(res.materialRanges) && res.materialRanges.length > 0) {
-            markStorageDirty(sceneResource.buffers.materials, res.materialRanges);
+            copySceneStorageRanges('materials', built.materials, res.materialRanges);
         }
         return true;
     }
@@ -3545,10 +3737,10 @@ export function createProbeField({
         const matStart = built.instBase | 0;
         const matCount = Math.max(0, (built.tlasBase | 0)
             + ((built.tlasNodeCount | 0) * (built.strides?.TLAS_STRIDE_F32 || 12)) - matStart);
-        markStorageDirty(sceneResource.buffers.vertexData, res.vertRanges);
+        copySceneStorageRanges('vertexData', built.vertexData, res.vertRanges);
         if (res.refitted) {
-            markStorageDirty(sceneResource.buffers.bvhNodes, res.nodeRanges);
-            markStorageDirty(sceneResource.buffers.materials, matCount > 0 ? [[matStart, matCount]] : null);
+            copySceneStorageRanges('bvhNodes', built.bvhNodes, res.nodeRanges);
+            copySceneStorageRanges('materials', built.materials, matCount > 0 ? [[matStart, matCount]] : null);
         }
         return true;
     }
@@ -4019,6 +4211,16 @@ export function createProbeField({
             tickBudgetRays,
             tickDtEma,
             sceneResourceRefs: sceneResource?.refs || 0,
+            sceneStorageGeneration: sceneResource?.storage?.generation || 0,
+            sceneStorageRebinds,
+            sceneStorageRewrites,
+            sceneStorageLastUpdate,
+            sceneStorageCapacities: sceneResource?.storage
+                ? { ...sceneResource.storage.capacities }
+                : null,
+            sceneStorageLiveLengths: sceneResource?.storage
+                ? { ...sceneResource.storage.liveLengths }
+                : null,
             lightResourceRefs: lightResource?.refs || 0,
             sharedSceneBuffers: !!casc[0].gpu && !!casc[1].gpu
                 && PROBE_SCENE_BUFFER_KEYS.every((key) => casc[0].gpu.buffers[key] === casc[1].gpu.buffers[key]),

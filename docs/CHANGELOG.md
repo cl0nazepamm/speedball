@@ -5,6 +5,24 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Hitchless structural rebuilds: the five traced-scene buffers now live in a
+  resident capacity arena (1.5× geometric headroom, device-limit capped) whose
+  BufferAttribute and TSL storage-node identities survive rebuilds; live
+  prefixes and exact traversal count/base uniforms are rewritten in place, so
+  stale capacity tails are unreachable without zeroing. Two review fixes
+  complete the design: `setAtlases` no longer bumps the node cacheToken on a
+  no-op call (an already-empty cascade disposed on every cascades=1 rebuild
+  was firing the whole-scene material-dirty pass per rebuild), and a
+  kernel-resident fast path keeps the live compute graph — bindings, pipelines
+  and all — across a within-capacity in-place rewrite when probe dims are
+  unchanged and material map textures are identity-equal, eliminating the
+  GPU-process pipeline recompile that stalled the first dispatch. Measured on
+  the churn harness at rest: worst frame per topology/enter/leave action fell
+  from ~240 ms (pre-cache) and ~110 ms (BLAS cache alone) to 4-5 ms at a
+  locked frame rate, with removal changes verified to propagate into the
+  field. Untextured scenes take the resident path today; per-build material
+  map textures still force a kernel rebuild (map-texture residency is the
+  known follow-up for textured scenes).
 - Cross-rebuild BLAS cache: a structural rebuild now pays only for the
   geometries that actually changed. Cached cores (BVH records, soup slices,
   BVH-ordered materials) are keyed by geometry identity × attribute
