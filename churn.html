@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0A0D12">
+<title>SPEEDBALL GI — scene churn test</title>
+<link rel="icon" href="data:,">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
+    "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
+    "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.tsl.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.0/examples/jsm/",
+    "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.10/build/index.module.js"
+  },
+  "scopes": {
+    "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.10/": { "three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.module.js" }
+  }
+}
+</script>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a0d12; overflow: hidden; }
+  #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #hud {
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    font: 12px/1.5 "JetBrains Mono", ui-monospace, monospace; color: #cfd8e3;
+    background: rgba(10, 13, 18, 0.82); border: 1px solid #2a3442; border-radius: 8px;
+    padding: 10px 12px; min-width: 300px; user-select: none;
+  }
+  #hud h1 { font-size: 12px; margin: 0 0 6px; color: #8ecdf5; letter-spacing: 0.08em; }
+  #hud .row { display: flex; justify-content: space-between; gap: 12px; }
+  #hud .row b { color: #fff; font-weight: 700; }
+  #hud .warn b { color: #ffb454; }
+  #hud .bad b { color: #ff6b6b; }
+  #toggles { margin-top: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+  #toggles button {
+    font: inherit; color: #cfd8e3; background: #16202c; border: 1px solid #2a3442;
+    border-radius: 5px; padding: 3px 8px; cursor: pointer; text-align: left;
+  }
+  #toggles button[aria-pressed="true"] { background: #1d3a55; border-color: #3f6b95; color: #fff; }
+  #toggles button:disabled { opacity: 0.35; cursor: default; }
+  #log { margin-top: 8px; border-top: 1px solid #2a3442; padding-top: 6px; color: #9aa8b8;
+         max-height: 9em; overflow: hidden; }
+  #log .spike { color: #ffb454; }
+  #log .spike-bad { color: #ff6b6b; }
+  #status {
+    position: fixed; inset: 0; display: none; place-items: center; z-index: 20;
+    color: #ffb454; background: #0a0d12; font: 14px/1.7 ui-monospace, monospace;
+    white-space: pre; text-align: center;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <h1>SPEEDBALL GI · SCENE CHURN</h1>
+  <div class="row"><span>fps</span><b id="fps">—</b></div>
+  <div class="row" id="worst-row"><span>worst frame (1s)</span><b id="worst">—</b></div>
+  <div class="row"><span>field</span><b id="field">—</b></div>
+  <div class="row"><span>res</span><b id="res">—</b></div>
+  <div id="toggles">
+    <button id="t-spawn"  type="button" aria-pressed="true">ENTER / LEAVE</button>
+    <button id="t-topo"   type="button" aria-pressed="true">TOPOLOGY</button>
+    <button id="t-skin"   type="button" aria-pressed="true">SKINNED</button>
+    <button id="t-deform" type="button" aria-pressed="true">DEFORM (CPU)</button>
+    <button id="t-emissive" type="button" aria-pressed="true">EMISSIVE MOVER</button>
+    <button id="t-light"  type="button" aria-pressed="true">LIGHT MOVER</button>
+    <button id="t-events" type="button" aria-pressed="false">EXPLICIT EVENTS</button>
+    <button id="t-all"    type="button" aria-pressed="true">CHURN ALL</button>
+    <button id="t-inspect" type="button" aria-pressed="false">INSPECTOR</button>
+  </div>
+  <div id="log"></div>
+</div>
+<div id="status"></div>
+
+<script type="module">
+import * as THREE from 'three/webgpu';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
+import { Inspector } from 'three/addons/inspector/Inspector.js';
+import GUI from 'three/addons/libs/lil-gui.module.min.js';
+import { installSpeedballGI, excludeFromGI } from './js/index.js';
+import { applyGiSettings } from './js/gi_settings.js';
+
+const statusEl = document.getElementById('status');
+const setStatus = (msg) => { statusEl.style.display = 'grid'; statusEl.textContent = msg; };
+
+// ── Renderer — WebGPU, initialized BEFORE GI install (install needs renderer.lighting,
+//    and the lights factory must be in place before the first render) ─────────────
+const renderer = new THREE.WebGPURenderer({ canvas: document.getElementById('c'), antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.NeutralToneMapping;
+// index.html drives sun 20 / GI 20 through the PowerShot film chain; without the
+// film the display tone-map needs the compensation instead (checked live at 0.5).
+renderer.toneMappingExposure = 0.5;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+await renderer.init();
+if (renderer.backend?.isWebGPUBackend !== true) {
+  setStatus('WebGPU not available.\nThis test needs a WebGPU-capable browser.');
+  throw new Error('WebGPU unavailable');
+}
+
+// ── Scene & camera ──────────────────────────────────────────────────────────────
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(58, window.innerWidth / window.innerHeight, 0.05, 500);
+camera.position.set(9.5, 6.5, 12.5);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 1.6, 0);
+
+// Sky + sun. The Preetham dome is view dressing only — excludeFromGI keeps it out of
+// the GI BVH and the probe-grid auto-fit; the probes get the sky via gi.setSky().
+const sky = new SkyMesh();
+sky.scale.setScalar(400);
+sky.turbidity.value = 10;          // hazy gold, same pin as Sponza
+sky.rayleigh.value = 0.6;          // less blue scatter
+sky.mieCoefficient.value = 0.008;  // tighter sun glow on the horizon
+sky.mieDirectionalG.value = 0.85;
+const sunElev = 6.5;               // golden hour — just above the horizon
+const sunAzimuth = 22;             // rakes in through the open +Z mouth onto the back wall
+const sunDir = new THREE.Vector3().setFromSphericalCoords(
+  1,
+  THREE.MathUtils.degToRad(90 - sunElev),
+  THREE.MathUtils.degToRad(sunAzimuth),
+);
+sky.sunPosition.value.copy(sunDir);
+excludeFromGI(sky);
+scene.add(sky);
+
+const sun = new THREE.DirectionalLight(0xffffff, 8);
+sun.position.copy(sunDir).multiplyScalar(90);   // far along a low vector so the light sits outside the yard
+const warm = THREE.MathUtils.clamp(sunElev / 18, 0, 1);
+sun.color.setRGB(1.0, 0.6 + 0.4 * warm, 0.35 + 0.65 * warm);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.bias = -0.0004;
+sun.shadow.normalBias = 0.05;
+const sc = sun.shadow.camera;
+sc.left = -22; sc.right = 22; sc.top = 22; sc.bottom = -22; sc.near = 20; sc.far = 180;
+scene.add(sun);
+scene.add(sun.target);
+// Tiny pre-convergence fill; the probes carry the real ambient once converged.
+scene.add(new THREE.HemisphereLight(0xffc09a, 0x2a1c38, 0.05));
+
+// ── Cornell-style courtyard, dressed as a real place ───────────────────────────
+// The bounce contract is unchanged: one saturated RED wall facing one saturated
+// GREEN wall, so colored indirect light stays verifiable by eye. The sun rakes in
+// from +X/+Z, so the RED wall is the sunlit emitter and the GREEN wall is the
+// shaded receiver. Everything else is production dressing — wall relief, instanced
+// paving, timber/brass/stone material variety — so the churn lanes exercise a scene
+// shaped like a real level (many small meshes, heavy geometry re-use) instead of
+// five boxes.
+const mat = (color, rough = 0.9, metal = 0) =>
+  new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal });
+// Emissive dressing is REAL light to the trace, not a shader-only glow: the packer
+// writes material.emissive × emissiveIntensity into the traced material record
+// (spectral_scene.js emissiveScaled), so these strips bounce onto the walls. They
+// are STATIC — only the EMISSIVE churn lane below moves an emitter.
+const glow = (color, intensity) => new THREE.MeshStandardMaterial({
+  color: 0x0d0906, roughness: 0.6, metalness: 0,
+  emissive: new THREE.Color(color), emissiveIntensity: intensity,
+});
+const M = {
+  // Mid-value ground on purpose: a near-white plaza washes the colored bounce out,
+  // which is the one thing this page must keep legible.
+  ground: mat(0x8e887d, 0.95), paveA: mat(0x9d988d, 0.82), paveB: mat(0x857f75, 0.9),
+  white: mat(0xc9c6bf, 0.92),          // back-wall plaster (the Cornell white)
+  red:   mat(0xa02718, 0.88),          // left wall  — red bounce   (takes the sun)
+  green: mat(0x1f8a2c, 0.88),          // right wall — green bounce (in shadow)
+  dado:  mat(0x7b6f61, 0.97),          // rough plinth course under every wall
+  trim:  mat(0xd9d2c3, 0.68),          // cornices, capstones, sills
+  stone: mat(0x8d8778, 0.86),          // piers, bench legs, planter, plinths
+  stoneDark: mat(0x413d38, 0.5),       // stepped plinth under the centerpiece
+  // The one polished surface: MeshPhysicalMaterial clearcoat is raster-only (the
+  // traced material record has no clearcoat slot), so it costs the GI nothing.
+  polish: new THREE.MeshPhysicalMaterial({
+    color: 0x24262b, roughness: 0.14, metalness: 0.1, clearcoat: 1, clearcoatRoughness: 0.08 }),
+  timber: mat(0x6b4a2f, 0.82),         // pergola, benches, crates, flag pole
+  brass:  mat(0xb08d3c, 0.3, 0.85),    // fittings — metal, so it reflects rather than bounces
+  soil:   mat(0x2e2419, 0.98),
+  cove:    glow(0xffb066, 2.0),        // warm cove strip washing each wall base
+  lantern: glow(0xffc98a, 2.6),        // static lanterns on the entrance piers
+  // Pillar palette — four believable stone/metal finishes rather than four plastics,
+  // still distinct enough that a column vanishing from the ring is obvious.
+  gold: mat(0xb0873a, 0.4, 0.6),  teal: mat(0x4e8f80, 0.55, 0.25),
+  plum: mat(0x7b4750, 0.72),      bone: mat(0xd2c9b8, 0.7),
+  knot: mat(0xc9a227, 0.26, 0.9),      // brushed brass centerpiece — feeds the reflection lane
+  skin: mat(0x9c4b2f, 0.55, 0.15),     // patinated bronze sculpture
+  flag: new THREE.MeshStandardMaterial({
+    color: 0x3a6fd8, roughness: 0.78, metalness: 0, side: THREE.DoubleSide }),
+};
+// Shared-geometry cache. spectral_scene dedupes one BLAS per (geometry identity ×
+// per-tri material mapping), so re-using a BoxGeometry across dozens of dressing
+// meshes keeps the ENTER/LEAVE and TOPOLOGY rebuild cost about the CHURN instead of
+// about the dressing — the dressing costs instance rows, not BVH builds.
+const geoCache = new Map();
+const boxGeo = (w, h, d) => {
+  const key = `${w}|${h}|${d}`;
+  let g = geoCache.get(key);
+  if (!g) { g = new THREE.BoxGeometry(w, h, d); geoCache.set(key, g); }
+  return g;
+};
+const box = (w, h, d, m, x, y, z) => {
+  const mesh = new THREE.Mesh(boxGeo(w, h, d), m);
+  mesh.position.set(x, y, z);
+  mesh.castShadow = mesh.receiveShadow = true;
+  scene.add(mesh);
+  return mesh;
+};
+// Small box props (benches, crates, planters) as one placed group — same shared
+// geometries, one transform, so a prop is cheap in every lane.
+const prop = (parts, x, z, ry = 0) => {
+  const g = new THREE.Group();
+  for (const [w, h, d, m, px, py, pz] of parts) {
+    const piece = new THREE.Mesh(boxGeo(w, h, d), m);
+    piece.position.set(px, py, pz);
+    piece.castShadow = piece.receiveShadow = true;
+    g.add(piece);
+  }
+  g.position.set(x, 0, z);
+  g.rotation.y = ry;
+  scene.add(g);
+  return g;
+};
+
+// Ground slab (its top is y = 0 — every prop stands on that plane) plus a paved
+// plaza inset. The paving is two InstancedMeshes on a checker: 100 slabs, but only
+// ONE BLAS per tone plus instance rows — the shape real content has, and it keeps
+// the tracer's instanced path in the churn.
+box(26, 0.4, 26, M.ground, 0, -0.2, 0);
+{
+  const N = 10, CELL = 1.8;
+  const slabGeo = new THREE.BoxGeometry(1.7, 0.12, 1.7);
+  const paveA = new THREE.InstancedMesh(slabGeo, M.paveA, (N * N) / 2);
+  const paveB = new THREE.InstancedMesh(slabGeo, M.paveB, (N * N) / 2);
+  const m4 = new THREE.Matrix4();
+  let ia = 0, ib = 0;
+  for (let ix = 0; ix < N; ix++) for (let iz = 0; iz < N; iz++) {
+    m4.makeTranslation((ix - (N - 1) / 2) * CELL, -0.04, (iz - (N - 1) / 2) * CELL);
+    if ((ix + iz) & 1) paveB.setMatrixAt(ib++, m4); else paveA.setMatrixAt(ia++, m4);
+  }
+  for (const p of [paveA, paveB]) {
+    p.castShadow = p.receiveShadow = true;
+    p.instanceMatrix.needsUpdate = true;
+    scene.add(p);
+  }
+}
+
+// Bounce walls. The colored PANEL is the same slab as before (same color, same
+// inner face), so the Cornell reading is unchanged; the dado, cornice, capstone and
+// pilasters only give the light something to model. sx = -1 left (red), +1 right.
+function bounceWall(sx, panel) {
+  const x = 12 * sx;
+  box(0.9, 1.0, 24, M.dado, x - 0.25 * sx, 0.5, 0);          // rough plinth course
+  box(0.4, 6.2, 24, panel, x, 4.1, 0);                       // the Cornell panel
+  box(1.0, 0.45, 24, M.trim, x - 0.3 * sx, 7.42, 0);         // cornice
+  box(1.2, 0.28, 24, M.trim, x - 0.4 * sx, 7.79, 0);         // capstone
+  for (let i = -2; i <= 2; i++) box(0.5, 6.0, 0.8, panel, x - 0.45 * sx, 4.0, i * 4.6);
+  box(0.16, 0.1, 22.6, M.cove, x - 0.78 * sx, 1.06, 0);      // warm cove strip on the dado
+}
+bounceWall(-1, M.red);
+bounceWall(1, M.green);
+
+// Back wall: three tall window slots let the sky through and break the flat plaster.
+// Built from bands + piers rather than CSG — no boolean, still a real elevation.
+box(24, 2.4, 0.4, M.white, 0, 1.2, -12);                     // sill band
+box(24, 2.1, 0.4, M.white, 0, 6.65, -12);                    // header band
+for (const [xc, w] of [[-9.55, 4.9], [-3, 3.8], [3, 3.8], [9.55, 4.9]]) {
+  box(w, 3.2, 0.4, M.white, xc, 4.0, -12);                   // piers between the slots
+}
+for (const xc of [-6, 0, 6]) {
+  box(2.6, 0.18, 0.7, M.trim, xc, 2.42, -11.85);             // sill
+  box(2.6, 0.22, 0.7, M.trim, xc, 5.58, -11.85);             // lintel
+}
+box(24, 1.0, 0.85, M.dado, 0, 0.5, -11.65);
+box(24.6, 0.45, 0.9, M.trim, 0, 7.92, -11.75);
+box(22.6, 0.1, 0.16, M.cove, 0, 1.06, -11.14);
+
+// Entrance piers frame the open +Z mouth (where the sun comes in) and carry two
+// static lanterns — a second, still emitter set that the moving one is read against.
+for (const sx of [-1, 1]) {
+  box(1.6, 3.4, 1.6, M.stone, sx * 9.6, 1.7, 10.8);
+  box(2.0, 0.35, 2.0, M.trim, sx * 9.6, 3.58, 10.8);
+  box(0.5, 0.7, 0.5, M.lantern, sx * 9.6, 4.1, 10.8);
+  box(0.62, 0.12, 0.62, M.brass, sx * 9.6, 4.52, 10.8);
+}
+box(20, 0.16, 1.3, M.trim, 0, 0.08, 10.9);                   // threshold step
+
+// Pergola over the shaded (green) aisle: the low sun rakes through the slats and
+// stripes the paving, which is the cheapest honest test of GI shadow contrast.
+for (const px of [8.0, 10.4]) {
+  for (const pz of [-6.0, 1.8]) box(0.28, 2.9, 0.28, M.timber, px, 1.45, pz);
+  box(0.24, 0.34, 9.0, M.timber, px, 3.05, -2.0);
+}
+for (let i = 0; i < 7; i++) box(3.0, 0.14, 0.22, M.timber, 9.2, 3.28, -6.0 + i * 1.3);
+
+// Props along the aisles: benches under the red wall, crates and an urn plinth in
+// the back corners, a planter for the sculpture.
+const BENCH = [[2.9, 0.14, 0.62, M.timber, 0, 0.52, 0],
+               [0.5, 0.5, 0.55, M.stone, -1.15, 0.25, 0],
+               [0.5, 0.5, 0.55, M.stone, 1.15, 0.25, 0]];
+prop(BENCH, -9.6, -3.5, Math.PI / 2);
+prop(BENCH, -9.6, 3.0, Math.PI / 2);
+prop([[1.1, 1.1, 1.1, M.timber, 0, 0.55, 0],
+      [0.9, 0.9, 0.9, M.timber, 0.15, 1.55, -0.1],
+      [0.75, 0.75, 0.75, M.timber, -0.85, 0.38, 0.7]], -9.4, -8.6, 0.42);
+prop([[2.6, 0.7, 2.6, M.stone, 0, 0.35, 0],
+      [2.2, 0.12, 2.2, M.soil, 0, 0.72, 0]], -4.2, 3.4);
+{
+  const plinth = box(1.2, 1.0, 1.2, M.stone, 9.0, 0.5, -8.6);
+  const urn = new THREE.Mesh(new THREE.CylinderGeometry(0.46, 0.28, 0.95, 20), M.brass);
+  urn.position.set(plinth.position.x, 1.48, plinth.position.z);
+  urn.castShadow = urn.receiveShadow = true;
+  scene.add(urn);
+}
+
+// Stepped plinth under the centerpiece, capped with the polished stone.
+box(3.6, 0.35, 3.6, M.stoneDark, 0, 0.175, 0);
+box(3.0, 0.35, 3.0, M.stoneDark, 0, 0.52, 0);
+box(2.4, 0.55, 2.4, M.polish, 0, 0.97, 0);
+
+// ── Churn 1: TOPOLOGY — the centerpiece knot cycles through vertex/index counts.
+//    Swapping mesh.geometry for a different-sized one is a structure change: the GI
+//    field must notice and rebuild its traced scene.
+const knot = new THREE.Mesh(new THREE.TorusKnotGeometry(0.9, 0.3, 128, 16), M.knot);
+knot.position.set(0, 2.45, 0);  // sits on the stepped plinth cap (top y = 1.245)
+knot.castShadow = knot.receiveShadow = true;
+scene.add(knot);
+const KNOT_LODS = [[96, 12], [144, 20], [200, 28], [64, 8]];
+let knotLod = 0;
+function churnTopology() {
+  knotLod = (knotLod + 1) % KNOT_LODS.length;
+  const [tube, rad] = KNOT_LODS[knotLod];
+  knot.geometry.dispose();
+  knot.geometry = new THREE.TorusKnotGeometry(0.9, 0.3, tube, rad);
+  return `TOPO knot ${tube}x${rad}`;
+}
+
+// ── Churn 2: ENTER / LEAVE — a ring of pillars pops in and out of the scene.
+//    Shared geometries + a palette that is already compiled at first paint, so a
+//    re-add needs no material recompile; presence changes alone must drive the GI.
+//    Each pillar is now a five-part column (plinth / shaft / collar / capital /
+//    finial) on the SAME five shared geometries, so the lane moves five instance
+//    rows per event instead of two while the BLAS set stays constant.
+const plinthGeo = new THREE.BoxGeometry(1.15, 0.28, 1.15);
+const shaftGeo = new THREE.CylinderGeometry(0.36, 0.42, 3.1, 16);
+const collarGeo = new THREE.TorusGeometry(0.4, 0.06, 8, 20);
+const abacusGeo = new THREE.BoxGeometry(1.0, 0.3, 1.0);
+const capGeo = new THREE.SphereGeometry(0.34, 20, 14);
+const pillars = [];
+const palette = [M.gold, M.teal, M.plum, M.bone];
+for (let i = 0; i < 8; i++) {
+  const a = (i / 8) * Math.PI * 2 + Math.PI / 8;
+  const body = palette[i % 4], accent = palette[(i + 1) % 4];
+  const g = new THREE.Group();
+  const parts = [
+    new THREE.Mesh(plinthGeo, M.stone),
+    new THREE.Mesh(shaftGeo, body),
+    new THREE.Mesh(collarGeo, accent),
+    new THREE.Mesh(abacusGeo, M.stone),
+    new THREE.Mesh(capGeo, accent),
+  ];
+  parts[0].position.y = 0.14;
+  parts[1].position.y = 1.83;
+  parts[2].position.y = 3.42; parts[2].rotation.x = Math.PI / 2;
+  parts[3].position.y = 3.62;
+  parts[4].position.y = 4.0;
+  for (const p of parts) p.castShadow = p.receiveShadow = true;
+  g.add(...parts);
+  g.position.set(Math.cos(a) * 6.5, 0, Math.sin(a) * 6.5);
+  scene.add(g);                        // present at t=0 → materials compile WITH GI folded in
+  pillars.push(g);
+}
+function churnSpawn() {
+  const i = (Math.random() * pillars.length) | 0;
+  const p = pillars[i];
+  if (p.parent) { p.removeFromParent(); return { label: `LEAVE pillar ${i}`, kind: 'remove' }; }
+  scene.add(p);
+  return { label: `ENTER pillar ${i}`, kind: 'add' };
+}
+
+// ── Churn 3: SKINNED — a bone-chain tentacle waving continuously. GPU-skinned
+//    vertices never reach the traced scene (by design), so this lane must churn
+//    without ever scheduling GI work — it is here to prove that it doesn't.
+function makeTentacle() {
+  const height = 3.6, bones = 5, segPerBone = height / (bones - 1);
+  const geo = new THREE.CylinderGeometry(0.16, 0.34, height, 12, 24);
+  geo.translate(0, height / 2, 0);
+  const pos = geo.attributes.position;
+  const skinIndices = [], skinWeights = [];
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i);
+    const bi = Math.min(bones - 2, Math.max(0, Math.floor(y / segPerBone)));
+    const t = Math.min(1, Math.max(0, (y - bi * segPerBone) / segPerBone));
+    skinIndices.push(bi, bi + 1, 0, 0);
+    skinWeights.push(1 - t, t, 0, 0);
+  }
+  geo.setAttribute('skinIndex', new THREE.Uint16BufferAttribute(skinIndices, 4));
+  geo.setAttribute('skinWeight', new THREE.Float32BufferAttribute(skinWeights, 4));
+  const chain = [];
+  for (let i = 0; i < bones; i++) {
+    const b = new THREE.Bone();
+    b.position.y = i === 0 ? 0 : segPerBone;
+    if (i > 0) chain[i - 1].add(b);
+    chain.push(b);
+  }
+  const mesh = new THREE.SkinnedMesh(geo, M.skin);
+  mesh.add(chain[0]);
+  mesh.bind(new THREE.Skeleton(chain));
+  mesh.castShadow = mesh.receiveShadow = true;
+  mesh.userData.chain = chain;
+  return mesh;
+}
+const tentacle = makeTentacle();
+tentacle.position.set(-4.2, 0.72, 3.4);   // grows out of the planter rim
+scene.add(tentacle);
+function animateSkin(t) {
+  const chain = tentacle.userData.chain;
+  for (let i = 1; i < chain.length; i++) {
+    chain[i].rotation.z = Math.sin(t * 1.7 + i * 0.9) * 0.38;
+    chain[i].rotation.x = Math.cos(t * 1.3 + i * 0.7) * 0.22;
+  }
+}
+
+// ── Churn 4: DEFORM — same-topology CPU vertex writes (a waving flag). This is the
+//    lane skinning does NOT hit: position/normal version bumps must route to the GI's
+//    in-place deform refresh, never to a full rebuild.
+const flagGeo = new THREE.PlaneGeometry(4.2, 2.4, 40, 20);
+const flagBase = flagGeo.attributes.position.array.slice();
+const flag = new THREE.Mesh(flagGeo, M.flag);
+flag.position.set(4.6, 3.0, 3.2);
+flag.castShadow = flag.receiveShadow = true;
+scene.add(flag);
+box(0.5, 0.3, 0.5, M.stone, 4.6 - 2.1, 0.15, 3.2);   // flag pole footing
+box(0.14, 4.6, 0.14, M.timber, 4.6 - 2.1, 2.3, 3.2); // flag pole
+{
+  const finial = new THREE.Mesh(new THREE.SphereGeometry(0.13, 16, 12), M.brass);
+  finial.position.set(4.6 - 2.1, 4.68, 3.2);
+  finial.castShadow = finial.receiveShadow = true;
+  scene.add(finial);
+}
+function animateDeform(t) {
+  const p = flagGeo.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = flagBase[i * 3], y = flagBase[i * 3 + 1];
+    const sway = (x + 2.1) / 4.2;   // pinned at the pole, free at the tip
+    p.array[i * 3 + 2] = Math.sin(x * 2.1 + t * 3.1) * 0.32 * sway
+                       + Math.sin(y * 3.3 + t * 2.2) * 0.09 * sway;
+  }
+  p.needsUpdate = true;
+  flagGeo.computeVertexNormals();   // bumps normal.version too — both feed the deform lane
+}
+
+// ── Churn 5: EMISSIVE — a moving emitter SURFACE ───────────────────────────────
+//    A drone lamp whose MeshStandardMaterial carries a strong emissive; the packer
+//    writes emissive × emissiveIntensity into the traced material record, so this
+//    orb is a genuine area emitter for the probes (no analytic light is attached —
+//    every photon it contributes is bounce off its own surface).
+//    LANE: this is the TRANSFORM lane, not the light lane. The orb's radiance is
+//    baked into the build; only its matrix moves, so the correct plugin response is
+//    the in-place instance/TLAS rewrite (refreshTransforms → spectral_scene
+//    updateTransforms) — never a BVH rebuild, never a material recompile.
+//    CORRECT BEHAVIOUR: the warm pool on the paving and the wash on the walls track
+//    the orb, and the HUD stays "steady" (no REBUILDING) the whole time.
+//    Events ON → the packet is consumed every tick, even mid-orbit. Events OFF →
+//    the fallback xform scan is REST-ONLY, and this page passes playing:true while
+//    any continuous lane runs, so the field deliberately holds the orb's old
+//    position until the movers are switched off AND the camera rests. That gap is
+//    the point of the toggle: it is the difference an event-driven host buys.
+const droneMat = new THREE.MeshStandardMaterial({
+  color: 0x140b04, roughness: 0.4, metalness: 0,
+  emissive: new THREE.Color(0xffb45a), emissiveIntensity: 8,
+});
+const drone = new THREE.Group();
+const droneOrb = new THREE.Mesh(new THREE.SphereGeometry(0.5, 28, 18), droneMat);
+const droneRing = new THREE.Mesh(new THREE.TorusGeometry(0.72, 0.05, 10, 28), M.brass);
+droneRing.rotation.x = Math.PI / 2;
+droneOrb.castShadow = droneRing.castShadow = droneRing.receiveShadow = true;
+drone.add(droneOrb, droneRing);
+scene.add(drone);
+// spectral_scene resolves transform targets against its traced-MESH table, so a
+// parent Group is silently skipped — the lane reports the meshes themselves.
+const droneParts = [droneOrb, droneRing];
+function animateEmissive(t) {
+  const a = t * 0.42;   // a slow lissajous: stays inside the walls, above the props
+  drone.position.set(Math.sin(a) * 8.2, 5.35 + Math.sin(a * 2.3) * 0.45, Math.cos(a * 0.73) * 8.2);
+  drone.rotation.y = a * 1.6;
+}
+
+// ── Churn 6: LIGHT — a moving ANALYTIC light ───────────────────────────────────
+//    A lantern car riding a cable across the courtyard mouth, carrying a real
+//    THREE.PointLight (point lights are collected by the GI light packer and the
+//    install default reserves 16 of them in the batched raster node).
+//    LANE: lights are REFRESH-class, not rebuild-class — the probe tick re-checks
+//    the light signature and refills the light buffer in place OUTSIDE the
+//    rest-only gate, so this lane must keep updating the GI field with NO events at
+//    all, even while the camera orbits. That is what makes it different from every
+//    other lane on this page.
+//    CORRECT BEHAVIOUR: the cool pool under the lantern, and its bounce onto the
+//    shaded green wall, slide with the fixture with the HUD reading "steady" —
+//    with EXPLICIT EVENTS off, which no other lane manages while playing:true.
+//    The fixture GEOMETRY is a separate matter: it is traced meshes on the move, so
+//    it rides the same transform lane as the drone, and only so that its own
+//    surfaces (and the globe's small emissive) follow the light they belong to.
+const lampRail = box(23.0, 0.09, 0.09, M.brass, 0, 7.0, 4.6);    // static cable
+lampRail.castShadow = false;
+const lamp = new THREE.Group();
+const lampRod = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 3.2, 8), M.brass);
+lampRod.position.y = -1.6;
+const lampHood = new THREE.Mesh(new THREE.ConeGeometry(0.42, 0.4, 20), M.brass);
+lampHood.position.y = -3.32;
+const lampGlobe = new THREE.Mesh(new THREE.SphereGeometry(0.34, 24, 16), new THREE.MeshStandardMaterial({
+  // Deliberately WEAK emissive: the fixture must read as "on" without competing
+  // with the PointLight, so this lane's GI contribution stays attributable to the
+  // light record rather than to an emitter surface.
+  color: 0x2a2620, roughness: 0.3, metalness: 0,
+  emissive: new THREE.Color(0xcfe4ff), emissiveIntensity: 2.5,
+}));
+lampGlobe.position.y = -3.62;
+for (const p of [lampRod, lampHood, lampGlobe]) p.castShadow = p.receiveShadow = true;
+// Point-light shadows are six cube faces per frame; this harness measures GI cost,
+// so the fixture stays shadowless and the frame-time log keeps meaning what it says.
+const lampLight = new THREE.PointLight(0xbcd6ff, 42, 15, 2);
+lampLight.castShadow = false;
+lampLight.position.y = -3.62;
+lamp.add(lampRod, lampHood, lampGlobe, lampLight);
+lamp.position.set(0, 7.0, 4.6);
+scene.add(lamp);
+const lampParts = [lampRod, lampHood, lampGlobe];
+function animateLight(t) {
+  const a = t * 0.52;                       // ~12 s across and back
+  lamp.position.x = Math.sin(a) * 7.6;
+  lamp.rotation.z = -Math.cos(a) * 0.22;    // the car's pendulum lags the sweep
+}
+
+// ── SPEEDBALL GI — one call at setup, before the first render ───────────────────
+const gi = installSpeedballGI({
+  renderer, scene, camera,
+  reflectionQuality: 'high',
+  reflectionSkyFallback: true,
+});
+if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.');
+// Canonical Sponza tuning via the shared demo helper, with the hero page's gain
+// overrides (giIntensity 20 / sky 2). This is what makes bounce readable in shadow.
+gi.setSmoothness(1);
+gi.setFilterStrength(1);
+applyGiSettings(gi, { giIntensity: 20, giSky: 2, giDepthSharpness: 2 });
+const giTune = {
+  sunIntensity: 8, emissiveStrength: 8, pendant: true,
+  giIntensity: 20, giSky: 2, giDepthSharpness: 2, giDivisions: 16, giRays: 64,
+};
+const gui = new GUI({ title: 'GI' });
+gui.add(giTune, 'sunIntensity').min(0).step(0.05).name('sunlight').onChange((v) => { sun.intensity = v; });
+gui.add(giTune, 'emissiveStrength').min(0).step(0.05).name('emissive').onChange((v) => { droneMat.emissiveIntensity = v; });
+gui.add(giTune, 'pendant').name('pendant').onChange((on) => {
+  lampLight.visible = on;
+  lampGlobe.material.emissiveIntensity = on ? 2.5 : 0;
+});
+gui.add(giTune, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => gi.setIntensity(v));
+gui.add(giTune, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi.setDivisions(v); gi.markInteraction?.(); });
+gui.add(giTune, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi.setRays(v); gi.markInteraction?.(); });
+gui.add(giTune, 'giSky', 0, 2, 0.05).name('sky light').onChange((v) => gi.setSkyIntensity?.(v));
+gui.add(giTune, 'giDepthSharpness', 0, 7, 0.1).name('depth sharpness').onChange((v) => gi.setDepthSharpness(v));
+// Probes need the sky the dome shows (the dome itself is excluded from the trace).
+// Same low-frequency dome approximation as index.html's updateGiSky, evaluated for
+// this scene's fixed sun elevation / turbidity / rayleigh.
+{
+  const elev = THREE.MathUtils.radToDeg(Math.asin(sunDir.y));
+  const sunUp = THREE.MathUtils.clamp(Math.sin(THREE.MathUtils.degToRad(elev)), 0, 1);
+  const daylight = Math.sqrt(sunUp);
+  const ray = THREE.MathUtils.clamp(sky.rayleigh.value / 8, 0, 1);
+  const turb = THREE.MathUtils.clamp(sky.turbidity.value / 20, 0, 1);
+  const haze = THREE.MathUtils.clamp((1 - daylight) * 0.65 + turb * 0.35, 0, 1);
+  gi.setSky?.({
+    zenith: new THREE.Color().setRGB(0.10 + 0.12 * ray, 0.20 + 0.20 * ray, 0.42 + 0.34 * ray)
+      .multiplyScalar(0.18 + 0.62 * daylight),
+    horizon: new THREE.Color().setRGB(0.34 + 0.34 * haze, 0.39 + 0.18 * daylight, 0.48 + 0.24 * daylight)
+      .multiplyScalar(0.16 + 0.50 * daylight),
+    ground: new THREE.Color().setRGB(0.10, 0.085, 0.065).multiplyScalar(0.06 + 0.16 * daylight),
+  });
+}
+window.gi = gi; window.scene = scene; window.renderer = renderer; // console pokes
+
+// ── Churn scheduler + HUD ───────────────────────────────────────────────────────
+const churn = { spawn: true, topo: true, skin: true, deform: true, emissive: true, light: true, events: false };
+const hasEvents = typeof gi.notifySceneChange === 'function';
+const logEl = document.getElementById('log');
+const fpsEl = document.getElementById('fps');
+const worstEl = document.getElementById('worst');
+const worstRow = document.getElementById('worst-row');
+const fieldEl = document.getElementById('field');
+const resEl = document.getElementById('res');
+const _drawSize = new THREE.Vector2();
+function writeRes() {
+  renderer.getDrawingBufferSize(_drawSize);
+  resEl.textContent = `${Math.round(_drawSize.x)} × ${Math.round(_drawSize.y)} · ${renderer.getPixelRatio().toFixed(2)}×`;
+}
+writeRes();
+
+// Every churn action gets a watcher: the worst frame time inside the following
+// second is attributed to it in the log, so stalls are traceable to their cause.
+const watchers = [];
+const logLines = [];
+function logAction(label) {
+  watchers.push({ label, framesLeft: 75, worst: 0 });
+}
+function flushWatcher(w) {
+  const ms = w.worst.toFixed(0);
+  const cls = w.worst >= 100 ? 'spike-bad' : (w.worst >= 34 ? 'spike' : '');
+  logLines.push(`<div class="${cls}">${w.label} → worst ${ms} ms</div>`);
+  while (logLines.length > 6) logLines.shift();
+  logEl.innerHTML = logLines.join('');
+}
+
+let nextSpawnAt = 2500, nextTopoAt = 4200;
+function runChurn(nowMs) {
+  if (churn.spawn && nowMs >= nextSpawnAt) {
+    nextSpawnAt = nowMs + 2200 + Math.random() * 900;
+    const { label, kind } = churnSpawn();
+    if (churn.events) gi.notifySceneChange?.(kind);
+    logAction(label + (churn.events ? ' [event]' : ''));
+  }
+  if (churn.topo && nowMs >= nextTopoAt) {
+    nextTopoAt = nowMs + 4000 + Math.random() * 1200;
+    const label = churnTopology();
+    if (churn.events) gi.notifySceneChange?.('topology');
+    logAction(label + (churn.events ? ' [event]' : ''));
+  }
+}
+
+const T = (id, key) => {
+  const el = document.getElementById(id);
+  el.addEventListener('click', () => {
+    churn[key] = !churn[key];
+    el.setAttribute('aria-pressed', String(churn[key]));
+  });
+  return el;
+};
+T('t-spawn', 'spawn'); T('t-topo', 'topo'); T('t-skin', 'skin'); T('t-deform', 'deform');
+T('t-emissive', 'emissive'); T('t-light', 'light');
+const eventsBtn = T('t-events', 'events');
+if (!hasEvents) { eventsBtn.disabled = true; eventsBtn.title = 'notifySceneChange not in this build'; }
+document.getElementById('t-all').addEventListener('click', (e) => {
+  const on = e.currentTarget.getAttribute('aria-pressed') !== 'true';
+  e.currentTarget.setAttribute('aria-pressed', String(on));
+  for (const key of ['spawn', 'topo', 'skin', 'deform', 'emissive', 'light']) {
+    churn[key] = on;
+    document.getElementById('t-' + key).setAttribute('aria-pressed', String(on));
+  }
+});
+
+// three.js r185 Inspector (upstream examples/jsm/inspector, wired as in maxjs):
+// lazily created on first use. While attached it turns GPU timestamp tracking on,
+// so detach must wait out the pending timestamp resolve, restore the renderer's
+// passive inspector, and stop timestamp tracking — otherwise a hidden inspector
+// keeps profiling and eventually exhausts WebGPU's query pool.
+const passiveInspector = renderer.inspector;
+const inspectBtn = document.getElementById('t-inspect');
+let inspector = null;
+inspectBtn.addEventListener('click', () => {
+  const on = inspectBtn.getAttribute('aria-pressed') !== 'true';
+  inspectBtn.setAttribute('aria-pressed', String(on));
+  if (on) {
+    if (!inspector) {
+      inspector = new Inspector();
+      document.body.appendChild(inspector.domElement);
+    }
+    inspector.domElement.style.display = '';
+    renderer.inspector = inspector;
+    return;
+  }
+  if (!inspector) return;
+  inspector.domElement.style.display = 'none';
+  const detachWhenIdle = () => {
+    if (renderer.inspector !== inspector) return;
+    if (inspectBtn.getAttribute('aria-pressed') === 'true') return;   // re-enabled meanwhile
+    const pending = inspector._resolveTimestampPromise;
+    if (pending?.then) {
+      void pending.then(() => queueMicrotask(detachWhenIdle), () => queueMicrotask(detachWhenIdle));
+      return;
+    }
+    renderer.inspector = passiveInspector;
+    if (renderer.backend) renderer.backend.trackTimestamp = false;
+  };
+  queueMicrotask(detachWhenIdle);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  writeRes();
+});
+
+// ── Loop ────────────────────────────────────────────────────────────────────────
+let lastMs = 0, fpsEma = 0;
+const dtRing = new Float32Array(90);
+let dtIdx = 0;
+let hudAt = 0;
+
+renderer.setAnimationLoop((nowMs) => {
+  const dt = lastMs > 0 ? nowMs - lastMs : 16.7;
+  lastMs = nowMs;
+  dtRing[dtIdx++ % dtRing.length] = dt;
+  fpsEma = fpsEma > 0 ? fpsEma * 0.95 + (1000 / Math.max(dt, 1e-3)) * 0.05 : 60;
+  for (let i = watchers.length - 1; i >= 0; i--) {
+    const w = watchers[i];
+    if (dt > w.worst) w.worst = dt;
+    if (--w.framesLeft <= 0) { flushWatcher(w); watchers.splice(i, 1); }
+  }
+
+  controls.update();
+  const t = nowMs / 1000;
+  if (churn.skin) animateSkin(t);
+  if (churn.deform) {
+    animateDeform(t);
+    if (churn.events) gi.markDeformsDirty?.();
+  }
+  if (churn.emissive) {
+    animateEmissive(t);
+    // Transform lane. notifySceneChange('transform') forwards change.objects to
+    // markTransformsDirty, which queues the exact meshes for the next tick's
+    // in-place instance/TLAS rewrite — no rebuild, no per-frame log line (a
+    // continuous lane, same precedent as SKINNED / DEFORM).
+    if (churn.events) gi.notifySceneChange?.({ type: 'transform', objects: droneParts });
+  }
+  if (churn.light) {
+    animateLight(t);
+    // NOTHING is sent for the PointLight itself — the lights lane is refresh-class
+    // and rides through motion unprompted; sending an event here would only prove
+    // the harness can call the API. The fixture's traced meshes are ordinary moving
+    // geometry, so they take the same transform packet as the drone.
+    if (churn.events) gi.markTransformsDirty?.(lampParts);
+  }
+  runChurn(nowMs);
+
+  // The scene genuinely animates while any continuous churn is on: playing:true
+  // keeps the solver working through motion instead of waiting for an idle rest.
+  gi.update({ playing: churn.skin || churn.deform || churn.emissive || churn.light });
+  renderer.render(scene, camera);
+
+  if (nowMs >= hudAt) {
+    hudAt = nowMs + 250;
+    let worst = 0;
+    for (let i = 0; i < dtRing.length; i++) if (dtRing[i] > worst) worst = dtRing[i];
+    fpsEl.textContent = fpsEma.toFixed(0);
+    worstEl.textContent = worst.toFixed(0) + ' ms';
+    worstRow.className = 'row' + (worst >= 100 ? ' bad' : (worst >= 34 ? ' warn' : ''));
+    const d = gi._debugState?.();
+    fieldEl.textContent = d
+      ? `${gi.getRays?.() ?? '—'} rays · ${d.buildDirty ? 'REBUILDING' : 'steady'} · geo ${d.geoStable}`
+      : '—';
+    writeRes();
+  }
+});
+</script>
+</body>
+</html>
