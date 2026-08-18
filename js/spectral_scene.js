@@ -722,7 +722,33 @@ function buildTlasRecords(aabbs, leafSize = 2) {
     return { records, order };
 }
 
-export async function buildSpectralScene({ THREE, scene, camera = null, maxTriangles = 4_000_000 } = {}) {
+// ── Cross-rebuild BLAS cache ────────────────────────────────────────────────
+// A structural rebuild used to rebuild EVERY BLAS in the scene; with a cache
+// installed a topology change pays only for the geometries it actually
+// changed. Entries are keyed by the same structural fingerprint as the
+// in-build dedup (geometry identity × attribute identity/version × per-tri
+// uber mapping), so any content change misses. The cached core is immutable
+// build output — records, soup slices, BVH-ordered materials — and every
+// build works on a shallow clone (see the reuse site), so per-build pool
+// offsets stamped by a newer build can never corrupt an older build that is
+// still draining async work against its own pool. Capacity is bounded by
+// total cached triangles, evicted least-recently-used first.
+export function createBlasCache({ maxTriangles = 2_000_000 } = {}) {
+    return { map: new Map(), maxTriangles, triangles: 0, hits: 0, misses: 0 };
+}
+
+let nextAttrId = 1;
+const attrIds = new WeakMap();
+// Attribute OBJECT identity for cache keys: a replaced attribute restarts its
+// version counter at 0, so version alone would false-hit across the swap.
+function attrIdentity(attr) {
+    if (!attr) return 0;
+    let id = attrIds.get(attr);
+    if (id === undefined) { id = nextAttrId++; attrIds.set(attr, id); }
+    return id;
+}
+
+export async function buildSpectralScene({ THREE, scene, camera = null, maxTriangles = 4_000_000, blasCache = null } = {}) {
     if (!scene) return null;
     scene.updateMatrixWorld(true);
 
@@ -762,7 +788,14 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         if (visibleTriCount <= 0) return;
 
         const uniqueTriMaterial = Array.isArray(obj.material);
-        let key = `${geom.uuid}:${index ? index.version : -1}:${pos.version}:${uniqueTriMaterial ? 1 : 0}`;
+        const normalAttr = geom.attributes.normal || null;
+        // Doubles as the cross-rebuild cache key: attribute identities catch
+        // swapped-in attributes whose fresh version counters would collide,
+        // and the normal fingerprint keeps cached soup normals honest.
+        let key = `${geom.uuid}:${attrIdentity(index)}.${index ? index.version : -1}`
+            + `:${attrIdentity(pos)}.${pos.version}.${attributeDataVersion(pos)}`
+            + `:${attrIdentity(normalAttr)}.${normalAttr ? normalAttr.version : -1}.${attributeDataVersion(normalAttr)}`
+            + `:${uniqueTriMaterial ? 1 : 0}`;
         if (uniqueTriMaterial) {
             let h = 0;
             for (let t = 0; t < triCount; t++) h = ((h * 31) + triMat[t] + 1) >>> 0;
@@ -773,12 +806,34 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
 
         let blasIdx = blasByKey.get(key);
         if (blasIdx === undefined) {
-            const blas = buildLocalBlas(THREE, {
-                pos, index, triCount, visibleTriCount, visibleTriIndices, triMat, uniqueTriMaterial,
-                normal: geom.attributes.normal || null,
-                uv: geom.attributes.uv || null,
-            });
-            if (!blas) return;
+            let core = blasCache ? blasCache.map.get(key) : undefined;
+            if (core) {
+                blasCache.hits++;
+                blasCache.map.delete(key);   // LRU touch: re-insert as newest
+                blasCache.map.set(key, core);
+            } else {
+                core = buildLocalBlas(THREE, {
+                    pos, index, triCount, visibleTriCount, visibleTriIndices, triMat, uniqueTriMaterial,
+                    normal: normalAttr,
+                    uv: geom.attributes.uv || null,
+                });
+                if (!core) return;
+                if (blasCache) {
+                    blasCache.misses++;
+                    blasCache.map.set(key, core);
+                    blasCache.triangles += core.triCount;
+                    for (const [oldKey, old] of blasCache.map) {
+                        if (blasCache.triangles <= blasCache.maxTriangles || blasCache.map.size <= 1) break;
+                        if (old === core) continue;   // never evict this build's own entry
+                        blasCache.map.delete(oldKey);
+                        blasCache.triangles -= old.triCount;
+                    }
+                }
+            }
+            // Per-build state lives on a clone: the pool offsets and source
+            // bindings stamped below must never leak into an older build that
+            // is still draining async deform slices against its own pool.
+            const blas = Object.assign({}, core);
             // Deform tracking: soup vertices [0, srcVertCount) map 1:1 onto the
             // source geometry's vertices, so updateDeforms can re-gather this
             // BLAS's pooled slice straight from the live attributes.

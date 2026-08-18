@@ -5,6 +5,14 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Cross-rebuild BLAS cache: a structural rebuild now pays only for the
+  geometries that actually changed. Cached cores (BVH records, soup slices,
+  BVH-ordered materials) are keyed by geometry identity × attribute
+  identity/version × per-tri material mapping, reused via per-build clones so
+  an in-flight older build can never be corrupted, and bounded by a
+  least-recently-used triangle budget. Measured on the churn harness at rest:
+  worst frame per topology/enter/leave action drops from ~240 ms to ~110 ms
+  (the remainder is pool upload + kernel work, not BLAS builds).
 - three-mesh-bvh housekeeping: demo CDN pins moved to 0.9.14, the build option
   renamed to `targetLeafSize` (kills the per-BLAS deprecation warning during
   churn), and the peer floor raised to `>=0.9.11` — older 0.9.x silently

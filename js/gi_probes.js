@@ -34,6 +34,7 @@ import {
 // importing this module for the GiProbeNode (e.g. from max_lights_node.js) does
 // NOT drag the CPU BVH builder into that module graph.
 let _buildSpectralScene = null;
+let _createBlasCache = null;
 let _collectLights = null;       // cheap light re-collect for reactivity (no BVH rebuild)
 let _LIGHT_STRIDE = 16;
 import { buildTraversal, T_MAX, RAY_EPS, PI } from './spectral_traverse.js';
@@ -1030,6 +1031,7 @@ export function createProbeField({
     // it's set by geometry/light-count/volume changes (true at start), and left FALSE by
     // setDivisions/setRays so those resize the grid/kernels off the cached soup (no hitch).
     let cachedBuilt = null;
+    let blasCache = null;    // cross-rebuild BLAS cache (created with the lazy scene builder)
     // C0/C1 trace the same scene soup. Keep the large immutable/streamed scene
     // attributes and material maps behind one ref-counted owner instead of
     // allocating and uploading a duplicate set for every cascade. The active
@@ -2549,6 +2551,7 @@ export function createProbeField({
         if (!_buildSpectralScene) {
             const mod = await import('./spectral_scene.js');
             _buildSpectralScene = mod.buildSpectralScene;
+            _createBlasCache = mod.createBlasCache || null;
             _collectLights = mod.collectLights || null;
             if (Number.isFinite(mod.LIGHT_STRIDE)) _LIGHT_STRIDE = mod.LIGHT_STRIDE;
         }
@@ -2748,7 +2751,8 @@ export function createProbeField({
             scene.updateMatrixWorld(true);
             const startedGeneration = buildGeneration;
             const startedGeoSig = geoSignature();
-            built = await buildSpectralScene({ THREE, scene, maxTriangles: MAX_TRIANGLES });
+            if (!blasCache && _createBlasCache) blasCache = _createBlasCache();
+            built = await buildSpectralScene({ THREE, scene, maxTriangles: MAX_TRIANGLES, blasCache });
             if (disposed) {
                 disposeUninstalledBuild(built);
                 return false;
@@ -3818,6 +3822,7 @@ export function createProbeField({
         sceneResource = null;
         liveLightRecords = null;
         cachedBuilt = null;
+        blasCache = null;
         pendingTransformTargets.clear();
         pendingAllTransforms = false;
         pendingDeformRefresh = false;
@@ -4027,6 +4032,9 @@ export function createProbeField({
             lastRefitCount,
             lastTransformInstanceCount,
             lastTlasRefitCount,
+            blasCache: blasCache
+                ? { hits: blasCache.hits, misses: blasCache.misses, triangles: blasCache.triangles, entries: blasCache.map.size }
+                : null,
             pendingTransformCount: pendingAllTransforms ? -1 : pendingTransformTargets.size,
             pendingDeformRefresh,
             solveList: lastSolveList,
