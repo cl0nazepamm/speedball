@@ -25,7 +25,9 @@
 import { MeshBVH } from 'three-mesh-bvh';
 import {
     createFlatBlasRefitStepper,
+    createFlatTlasRefitIndex,
     refitFlatBlasRange,
+    refitFlatTlasDirty,
     refitFlatTlasRange,
     runLatestBudgetedTask,
 } from './gi_refit.js';
@@ -42,8 +44,11 @@ const NODE_STRIDE_U32 = 8;     // bvhNodes: 6 aabb floats + miss + payload
 //   [24] alpha-map layer
 //   [25] nirAlbedo: −1 = untagged (kernel uses JH extrapolation as prior),
 //        else authored [0,1] NIR reflectance (userData.nirAlbedo wins over
-//        the classifyNir heuristics) · [26..27] pad
+//        the classifyNir heuristics) · [26] traversal flags · [27] pad
 const MAT_STRIDE = 28;
+const MAT_FLAG_ALPHA_TEXTURE = 1; // alpha acceptance requires UV/map sampling
+const MAT_FLAG_ALPHA_ACCEPT = 2;  // constant alpha path is guaranteed accepted
+const MAT_FLAG_SHADOW_BLOCK = 4;  // transmission < 0.5 (matches traverseAny)
 const LIGHT_STRIDE = 17;        // lights: see layout below
 const VERT_STRIDE = 3;          // vertexPos: tightly packed xyz (flat f32 storage, read by offset; also fed to MeshBVH which assumes stride 3)
 const VERTEX_DATA_STRIDE = 8;   // GPU interleaved per-vertex: pos(3) + normal(3) + uv(2)
@@ -265,6 +270,16 @@ function materialToUber(material) {
         ? Math.min(1, Math.max(0, udNir))
         : classifyNir(material.name, r, g, b, roughnessC, metalnessC, transmissionC);
 
+    // Traversal classification is packed once instead of rediscovered for
+    // every candidate triangle. A bound color/alpha map stays on the exact
+    // texture path; otherwise scalar alpha acceptance is a build-time fact.
+    const hasAlphaTexture = !!(material.map || material.alphaMap);
+    const constantAlphaAccepted = opacity > 1.0e-4
+        && (alphaTest <= 0 || opacity >= alphaTest);
+    const traversalFlags = (hasAlphaTexture ? MAT_FLAG_ALPHA_TEXTURE : 0)
+        | (!hasAlphaTexture && constantAlphaAccepted ? MAT_FLAG_ALPHA_ACCEPT : 0)
+        | (transmissionC < 0.5 ? MAT_FLAG_SHADOW_BLOCK : 0);
+
     return [r, g, b,
         Math.min(1, Math.max(0, roughness)), // 0 = delta mirror, legal
         Math.min(1, Math.max(0, metalness)),
@@ -280,7 +295,7 @@ function materialToUber(material) {
         Math.min(1, Math.max(0, alphaTest)),
         -1,                     // [24] alpha-map layer, filled by buildMaterialTextures
         nirAlbedo,              // [25] NIR reflectance (−1 = JH prior)
-        0, 0];                  // [26..27] pad
+        traversalFlags, 0];     // [26] traversal flags, [27] pad
 }
 
 const texUuid = (t) => (t && t.isTexture ? t.uuid : '-');
@@ -781,8 +796,12 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         }
         if (obj.isInstancedMesh) {
             const capacity = Number.isFinite(obj.instanceMatrix?.count) ? obj.instanceMatrix.count : obj.count;
-            const count = Math.max(0, Math.min(obj.count | 0, capacity | 0));
-            for (let i = 0; i < count; i++) instances.push({ blas: blasIdx, object: obj, instanceIndex: i });
+            // Reserve every allocated matrix slot in the TLAS. Games can then
+            // grow/shrink `count` or recycle a slot without reallocating the
+            // soup; inactive records are masked in traversal until activated.
+            for (let i = 0; i < Math.max(0, capacity | 0); i++) {
+                instances.push({ blas: blasIdx, object: obj, instanceIndex: i });
+            }
         } else {
             instances.push({ blas: blasIdx, object: obj, instanceIndex: -1 });
         }
@@ -796,9 +815,10 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     const instanceObjectCounts = instanceObjects.map((object) => ({
         object,
         count: object.isInstancedMesh
-            ? Math.max(0, Math.min(object.count | 0, (object.instanceMatrix?.count ?? object.count) | 0))
+            ? Math.max(0, (object.instanceMatrix?.count ?? object.count) | 0)
             : 1,
     }));
+    const instanceCountByObject = new Map(instanceObjectCounts.map((entry) => [entry.object, entry.count]));
     if (instCount >= (1 << 24)) return { error: `too many instances for the TLAS leaf payload: ${instCount}` };
 
     // Pool assembly: place every BLAS at its base offsets, then serialize
@@ -873,11 +893,15 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         const aabbs = new Array(instCount);
         const invRows = new Float32Array(instCount * 12);
         const detSign = new Float32Array(instCount);
+        const active = new Uint8Array(instCount);
         const worldBounds = new THREE.Box3();
         worldBounds.makeEmpty();
         for (let i = 0; i < instCount; i++) {
             const ins = instances[i];
-            instanceWorldMatrix(ins, _m4);
+            const isActive = ins.instanceIndex < 0 || ins.instanceIndex < Math.max(0, ins.object.count | 0);
+            active[i] = isActive ? 1 : 0;
+            if (isActive) instanceWorldMatrix(ins, _m4);
+            else _m4.copy(ins.object.matrixWorld);
             _inv.copy(_m4).invert();
             const e = _inv.elements; // column-major → store ROWS (w = translation term)
             const o = i * 12;
@@ -885,16 +909,28 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
             invRows[o + 4] = e[1]; invRows[o + 5] = e[5]; invRows[o + 6] = e[9]; invRows[o + 7] = e[13];
             invRows[o + 8] = e[2]; invRows[o + 9] = e[6]; invRows[o + 10] = e[10]; invRows[o + 11] = e[14];
             detSign[i] = _m4.determinant() < 0 ? -1 : 1;
-            _box.copy(blasList[ins.blas].localBounds).applyMatrix4(_m4);
+            if (isActive) {
+                _box.copy(blasList[ins.blas].localBounds).applyMatrix4(_m4);
+                worldBounds.union(_box);
+            } else {
+                // A finite point keeps the threaded TLAS numerically valid;
+                // the instance active flag prevents its BLAS from being entered.
+                const eWorld = ins.object.matrixWorld.elements;
+                _box.min.set(eWorld[12], eWorld[13], eWorld[14]);
+                _box.max.copy(_box.min);
+            }
             aabbs[i] = {
                 min: [_box.min.x, _box.min.y, _box.min.z],
                 max: [_box.max.x, _box.max.y, _box.max.z],
                 c: [(_box.min.x + _box.max.x) * 0.5, (_box.min.y + _box.max.y) * 0.5, (_box.min.z + _box.max.z) * 0.5],
             };
-            worldBounds.union(_box);
+        }
+        if (worldBounds.isEmpty() && aabbs.length > 0) {
+            worldBounds.min.fromArray(aabbs[0].min);
+            worldBounds.max.fromArray(aabbs[0].max);
         }
         const { records, order } = buildTlasRecords(aabbs);
-        return { invRows, detSign, records, order, worldBounds };
+        return { aabbs, invRows, detSign, active, records, order, worldBounds };
     }
 
     // Extract PBR maps into array textures FIRST — this writes each material's
@@ -917,6 +953,15 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     const tlasNodes = materials.subarray(tlasBase, tlasBase + tlasNodeCount * TLAS_STRIDE_F32);
     const liveInstanceBounds = new Float32Array(instCount * 6);
     const tlasOrder = dyn0.order;
+    const slotsByObject = new Map();
+    const objectByUuid = new Map();
+    for (let slot = 0; slot < instCount; slot++) {
+        const object = instances[tlasOrder[slot]].object;
+        let slots = slotsByObject.get(object);
+        if (!slots) { slots = []; slotsByObject.set(object, slots); }
+        slots.push(slot);
+        if (typeof object.uuid === 'string') objectByUuid.set(object.uuid, object);
+    }
     for (let i = 0; i < uberList.length; i++) materials.set(uberList[i], i * MAT_STRIDE);
 
     function writeDynamic(dyn) {
@@ -929,7 +974,12 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
             materials[b + 12] = blas.blasRoot;   // exact ≤ 2^24 (guarded above)
             materials[b + 13] = blas.blasEnd;
             materials[b + 14] = dyn.detSign[src];
-            materials.fill(0, b + 15, b + MAT_STRIDE);
+            materials[b + 15] = dyn.active[src];
+            materials.fill(0, b + 16, b + MAT_STRIDE);
+            const aabb = dyn.aabbs[src];
+            const bb = slot * 6;
+            liveInstanceBounds[bb] = aabb.min[0]; liveInstanceBounds[bb + 1] = aabb.min[1]; liveInstanceBounds[bb + 2] = aabb.min[2];
+            liveInstanceBounds[bb + 3] = aabb.max[0]; liveInstanceBounds[bb + 4] = aabb.max[1]; liveInstanceBounds[bb + 5] = aabb.max[2];
         }
         for (let i = 0; i < dyn.records.length; i++) {
             const rec = dyn.records[i];
@@ -943,26 +993,94 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         }
     }
     writeDynamic(dyn0);
+    const tlasRefitIndex = createFlatTlasRefitIndex({
+        nodes: tlasNodes,
+        instanceBounds: liveInstanceBounds,
+        end: tlasNodeCount,
+    });
+    if (!tlasRefitIndex) return { error: 'invalid flattened TLAS topology' };
 
-    // Moving-object fast path: re-read live matrixWorlds, rewrite the stable
-    // instance slots, then refit the build-time TLAS partition bottom-up.
-    // No per-update arrays, median sort, node objects, or topology rewrite.
+    function currentInstanceCapacity(object) {
+        return object.isInstancedMesh
+            ? Math.max(0, (object.instanceMatrix?.count ?? object.count) | 0)
+            : 1;
+    }
+
+    function recordRanges(indices, base, stride) {
+        if (!indices.length) return [];
+        const sorted = Array.from(new Set(indices)).sort((a, b) => a - b);
+        const ranges = [];
+        let start = sorted[0], end = start;
+        for (let i = 1; i < sorted.length; i++) {
+            const value = sorted[i];
+            if (value === end + 1) { end = value; continue; }
+            ranges.push([base + start * stride, (end - start + 1) * stride]);
+            start = end = value;
+        }
+        ranges.push([base + start * stride, (end - start + 1) * stride]);
+        return ranges;
+    }
+
+    // Moving-object fast path. With no object list this preserves the legacy
+    // compatibility scan/refit. Event-driven hosts pass the dirty Object3D(s),
+    // rewriting only their stable instance slots and exact TLAS ancestors.
     // A wildly rearranged scene can make the frozen partition less efficient
     // to traverse, but its exact refit bounds stay correct. Returns null only
     // if the stored threaded layout is invalid (caller should full-rebuild).
-    function updateTransforms({ rewriteInstanceRows = true } = {}) {
-        for (const entry of instanceObjectCounts) {
-            const { object } = entry;
-            const count = object.isInstancedMesh
-                ? Math.max(0, Math.min(object.count | 0, (object.instanceMatrix?.count ?? object.count) | 0))
-                : 1;
-            if (count !== entry.count) return null;
+    function updateTransforms({ rewriteInstanceRows = true, objects = null } = {}) {
+        const dirtySlots = [];
+        const dirtyObjects = new Set();
+        const full = objects == null;
+        if (full) {
+            for (const entry of instanceObjectCounts) {
+                if (currentInstanceCapacity(entry.object) !== entry.count) return null;
+                dirtyObjects.add(entry.object);
+            }
+            for (let slot = 0; slot < instCount; slot++) dirtySlots.push(slot);
+        } else {
+            const targets = Array.isArray(objects) || objects instanceof Set ? objects : [objects];
+            for (const target of targets) {
+                const rawObject = target?.object || target;
+                const object = typeof rawObject === 'string' ? objectByUuid.get(rawObject) : rawObject;
+                const slots = slotsByObject.get(object);
+                // Hosts commonly report transforms for helpers, cameras, newly
+                // spawned objects awaiting a topology packet, or meshes excluded
+                // from GI. They are not evidence that the resident soup is bad.
+                if (!object || !slots) continue;
+                if (currentInstanceCapacity(object) !== (instanceCountByObject.get(object) ?? -1)) return null;
+                dirtyObjects.add(object);
+                const instanceIndex = Number.isInteger(target?.instanceIndex) ? target.instanceIndex : -1;
+                if (instanceIndex < 0) {
+                    dirtySlots.push(...slots);
+                } else {
+                    let found = false;
+                    for (const slot of slots) {
+                        if (instances[tlasOrder[slot]].instanceIndex !== instanceIndex) continue;
+                        dirtySlots.push(slot);
+                        found = true;
+                    }
+                    if (!found) continue;
+                }
+            }
         }
-        for (const object of instanceObjects) object.updateWorldMatrix?.(true, false);
-        for (let slot = 0; slot < instCount; slot++) {
+        if (dirtySlots.length > 1) {
+            dirtySlots.sort((a, b) => a - b);
+            let write = 1;
+            for (let read = 1; read < dirtySlots.length; read++) {
+                if (dirtySlots[read] !== dirtySlots[write - 1]) dirtySlots[write++] = dirtySlots[read];
+            }
+            dirtySlots.length = write;
+        }
+        if (dirtySlots.length === 0) return {
+            bounds: null, materialRanges: [], updatedInstances: 0, refittedTlasNodes: 0, full,
+        };
+        for (const object of dirtyObjects) object.updateWorldMatrix?.(true, false);
+        for (const slot of dirtySlots) {
             const src = tlasOrder[slot];
             const ins = instances[src];
-            instanceWorldMatrix(ins, _m4);
+            const isActive = ins.instanceIndex < 0 || ins.instanceIndex < Math.max(0, ins.object.count | 0);
+            if (isActive) instanceWorldMatrix(ins, _m4);
+            else _m4.copy(ins.object.matrixWorld);
             if (rewriteInstanceRows) {
                 const detSign = _m4.determinant() < 0 ? -1 : 1;
                 _inv.copy(_m4).invert();
@@ -972,8 +1090,15 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
                 materials[b + 4] = e[1]; materials[b + 5] = e[5]; materials[b + 6] = e[9]; materials[b + 7] = e[13];
                 materials[b + 8] = e[2]; materials[b + 9] = e[6]; materials[b + 10] = e[10]; materials[b + 11] = e[14];
                 materials[b + 14] = detSign;
+                materials[b + 15] = isActive ? 1 : 0;
             }
-            _box.copy(blasList[ins.blas].localBounds).applyMatrix4(_m4);
+            if (isActive) {
+                _box.copy(blasList[ins.blas].localBounds).applyMatrix4(_m4);
+            } else {
+                const eWorld = ins.object.matrixWorld.elements;
+                _box.min.set(eWorld[12], eWorld[13], eWorld[14]);
+                _box.max.copy(_box.min);
+            }
             const bb = slot * 6;
             liveInstanceBounds[bb] = _box.min.x;
             liveInstanceBounds[bb + 1] = _box.min.y;
@@ -982,11 +1107,32 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
             liveInstanceBounds[bb + 4] = _box.max.y;
             liveInstanceBounds[bb + 5] = _box.max.z;
         }
-        if (!refitFlatTlasRange({ nodes: tlasNodes, instanceBounds: liveInstanceBounds, end: tlasNodeCount })) return null;
+        let touchedNodes;
+        if (full) {
+            if (!refitFlatTlasRange({ nodes: tlasNodes, instanceBounds: liveInstanceBounds, end: tlasNodeCount })) return null;
+            touchedNodes = Array.from({ length: tlasNodeCount }, (_, i) => i);
+        } else {
+            touchedNodes = refitFlatTlasDirty({
+                nodes: tlasNodes,
+                instanceBounds: liveInstanceBounds,
+                dirtySlots,
+                index: tlasRefitIndex,
+            });
+            if (!touchedNodes) return null;
+        }
         const bounds = new THREE.Box3();
         bounds.min.set(tlasNodes[0], tlasNodes[1], tlasNodes[2]);
         bounds.max.set(tlasNodes[3], tlasNodes[4], tlasNodes[5]);
-        return { bounds };
+        const materialRanges = [];
+        if (rewriteInstanceRows) materialRanges.push(...recordRanges(dirtySlots, instBase, MAT_STRIDE));
+        materialRanges.push(...recordRanges(touchedNodes, tlasBase, TLAS_STRIDE_F32));
+        return {
+            bounds,
+            materialRanges,
+            updatedInstances: dirtySlots.length,
+            refittedTlasNodes: touchedNodes.length,
+            full,
+        };
     }
 
     let asyncDeformRequestSerial = 0;

@@ -973,6 +973,7 @@ export function createProbeField({
     let cascades = 2;
     let solveTurn = 0;        // round-robin cascade index across ticks (C0 even, C1 odd)
     let buildStage = 0;       // staggered build phase machine (0 = build C0, 1 = build C1, 2 = done)
+    let fieldEverReady = false; // first bring-up completed once — REbuilds are rest-gated, bring-up is not
     let buildCascadeCount = 1; // effective cascade count for the CURRENT build (fitFineBox may drop to 1)
 
     // Per-cascade state (index 0 = C0 coarse full-bounds, 1 = C1 fine sub-box). The BVH
@@ -1101,6 +1102,11 @@ export function createProbeField({
     let lastXformSig = null;
     let lastDeformSig = null;
     let lastRefitCount = 0;   // BLASes refit by the most recent deform refresh (debug/stats)
+    let lastTransformInstanceCount = 0;
+    let lastTlasRefitCount = 0;
+    const pendingTransformTargets = new Set();
+    let pendingAllTransforms = false;
+    let pendingDeformRefresh = false;
     let geoStable = -1;       // -1 = no pending geo change; >=0 = stable-check count since a change (debounce, A1)
     let checkCounter = 0;
     let lastIdleMs = Infinity;
@@ -2887,6 +2893,7 @@ export function createProbeField({
             node.setCascadeCount(1);
             disposeCascadeGPU(1);
             buildStage = 2;
+            fieldEverReady = true;
         } else if (c1SameDim) {
             // C1 stays live at its current dims → keep it bound (no recompile), rebuild its
             // BVH-bound kernels next idle tick without dropping the blend.
@@ -2908,11 +2915,12 @@ export function createProbeField({
     // the fragment starts blending the fine cascade. Runs behind the SAME idle gate as C0.
     async function advanceBuildStageC1() {
         const built = cachedBuilt;
-        if (!built) { buildStage = 2; return; }
+        if (!built) { buildStage = 2; fieldEverReady = true; return; }
         const genBefore = node._structGen;
         const recompiled = buildOneCascade(built, 1);
         node.setCascadeCount(2);  // C1 online → fragment blends fine cascade
         buildStage = 2;
+        fieldEverReady = true;
         // C1's setGrid/setAtlases + setCascadeCount bump _structGen only on the full path;
         // a same-dim C1 reuse changes nothing → no recompile needed (churn-free).
         if ((recompiled || node._structGen !== genBefore) && typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
@@ -2965,7 +2973,13 @@ export function createProbeField({
             // A CPU soup/kernel build is not evidence that the previous GPU
             // solve was too expensive. Keep it out of the cadence interval.
             resetFramePacing();
-            if (!restOnly) return;   // never (re)build the soup/kernels mid-motion (hitch source)
+            // REbuilds never run mid-motion (hitch source) — but the FIRST
+            // bring-up must: a host that is playing from frame 0 (game loop,
+            // continuous deform) otherwise never gets a rest window, and the
+            // field stays dirty forever. There is no converged GI to disturb
+            // yet, so the one-time build hitch on a boot frame is the cheaper
+            // failure mode by construction.
+            if (!restOnly && fieldEverReady) return;
             if (rebuildBackoff > 0) return;
             inFlight = true; let ok = false;
             try { ok = await rebuild(); } finally { inFlight = false; }
@@ -2979,7 +2993,7 @@ export function createProbeField({
         // single frame does 2× the build. C1 comes online one idle tick after C0. Held for rest.
         if (buildStage < 2) {
             resetFramePacing();
-            if (!restOnly) return;
+            if (!restOnly && fieldEverReady) return;   // same first-bring-up exception as stage 0
             inFlight = true;
             try { await advanceBuildStageC1(); } finally { inFlight = false; }
             return;
@@ -3053,6 +3067,25 @@ export function createProbeField({
             inFlight = true;
             try { await flushGiLightGrid(); } finally { inFlight = false; }
             if (disposed || dirty || giLightGridDirty) return;
+        }
+        // Explicit host changes bypass the scene-wide/rest-only signature
+        // scans. One moving object rewrites only its stable instance rows and
+        // exact TLAS ancestors while the game or DCC viewport is still moving.
+        if (pendingAllTransforms || pendingTransformTargets.size > 0) {
+            const targets = pendingAllTransforms ? null : Array.from(pendingTransformTargets);
+            pendingAllTransforms = false;
+            pendingTransformTargets.clear();
+            if (!refreshTransforms(targets)) return;
+            // The next rest-only signature pass establishes a fresh baseline;
+            // it must not replay this already-committed packet as a full refit.
+            lastXformSig = null;
+        }
+        if (pendingDeformRefresh) {
+            pendingDeformRefresh = false;
+            inFlight = true;
+            try { await refreshDeforms(); } finally { inFlight = false; }
+            if (disposed || dirty) return;
+            lastDeformSig = null;
         }
         if (restOnly) {
             if (checkCounter % XFORM_CHECK_INTERVAL === 0) {
@@ -3227,6 +3260,60 @@ export function createProbeField({
             buildGeneration++;
         }
     }
+
+    // Event-driven scene updates for games, realtime DCC bridges, and other
+    // hosts that already know what changed. Legacy signatures remain as a
+    // compatibility fallback; explicit transform/deform notifications are
+    // consumed during continuous motion instead of waiting for an idle scan.
+    function markTransformsDirty(targets = null) {
+        if (targets == null) {
+            pendingAllTransforms = true;
+            pendingTransformTargets.clear();
+            return;
+        }
+        if (pendingAllTransforms) return;
+        const list = Array.isArray(targets) || targets instanceof Set ? targets : [targets];
+        for (const target of list) if (target != null) pendingTransformTargets.add(target);
+    }
+    function markDeformsDirty() {
+        pendingDeformRefresh = true;
+    }
+    function markTopologyDirty() {
+        requestRebuild(true);
+    }
+    function notifySceneChange(change) {
+        if (Array.isArray(change)) {
+            for (const entry of change) notifySceneChange(entry);
+            return true;
+        }
+        const type = typeof change === 'string' ? change : change?.type;
+        switch (String(type || '').toLowerCase()) {
+            case 'transform':
+            case 'xform':
+                markTransformsDirty(change?.objects ?? change?.object ?? change?.target ?? null);
+                return true;
+            case 'deform':
+            case 'vertices':
+                markDeformsDirty();
+                return true;
+            case 'light':
+            case 'lighting':
+                forceLightingRefresh();
+                return true;
+            case 'add':
+            case 'added':
+            case 'remove':
+            case 'removed':
+            case 'topology':
+            case 'geometry':
+            case 'material':
+            case 'structure':
+                markTopologyDirty();
+                return true;
+            default:
+                return false;
+        }
+    }
     // Set explicit probe volume(s) — e.g. synced "SPEEDBALL GI Probe Grid" helpers. Each
     // entry is a world-space THREE.Box3 (auto resolution) OR { box, res } where res is
     // a Vector3/[x,y,z] of MANUAL per-axis divisions. Pass null/empty to revert to
@@ -3337,7 +3424,11 @@ export function createProbeField({
             const idx = o.geometry.index;
             meshes++;
             prims += idx ? idx.count : p.count;
-            const instanceCount = o.isInstancedMesh ? Math.max(0, o.count | 0) : 1;
+            // InstancedMesh allocation capacity is structural; its live count
+            // is transform-state and rides the reserved-slot TLAS fast path.
+            const instanceCapacity = o.isInstancedMesh
+                ? Math.max(0, (o.instanceMatrix?.count ?? o.count) | 0)
+                : 1;
             hash = ((hash * 31) + structureId(o)) | 0;
             hash = ((hash * 31) + structureId(o.geometry)) | 0;
             // Replacing a same-sized position attribute is still a DEFORM.
@@ -3345,7 +3436,7 @@ export function createProbeField({
             // structure lane only needs the vertex count here.
             hash = ((hash * 31) + p.count) | 0;
             hash = ((hash * 31) + structureId(idx) + (idx ? ((idx.version | 0) + idx.count) : 0)) | 0;
-            hash = ((hash * 31) + instanceCount) | 0;
+            hash = ((hash * 31) + instanceCapacity) | 0;
             const groups = o.geometry.groups || [];
             hash = ((hash * 31) + groups.length) | 0;
             for (const group of groups) {
@@ -3396,7 +3487,10 @@ export function createProbeField({
                 h = ((h * 33) + Math.round(e[13] / q)) | 0;
                 h = ((h * 33) + Math.round(e[14] / q)) | 0;
             }
-            if (o.isInstancedMesh && o.instanceMatrix) h = ((h * 33) + (o.instanceMatrix.version | 0)) | 0;
+            if (o.isInstancedMesh && o.instanceMatrix) {
+                h = ((h * 33) + (o.instanceMatrix.version | 0)) | 0;
+                h = ((h * 33) + Math.max(0, o.count | 0)) | 0;
+            }
         });
         return h;
     }
@@ -3405,18 +3499,20 @@ export function createProbeField({
     // small materials buffer. No soup rewrite, no MeshBVH rebuild, no shader
     // recompile — probes re-trace the moved geometry on the next solve pass.
     // A null result means the instance set changed under us → full rebuild.
-    function refreshTransforms() {
+    function refreshTransforms(objects = null) {
         const built = cachedBuilt;
-        if (!built?.updateTransforms || !casc[0].gpu) return;
-        if (sceneResource?.built !== built) { requestRebuild(); return; }
+        if (!built?.updateTransforms || !casc[0].gpu) return false;
+        if (sceneResource?.built !== built) { requestRebuild(); return false; }
         let res = null;
-        try { res = built.updateTransforms(); } catch { res = null; }
-        if (!res) { requestRebuild(); return; }
+        try { res = built.updateTransforms(objects == null ? undefined : { objects }); } catch { res = null; }
+        if (!res) { requestRebuild(); return false; }
         if (res.bounds && built.bounds?.copy) built.bounds.copy(res.bounds);
-        const matStart = built.instBase | 0;
-        const matCount = Math.max(0, (built.tlasBase | 0)
-            + ((built.tlasNodeCount | 0) * (built.strides?.TLAS_STRIDE_F32 || 12)) - matStart);
-        markStorageDirty(sceneResource.buffers.materials, matCount > 0 ? [[matStart, matCount]] : null);
+        lastTransformInstanceCount = res.updatedInstances | 0;
+        lastTlasRefitCount = res.refittedTlasNodes | 0;
+        if (Array.isArray(res.materialRanges) && res.materialRanges.length > 0) {
+            markStorageDirty(sceneResource.buffers.materials, res.materialRanges);
+        }
+        return true;
     }
     // Deforming-object fast path: re-gather the deformed BLAS vertex slices +
     // refit their node bounds in place (spectral_scene updateDeforms — no
@@ -3722,6 +3818,9 @@ export function createProbeField({
         sceneResource = null;
         liveLightRecords = null;
         cachedBuilt = null;
+        pendingTransformTargets.clear();
+        pendingAllTransforms = false;
+        pendingDeformRefresh = false;
         buildDirty = true;
         node.setEnabled(false);
     }
@@ -3860,6 +3959,10 @@ export function createProbeField({
         setContinuous: (on) => { continuous = on === true; },
         getContinuous: () => continuous,
         requestRebuild,
+        markTransformsDirty,
+        markDeformsDirty,
+        markTopologyDirty,
+        notifySceneChange,
         setBounds,
         setVolumes,
         isSupported,
@@ -3922,6 +4025,10 @@ export function createProbeField({
             checkCounter,
             geoStable,
             lastRefitCount,
+            lastTransformInstanceCount,
+            lastTlasRefitCount,
+            pendingTransformCount: pendingAllTransforms ? -1 : pendingTransformTargets.size,
+            pendingDeformRefresh,
             solveList: lastSolveList,
             updatedCount: lastUpdatedCount,
             cascades: cascades,

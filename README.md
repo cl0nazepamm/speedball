@@ -58,6 +58,39 @@ has already run, three has cached a non-GI lights node and GI will fail.
   all-metal import reads as black GI. Opt-in; mutates materials in place. You can
   also pass `prepareMaterials: true` to `installSpeedballGI`.
 
+## Dynamic scenes and realtime editors
+
+Hosts that already know what changed should notify Speedball instead of making
+it rediscover edits by scanning the entire scene:
+
+```js
+// One ordinary Object3D moved:
+gi.markTransformsDirty(mesh);
+
+// One slot in an InstancedMesh pool moved or changed active state:
+gi.markTransformsDirty({ object: crowd, instanceIndex: 37 });
+
+// Equivalent event-oriented surface for engines and DCC bridges:
+gi.notifySceneChange({ type: 'transform', object: mesh });
+gi.notifySceneChange({ type: 'deform', object: streamedMesh });
+gi.notifySceneChange({ type: 'topology' }); // add/remove/new geometry
+```
+
+Transform packets are coalesced and consumed during continuous motion. A dirty
+object rewrites only its stable instance record(s) and the unique TLAS ancestor
+chain; unrelated objects and TLAS subtrees are not scanned, refitted, or
+uploaded. Transform events for cameras, helpers, excluded meshes, or other
+untraced objects are intentionally cheap no-ops.
+
+`InstancedMesh` allocation capacity is reserved in the TLAS at build time.
+Changing `mesh.count` within that capacity, recycling an existing matrix slot,
+or revealing a previously inactive slot needs only `markTransformsDirty()`—not
+a geometry rebuild. Growing beyond `instanceMatrix.count`, adding ordinary
+unique geometry, removing geometry, changing connectivity, or changing material
+assignment remains structural and must call `markTopologyDirty()` (or
+`notifySceneChange({ type: 'topology' })`). The automatic scene signatures remain
+enabled as a compatibility fallback for integrations that send no events.
+
 ## Local DDGI reflections
 
 Choose a structural **`reflectionQuality`** at creation time. Every tier builds
@@ -180,8 +213,7 @@ All of these work from a plain CDN import map too (e.g. jsDelivr:
 `https://cdn.jsdelivr.net/npm/speedball-gi@0.5.0/js/index.js`)
 
 Light records are stride 17 floats (slot [16] = emitter class) and material
-records stride 28 (slot [25] = NIR albedo); these extra fields are inert for
-GI and exist for the night-vision render mode of downstream consumers.
+records stride 28 (slot [25] = NIR albedo, slot [26] = traversal flags).
 
 ## Changelog
 

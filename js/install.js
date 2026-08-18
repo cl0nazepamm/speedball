@@ -115,8 +115,11 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  *                  Default false = the primary path, byte-identical to previous releases.
  * @param {boolean} [opts.installLightsNode=true]  set false if you install your own GI-aware lights node
  * @param {boolean} [opts.prepareMaterials=false]  run prepareMaterialsForGI(scene) on install
- * @returns {object} the probe field (all setters) augmented with update(), markInteraction(),
- *                   markMaterialsDirty(), and a dispose() that also restores the lights factory.
+ * @returns {object} the probe field (including markTransformsDirty(),
+ *                   markDeformsDirty(), markTopologyDirty(), and
+ *                   notifySceneChange()) augmented with update(),
+ *                   markInteraction(), markMaterialsDirty(), and a dispose()
+ *                   that also restores the lights factory.
  */
 export function installSpeedballGI({
     renderer,

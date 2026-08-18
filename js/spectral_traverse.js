@@ -142,7 +142,7 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
     // (stride 28 = MAT_STRIDE): [0..11] inverse world 3×4 (rows, w =
     // translation), [12] blasRoot, [13] blasEnd (node indices, exact ≤2^24),
     // [14] winding sign (±1, mirrored instances flip Möller–Trumbore's det),
-    // [15..27] reserved.
+    // [15] active flag (reserved InstancedMesh capacity), [16..27] reserved.
     const INST_STRIDE = uint(28);
     const instF = (inst, k) => materials.element(U.instBase.add(inst.mul(INST_STRIDE)).add(uint(k)));
     const instRow = (inst, r) => vec3(instF(inst, r * 4), instF(inst, r * 4 + 1), instF(inst, r * 4 + 2));
@@ -218,6 +218,8 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
         return alpha.greaterThan(float(1.0e-4))
             .and(alphaTest.lessThanEqual(float(0)).or(alpha.greaterThanEqual(alphaTest)));
     };
+    const materialTraversalFlags = (matId) => uint(matFloat(matId, 26));
+    const flagSet = (flags, bit) => flags.bitAnd(uint(bit)).notEqual(uint(0));
 
     const hitUV = (triId, u, vbar) => {
         const w = float(1).sub(u).sub(vbar);
@@ -406,12 +408,18 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
                                     const tHit = dot(e2, qv).mul(invDet);
                                     If(tHit.greaterThan(float(RAY_EPS)).and(tHit.lessThan(bestTVar)), () => {
                                         const matId = triMaterial.element(triId);
-                                        const acceptsSide = materialSideAccepts(matId, det.mul(dSign));
-                                        const acceptsAlpha = materialAlphaAccepts(matId, hitUV(triId, u, vbar));
-                                        If(acceptsSide.and(acceptsAlpha), () => {
+                                        const flags = materialTraversalFlags(matId);
+                                        const commitHit = () => {
                                             bestTVar.assign(tHit);
                                             bestTriVar.assign(int(triId));
                                             bestInstVar.assign(int(inst));
+                                        };
+                                        If(materialSideAccepts(matId, det.mul(dSign)), () => {
+                                            If(flagSet(flags, 1), () => {
+                                                If(materialAlphaAccepts(matId, hitUV(triId, u, vbar)), commitHit);
+                                            }).Else(() => {
+                                                If(flagSet(flags, 2), commitHit);
+                                            });
                                         });
                                     });
                                 });
@@ -452,7 +460,10 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
                 }).Else(() => {
                     const instOffset = uint(tlasF(cursor, 7));
                     Loop({ start: uint(0), end: uint(instCountF), type: 'uint', condition: '<' }, ({ i }) => {
-                        blasClosest(instOffset.add(i), ro, rd, bestTVar, bestTriVar, bestInst);
+                        const inst = instOffset.add(i);
+                        If(instF(inst, 15).greaterThan(float(0.5)), () => {
+                            blasClosest(inst, ro, rd, bestTVar, bestTriVar, bestInst);
+                        });
                     });
                     cursor.assign(miss);
                 });
@@ -505,10 +516,14 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
                                     const tHit = dot(e2, qv).mul(invDet);
                                     If(tHit.greaterThan(float(RAY_EPS)).and(tHit.lessThan(maxDist)), () => {
                                         const matId = triMaterial.element(triId);
-                                        const acceptsSide = materialSideAccepts(matId, det.mul(dSign));
-                                        const acceptsAlpha = materialAlphaAccepts(matId, hitUV(triId, u, vb));
-                                        const occTrans = matFloat(matId, 5);
-                                        If(acceptsSide.and(acceptsAlpha).and(occTrans.lessThan(float(0.5))), () => { blockedVar.assign(float(1)); });
+                                        const flags = materialTraversalFlags(matId);
+                                        If(materialSideAccepts(matId, det.mul(dSign)).and(flagSet(flags, 4)), () => {
+                                            If(flagSet(flags, 1), () => {
+                                                If(materialAlphaAccepts(matId, hitUV(triId, u, vb)), () => { blockedVar.assign(float(1)); });
+                                            }).Else(() => {
+                                                If(flagSet(flags, 2), () => { blockedVar.assign(float(1)); });
+                                            });
+                                        });
                                     });
                                 });
                             });
@@ -541,7 +556,10 @@ export function buildTraversal({ storages, U, env = null, lut = null, lutRes = 0
                 }).Else(() => {
                     const instOffset = uint(tlasF(cursor, 7));
                     Loop({ start: uint(0), end: uint(instCountF), type: 'uint', condition: '<' }, ({ i }) => {
-                        blasAny(instOffset.add(i), ro, rd, maxDist, blocked);
+                        const inst = instOffset.add(i);
+                        If(instF(inst, 15).greaterThan(float(0.5)), () => {
+                            blasAny(inst, ro, rd, maxDist, blocked);
+                        });
                     });
                     cursor.assign(miss);
                 });

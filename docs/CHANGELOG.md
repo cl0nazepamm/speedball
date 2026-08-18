@@ -5,6 +5,20 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Added an event-driven dynamic-scene lane for games and realtime DCC viewers.
+  `markTransformsDirty(object | { object, instanceIndex })` coalesces host
+  transform packets and rewrites only the affected stable instance records plus
+  their unique TLAS ancestor chains during continuous motion. Unknown/untraced
+  transform targets are cheap no-ops; the rest-only full-scene signatures remain
+  as compatibility fallback. `InstancedMesh` allocation capacity is now resident
+  in the TLAS, so active-count changes and slot recycling within that capacity do
+  not rebuild the BVH. Added `markDeformsDirty()`, `markTopologyDirty()`, and the
+  generic `notifySceneChange()` event surface.
+- Packed material traversal flags in slot 26 and added an exact opaque fast path.
+  Closest-hit and shadow traversal now skip candidate-hit UV interpolation and
+  alpha texture sampling for constant opaque materials; non-shadow-blocking
+  transmission candidates also exit before alpha work.
+
 - Added structural local-reflection quality tiers: `off`, `rough`, `high`, and
   `ultra`. The Sponza demo now uses `high`, which resolves an 8x8 glossy cache
   on interleaved two-phase texels and blends eight glossy receiver probes; legacy
@@ -21,9 +35,9 @@ All notable changes to Speedball GI are documented here. This project follows
   `refreshLights()` moved out of the rest-only gate in `tick()`. Lights are
   refresh-class (in-place buffer refill — no BVH, no compile, bounded
   lights-only traverse with deadbands), so light edits and animated lights
-  update the field live during interaction and playback. The xform, deform,
-  and structure lanes stay rest-only; the idle-gate contract for heavy work
-  is unchanged.
+  update the field live during interaction and playback. Explicit host transform
+  and deform packets now have their own continuous lane; fallback xform/deform
+  scans and structural rebuilds remain rest-only.
 - IR illuminator gain: a scalar trim on emitter-class-4 lights in the sensed
   band, on top of the existing on/off gate, uniform-driven (no recompiles).
   Three consumers, one knob per host: `setNirIlluminatorGain` (direct raster
