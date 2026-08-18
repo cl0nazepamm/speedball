@@ -157,8 +157,9 @@ const DEFORM_CHECK_INTERVAL = 12;  // ticks between DEFORM checks (same-topology
 // during motion is visually lossless; it resumes and converges once the view rests.
 const GI_IDLE_MS = 200;            // ms of camera/sync quiet before GI work resumes
 const REBUILD_BACKOFF_TICKS = 45;  // ticks to wait after a failed/empty rebuild before retrying
-const TICK_OVERLOAD_MS = 100;      // accepted solve cadence above this is a real overload sample
-const TICK_PAUSE_MS = 1000;        // longer gaps are tab/debugger/host pauses, not solve pressure
+const TICK_OVERLOAD_MS = 100;      // outside the normal EMA window; require repeated misses
+const TICK_PAUSE_MS = 1000;        // tab/debugger/host gaps are pauses, not solve pressure
+const TICK_OVERLOAD_STRIKES = 2;   // ignore one unrelated stall; back off if it repeats
 const PROBE_COMPUTE_KEYS = [
     'traceKernel', 'blendKernel', 'glossyKernel', 'uploadKernel', 'lightGridKernel',
     'clearAtlasKernel', 'clearGlossyAtlasKernel', 'classifyKernel', 'uploadStateKernel',
@@ -1074,6 +1075,7 @@ export function createProbeField({
     // Otherwise every budget adjustment injects a one-frame 60 Hz history jump.
     let hysteresisTickDtEma = 0;
     let budgetCooldown = 0;   // ticks to hold after a shrink before growing again (damps sawtooth)
+    let cadenceOverloadStreak = 0;
     let inFlight = false;
     let disposed = false;
 
@@ -1083,6 +1085,7 @@ export function createProbeField({
     function resetFramePacing() {
         lastTickAt = 0;
         tickDtEma = 0;
+        cadenceOverloadStreak = 0;
     }
     let frameCounter = 0;
     let quantStep = 1;        // translation deadband (~quarter cell) for the geo signature (A1)
@@ -2991,6 +2994,7 @@ export function createProbeField({
         if (lastTickAt > 0) {
             const dt = tNow - lastTickAt;
             if (dt > 0 && dt < TICK_OVERLOAD_MS) {
+                cadenceOverloadStreak = 0;
                 hysteresisTickDtEma = hysteresisTickDtEma > 0 ? hysteresisTickDtEma * 0.8 + dt * 0.2 : dt;
                 tickDtEma = tickDtEma > 0 ? tickDtEma * 0.8 + dt * 0.2 : dt;
                 if (budgetCooldown > 0) budgetCooldown--;
@@ -3004,17 +3008,23 @@ export function createProbeField({
                     tickBudgetRays = Math.min(RAYS_PER_TICK, tickBudgetRays + 1024);
                 }
             } else if (dt >= TICK_OVERLOAD_MS && dt < TICK_PAUSE_MS) {
-                // This is still an ACCEPTED solve-to-solve interval. Treat it as
-                // overload, not as an idle gap: the measured ~170 ms GI stall used
-                // to land in the reset branch and therefore stayed pinned at the
-                // 98k-ray maximum forever. Real presentation-size gaps call
-                // resetFramePacing(), while motion release resets lastTickAt above.
-                tickBudgetRays = probeBudgetAfterCadenceMiss(tickBudgetRays);
+                // computeAsync submits without waiting for GPU completion, so this is
+                // presentation cadence rather than a direct solve timer. One long gap
+                // may be unrelated; repeated accepted gaps still mean the browser is
+                // not making progress and must make the bounded GI workload back off.
                 tickDtEma = 0;
-                budgetCooldown = 120;
+                cadenceOverloadStreak = Math.min(
+                    TICK_OVERLOAD_STRIKES,
+                    cadenceOverloadStreak + 1,
+                );
+                if (cadenceOverloadStreak >= TICK_OVERLOAD_STRIKES && tickBudgetRays > RAYS_PER_TICK_MIN) {
+                    tickBudgetRays = probeBudgetAfterCadenceMiss(tickBudgetRays);
+                    budgetCooldown = 120;
+                }
             } else {
                 tickDtEma = 0;
                 hysteresisTickDtEma = 0;
+                cadenceOverloadStreak = 0;
             }
         }
         lastTickAt = tNow;
@@ -3131,21 +3141,13 @@ export function createProbeField({
                 );
                 C.U.probeOffset.value = C.probeCursor >>> 0;
                 C.U.updatedCount.value = updated >>> 0;
-                // (B1) Ray-set rotation shares ONE frameJitter, advanced ONLY from C0's
-                // accumulated probe coverage. Both cascades read the same U.frameJitter, so rayDir(k,jitter)
+                // (B1) Ray-set rotation shares ONE frameJitter, advanced ONLY on C0's pass
+                // boundary. Both cascades read the same U.frameJitter, so rayDir(k,jitter)
                 // stays byte-identical between trace and blend for whichever cascade runs
-                // this tick (rotation happens BEFORE any dispatch). When the WHOLE union
-                // solves every tick, rotate EVERY tick: re-blending the same deterministic
-                // ray set for ROT_MIN_TICKS pulls each texel ~26% toward that one estimate
-                // and then steps to the next — a visible ~10 Hz pulse, worst on the fine
-                // cascade (near-wall probes swing hard between ray sets). A fresh set per
-                // tick is a proper 5%-per-update Monte-Carlo accumulation instead. Partial
-                // batches rotate once their accumulated work covers the field and the minimum
-                // spacing has elapsed. This must not depend on the cursor landing on exactly
-                // zero: many batch sizes never do so until hundreds of updates later.
+                // this tick (rotation happens BEFORE any dispatch). Multi-tick (round-robin)
+                // passes keep the ROT_MIN_TICKS spacing.
                 C.ticksSinceRot++;
-                const coverageComplete = C.probeCoverageSinceRot >= C.probeTotal;
-                if (ci === 0 && (fullPassPerTick || (coverageComplete && C.ticksSinceRot >= ROT_MIN_TICKS))) {
+                if (ci === 0 && C.probeCursor === 0 && (fullPassPerTick || C.ticksSinceRot >= ROT_MIN_TICKS)) {
                     if (C.refreshStarted && !debugFreezeRayJitter) {
                         frameCounter = (frameCounter + 1) >>> 0;
                         U.frameJitter.value = debugFrameJitterOverride ?? ((frameCounter * 0.61803398875) % 1);
@@ -3916,6 +3918,7 @@ export function createProbeField({
                 && casc[0].gpu.buffers.lights === casc[1].gpu.buffers.lights,
             hysteresisTickDtEma,
             budgetCooldown,
+            cadenceOverloadStreak,
             checkCounter,
             geoStable,
             lastRefitCount,
