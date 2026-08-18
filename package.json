@@ -19,7 +19,7 @@
   },
   "scripts": {
     "start": "python3 -m http.server 8777 --bind 127.0.0.1",
-    "test": "node scripts/webgpu-cleanup-smoke.mjs && node scripts/caustics-smoke.mjs && node scripts/rough-reflections-smoke.mjs && node scripts/gi-hysteresis-normalization-smoke.mjs && node scripts/gi-oct-seam-smoke.mjs && node scripts/gi-deform-refit-smoke.mjs && node scripts/gi-async-deform-refit-smoke.mjs && node scripts/gi-post-scrub-budget-smoke.mjs"
+    "test": "node scripts/webgpu-cleanup-smoke.mjs && node scripts/caustics-smoke.mjs && node scripts/rough-reflections-smoke.mjs && node scripts/gi-hysteresis-normalization-smoke.mjs && node scripts/gi-oct-seam-smoke.mjs && node scripts/gi-deform-refit-smoke.mjs && node scripts/gi-async-deform-refit-smoke.mjs && node scripts/gi-post-scrub-budget-smoke.mjs && node scripts/gi-dynamic-tlas-smoke.mjs"
   },
   "repository": {
     "type": "git",
@@ -69,6 +69,6 @@
   ],
   "peerDependencies": {
     "three": ">=0.185.0",
-    "three-mesh-bvh": ">=0.9.4 <0.10.0"
+    "three-mesh-bvh": ">=0.9.11 <0.10.0"
   }
 }

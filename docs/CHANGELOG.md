@@ -5,6 +5,14 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- three-mesh-bvh housekeeping: demo CDN pins moved to 0.9.14, the build option
+  renamed to `targetLeafSize` (kills the per-BLAS deprecation warning during
+  churn), and the peer floor raised to `>=0.9.11` — older 0.9.x silently
+  ignored the leaf-size option under its previous names. Local BLAS bounds now
+  come from the MeshBVH build itself instead of a separate `computeBoundingBox`
+  pass: one less O(V) scan per BLAS per rebuild, and the bounds no longer
+  wrongly include the origin when invisible triangles leave zero-filled
+  duplicate vertex slots.
 - Added an event-driven dynamic-scene lane for games and realtime DCC viewers.
   `markTransformsDirty(object | { object, instanceIndex })` coalesces host
   transform packets and rewrites only the affected stable instance records plus

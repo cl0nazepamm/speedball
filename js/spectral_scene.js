@@ -668,9 +668,12 @@ function buildLocalBlas(THREE, d) {
     geometry.setAttribute('position', new THREE.BufferAttribute(vertexPos, VERT_STRIDE));
     geometry.setIndex(new THREE.BufferAttribute(triIndex, 1));
     geometry.clearGroups();
-    geometry.computeBoundingBox();
+    const bvh = new MeshBVH(geometry, { targetLeafSize: 8, indirect: false });
+    // MeshBVH writes geometry.boundingBox during the build (setBoundingBox
+    // default) from the indexed triangles only — unlike computeBoundingBox,
+    // which also scanned the zero-filled slots of skipped triangles and could
+    // wrongly pull the bounds toward the origin.
     const localBounds = geometry.boundingBox ? geometry.boundingBox.clone() : new THREE.Box3();
-    const bvh = new MeshBVH(geometry, { maxLeafSize: 8, indirect: false });
     const roots = bvh._roots;
     geometry.dispose?.();
     if (!Array.isArray(roots) || roots.length === 0) return null;
