@@ -157,10 +157,8 @@ scene.add(new THREE.HemisphereLight(0xffc09a, 0x2a1c38, 0.05));
 // five boxes.
 const mat = (color, rough = 0.9, metal = 0) =>
   new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal });
-// Emissive dressing is REAL light to the trace, not a shader-only glow: the packer
-// writes material.emissive × emissiveIntensity into the traced material record
-// (spectral_scene.js emissiveScaled), so these strips bounce onto the walls. They
-// are STATIC — only the EMISSIVE churn lane below moves an emitter.
+// Emissive dressing carries real linear energy. The promoted strips below route
+// direct light through sphere-proxy NEE; unpromoted emissives stay on ray discovery.
 const glow = (color, intensity) => new THREE.MeshStandardMaterial({
   color: 0x0d0906, roughness: 0.6, metalness: 0,
   emissive: new THREE.Color(color), emissiveIntensity: intensity,
@@ -254,6 +252,7 @@ box(26, 0.4, 26, M.ground, 0, -0.2, 0);
 // Bounce walls. The colored PANEL is the same slab as before (same color, same
 // inner face), so the Cornell reading is unchanged; the dado, cornice, capstone and
 // pilasters only give the light something to model. sx = -1 left (red), +1 right.
+const staticEmissiveStrips = [];
 function bounceWall(sx, panel) {
   const x = 12 * sx;
   box(0.9, 1.0, 24, M.dado, x - 0.25 * sx, 0.5, 0);          // rough plinth course
@@ -261,7 +260,7 @@ function bounceWall(sx, panel) {
   box(1.0, 0.45, 24, M.trim, x - 0.3 * sx, 7.42, 0);         // cornice
   box(1.2, 0.28, 24, M.trim, x - 0.4 * sx, 7.79, 0);         // capstone
   for (let i = -2; i <= 2; i++) box(0.5, 6.0, 0.8, panel, x - 0.45 * sx, 4.0, i * 4.6);
-  box(0.16, 0.1, 22.6, M.cove, x - 0.78 * sx, 1.06, 0);      // warm cove strip on the dado
+  staticEmissiveStrips.push(box(0.16, 0.1, 22.6, M.cove, x - 0.78 * sx, 1.06, 0)); // warm cove strip
 }
 bounceWall(-1, M.red);
 bounceWall(1, M.green);
@@ -279,7 +278,7 @@ for (const xc of [-6, 0, 6]) {
 }
 box(24, 1.0, 0.85, M.dado, 0, 0.5, -11.65);
 box(24.6, 0.45, 0.9, M.trim, 0, 7.92, -11.75);
-box(22.6, 0.1, 0.16, M.cove, 0, 1.06, -11.14);
+staticEmissiveStrips.push(box(22.6, 0.1, 0.16, M.cove, 0, 1.06, -11.14));
 
 // Entrance piers frame the open +Z mouth (where the sun comes in) and carry two
 // static lanterns — a second, still emitter set that the moving one is read against.
@@ -457,14 +456,11 @@ function animateDeform(t) {
 }
 
 // ── Churn 5: EMISSIVE — a moving emitter SURFACE ───────────────────────────────
-//    A drone lamp whose MeshStandardMaterial carries a strong emissive; the packer
-//    writes emissive × emissiveIntensity into the traced material record, so this
-//    orb is a genuine area emitter for the probes (no analytic light is attached —
-//    every photon it contributes is bounce off its own surface).
-//    LANE: this is the TRANSFORM lane, not the light lane. The orb's radiance is
-//    baked into the build; only its matrix moves, so the correct plugin response is
-//    the in-place instance/TLAS rewrite (refreshTransforms → spectral_scene
-//    updateTransforms) — never a BVH rebuild, never a material recompile.
+//    A drone lamp whose MeshStandardMaterial carries a strong emissive. Its opt-in
+//    sphere proxy gives NEE a direct target while the A/B control can restore pure
+//    Monte-Carlo surface discovery.
+//    LANE: the in-place instance/TLAS rewrite also refreshes the sphere light record,
+//    so movement needs neither a BVH rebuild nor a material recompile.
 //    CORRECT BEHAVIOUR: the warm pool on the paving and the wash on the walls track
 //    the orb, and the HUD stays "steady" (no REBUILDING) the whole time.
 //    Events ON → the packet is consumed every tick, even mid-orbit. Events OFF →
@@ -532,6 +528,8 @@ lamp.add(lampRod, lampHood, lampGlobe, lampLight);
 lamp.position.set(0, 7.0, 4.6);
 scene.add(lamp);
 const lampParts = [lampRod, lampHood, lampGlobe];
+const giEmitterMeshes = [droneOrb, ...staticEmissiveStrips, lampGlobe];
+for (const mesh of giEmitterMeshes) mesh.userData.giEmitter = true;
 function animateLight(t) {
   const a = t * 0.52;                       // ~12 s across and back
   lamp.position.x = Math.sin(a) * 7.6;
@@ -551,7 +549,7 @@ gi.setSmoothness(1);
 gi.setFilterStrength(1);
 applyGiSettings(gi, { giIntensity: 20, giSky: 2, giDepthSharpness: 2 });
 const giTune = {
-  sunIntensity: 8, emissiveStrength: 8, pendant: true,
+  sunIntensity: 8, emissiveStrength: 8, emitterNee: true, pendant: true,
   giIntensity: 20, giSky: 2, giDepthSharpness: 2, giDivisions: 16, giRays: 64,
   giRayBudget: 98304,                                // per-tick trace budget (light speed vs GPU)
   giJitterMode: 'gated',                             // 'gated' basis vs 'montecarlo' re-jitter
@@ -559,13 +557,15 @@ const giTune = {
 };
 const gui = new GUI({ title: 'GI' });
 gui.add(giTune, 'sunIntensity').min(0).step(0.05).name('sunlight').onChange((v) => { sun.intensity = v; });
-// Material VALUES have no fallback scan (the rest-only geo signature hashes
-// material identity, not values) — with EXPLICIT EVENTS off these edits reach
-// the trace only when something else forces a rebuild. With events on they ride
-// the in-place record lane and update live, even mid-churn.
+// Ordinary material values have no fallback scan. Promoted emitter emissive is
+// the bounded exception: the light signature tracks it so the NEE record stays honest.
 gui.add(giTune, 'emissiveStrength').min(0).step(0.05).name('emissive').onChange((v) => {
   droneMat.emissiveIntensity = v;
   if (churn.events) gi.notifySceneChange?.({ type: 'material', materials: [droneMat] });
+});
+gui.add(giTune, 'emitterNee').name('emitter NEE').onChange((on) => {
+  for (const mesh of giEmitterMeshes) mesh.userData.giEmitter = on;
+  gi.markTopologyDirty();
 });
 gui.add(giTune, 'pendant').name('pendant').onChange((on) => {
   lampLight.visible = on;

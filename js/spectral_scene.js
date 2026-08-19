@@ -171,7 +171,7 @@ function giColorHint(v) {
     return null;
 }
 
-function emissiveScaled(material, out) {
+export function emissiveScaled(material, out) {
     // Node-driven emissive (emissiveNode) is invisible to the packer; an explicit
     // userData.giEmissive hint (absolute linear energy, NOT scaled by
     // emissiveIntensity) is the only way to feed it to the trace.
@@ -721,7 +721,7 @@ function flattenBVHRoot(rootBuffer, expectedTriCount) {
 }
 
 // ── Light extraction ───────────────────────────────────────────────
-// Layout (stride 17 floats): [0] type(0 dir/1 point/2 spot/3 rect),
+// Layout (stride 17 floats): [0] type(0 dir/1 point/2 spot/3 emissive sphere),
 // [1..3] worldPos, [4..6] worldDir (toward target), [7..9] color*intensity,
 // [10] range, [11] decay, [12] cosAngle, [13] cosPenumbra, [14] w, [15] h,
 // [16] emitter class (packed): 0 untagged (JH emission), 2 LED,
@@ -808,6 +808,63 @@ export function collectLights(THREE, scene, camera = null) {
             return;
         }
         out.push([type, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z, cr, cg, cb, range, decay, cosAngle, cosPen, w, h, eclass]);
+    });
+    return out;
+}
+
+export function collectEmitterRecords(THREE, scene, camera = null) {
+    const out = [];
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    const ab = new THREE.Vector3();
+    const ac = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    const scale = new THREE.Vector3();
+    scene.traverseVisible((obj) => {
+        if (obj.userData?.giEmitter !== true || !isTraceableMesh(obj, camera)) return;
+        const material = meshMaterials(obj)[0] || null;
+        if (!materialIsRenderable(material)) return;
+        const em = emissiveScaled(material, [0, 0, 0]);
+        if (Math.max(em[0], em[1], em[2]) <= 0) return;
+
+        const geom = obj.geometry;
+        if (!geom.boundingSphere) {
+            try { geom.computeBoundingSphere(); } catch { return; }
+        }
+        const sphere = geom.boundingSphere;
+        if (!sphere || !Number.isFinite(sphere.radius)) return;
+        obj.updateWorldMatrix(true, false);
+
+        const pos = geom.attributes.position;
+        const index = geom.index;
+        const count = index ? index.count : pos.count;
+        let area = 0;
+        for (let i = 0; i + 2 < count; i += 3) {
+            const ia = index ? index.getX(i) : i;
+            const ib = index ? index.getX(i + 1) : i + 1;
+            const ic = index ? index.getX(i + 2) : i + 2;
+            if (ia < 0 || ib < 0 || ic < 0 || ia >= pos.count || ib >= pos.count || ic >= pos.count) continue;
+            a.fromBufferAttribute(pos, ia).applyMatrix4(obj.matrixWorld);
+            b.fromBufferAttribute(pos, ib).applyMatrix4(obj.matrixWorld);
+            c.fromBufferAttribute(pos, ic).applyMatrix4(obj.matrixWorld);
+            area += ab.subVectors(b, a).cross(ac.subVectors(c, a)).length() * 0.5;
+        }
+        if (!(area > 0) || !Number.isFinite(area)) return;
+
+        center.copy(sphere.center).applyMatrix4(obj.matrixWorld);
+        obj.getWorldScale(scale);
+        const radius = sphere.radius * Math.max(Math.abs(scale.x), Math.abs(scale.y), Math.abs(scale.z));
+        if (!Number.isFinite(radius)) return;
+        const emitterScale = Number.isFinite(obj.userData?.giEmitterScale) ? obj.userData.giEmitterScale : 1;
+        const energyScale = (area / 4) * emitterScale;
+        const cr = em[0] * energyScale;
+        const cg = em[1] * energyScale;
+        const cb = em[2] * energyScale;
+        if (!Number.isFinite(cr) || !Number.isFinite(cg) || !Number.isFinite(cb)) return;
+        const range = Math.sqrt(Math.max(0, cr, cg, cb) / 0.005);
+        if (!Number.isFinite(range)) return;
+        out.push([3, center.x, center.y, center.z, 0, 0, -1, cr, cg, cb, range, 2, -1, -1, radius, 0, 0]);
     });
     return out;
 }
@@ -979,11 +1036,17 @@ export async function buildSpectralScene({
     const uberSharers = [];   // parallel: EVERY distinct material folded into the record by
     const uberMapTails = [];  // dedup, and the map-identity tail the record was keyed with —
                               // both feed updateMaterialValues' fail-closed drift checks.
+    const uberZeroEmissive = [];
     const uberMap = new Map();
-    function internMaterial(material) {
+    function internMaterial(material, zeroEmissive = false) {
         const mat = material || {};
         const rec = materialToUber(mat);
-        const key = uberKey(rec, mat);
+        if (zeroEmissive) {
+            // Tier-1 limitation: probe-space glossy reflections lose this self-glow;
+            // the raster still draws the emitter while NEE owns its traced direct light.
+            rec[7] = 0; rec[8] = 0; rec[9] = 0;
+        }
+        const key = uberKey(rec, mat) + (zeroEmissive ? ':E0' : '');
         let idx = uberMap.get(key);
         if (idx === undefined) {
             idx = uberList.length;
@@ -991,6 +1054,7 @@ export async function buildSpectralScene({
             uberMaterials.push(mat);
             uberSharers.push([mat]);
             uberMapTails.push(materialMapTail(mat));
+            uberZeroEmissive.push(zeroEmissive);
             uberMap.set(key, idx);
         } else if (!uberSharers[idx].includes(mat)) {
             uberSharers[idx].push(mat);
@@ -1012,8 +1076,13 @@ export async function buildSpectralScene({
         if (triCount <= 0) return;
 
         const mats = meshMaterials(obj);
+        const zeroEmissive = obj.userData?.giEmitter === true;
         const { triMat, visibleTriCount, visibleTriIndices } =
-            buildTriangleMaterialMap(geom, mats, triCount, internMaterial, Array.isArray(obj.material));
+            buildTriangleMaterialMap(
+                geom, mats, triCount,
+                (material) => internMaterial(material, zeroEmissive),
+                Array.isArray(obj.material),
+            );
         if (visibleTriCount <= 0) return;
 
         const uniqueTriMaterial = Array.isArray(obj.material);
@@ -1367,8 +1436,13 @@ export async function buildSpectralScene({
             dirtySlots.length = write;
         }
         if (dirtySlots.length === 0) return {
-            bounds: null, materialRanges: [], updatedInstances: 0, refittedTlasNodes: 0, full,
+            bounds: null, materialRanges: [], updatedInstances: 0, refittedTlasNodes: 0,
+            emitterTransformsTouched: false, full,
         };
+        let emitterTransformsTouched = false;
+        for (const object of dirtyObjects) {
+            if (object.userData?.giEmitter === true) { emitterTransformsTouched = true; break; }
+        }
         for (const object of dirtyObjects) object.updateWorldMatrix?.(true, false);
         for (const slot of dirtySlots) {
             const src = tlasOrder[slot];
@@ -1426,6 +1500,7 @@ export async function buildSpectralScene({
             materialRanges,
             updatedInstances: dirtySlots.length,
             refittedTlasNodes: touchedNodes.length,
+            emitterTransformsTouched,
             full,
         };
     }
@@ -1457,14 +1532,19 @@ export async function buildSpectralScene({
             }
         }
         const staged = [];
+        let emitterValuesTouched = false;
         for (let i = 0; i < uberList.length; i++) {
             const sharers = uberSharers[i];
             if (targetSet && !sharers.some((m) => targetSet.has(m))) continue;
+            const zeroEmissive = uberZeroEmissive[i] === true;
+            if (zeroEmissive) emitterValuesTouched = true;
             if (materialMapTail(sharers[0]) !== uberMapTails[i]) return null;
             const rec = materialToUber(sharers[0]);
+            if (zeroEmissive) { rec[7] = 0; rec[8] = 0; rec[9] = 0; }
             for (let s = 1; s < sharers.length; s++) {
                 if (materialMapTail(sharers[s]) !== uberMapTails[i]) return null;
                 const r2 = materialToUber(sharers[s]);
+                if (zeroEmissive) { r2[7] = 0; r2[8] = 0; r2[9] = 0; }
                 for (let f = 0; f < MAT_STRIDE; f++) {
                     if (Math.round(r2[f] * 1000) !== Math.round(rec[f] * 1000)) return null;
                 }
@@ -1484,7 +1564,11 @@ export async function buildSpectralScene({
             materials.set(rec, i * MAT_STRIDE);
             changed.push(i);
         }
-        return { materialRanges: recordRanges(changed, 0, MAT_STRIDE), updatedRecords: changed.length };
+        return {
+            materialRanges: recordRanges(changed, 0, MAT_STRIDE),
+            updatedRecords: changed.length,
+            emitterValuesTouched,
+        };
     }
 
     let asyncDeformRequestSerial = 0;
@@ -1893,6 +1977,7 @@ export async function buildSpectralScene({
 
     // Lights
     const lightRecords = collectLights(THREE, scene, camera);
+    lightRecords.push(...collectEmitterRecords(THREE, scene, camera));
     const lights = new Float32Array(Math.max(1, lightRecords.length) * LIGHT_STRIDE);
     for (let i = 0; i < lightRecords.length; i++) lights.set(lightRecords[i], i * LIGHT_STRIDE);
 
@@ -1901,6 +1986,7 @@ export async function buildSpectralScene({
     // changes storage layout and therefore fails closed to a full scene build.
     function updateLights() {
         const nextRecords = collectLights(THREE, scene, camera);
+        nextRecords.push(...collectEmitterRecords(THREE, scene, camera));
         if (nextRecords.length !== lightRecords.length) return null;
         lights.fill(0);
         for (let i = 0; i < nextRecords.length; i++) {

@@ -5,6 +5,23 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Opt-in emissive NEE promotion ("penumbra hypothesis", tier 1): meshes with
+  `userData.giEmitter = true` emit a type-3 sphere-proxy light record (world
+  bounding sphere, power = emissive x area/4 x `giEmitterScale`, finite
+  influence range) that both NEE paths sample directly with a jittered source
+  disk, a `1/max(d^2, r^2)` near-field clamp, and a shadow ray stopped at the
+  source sphere. The traced material record is zeroed through a dedup-split
+  (`:E0`) so direct emitter light is NEE-owned with no double count; the
+  material-value lane re-applies the zeroing and routes emitter value edits to
+  the light-record refresh, emitter transforms force the same refresh, and the
+  rest-mode light signature tracks promoted emitters only. Emission moves from
+  Monte-Carlo discovery (lattice-lottery spikes) to one-sample analytic NEE:
+  small bright emitters are stable even at low hysteresis in monte carlo mode.
+  Known tier-1 trades: sphere proxy misshapes long strips, probe-space glossy
+  lobes lose emitter self-glow, and emitter add/remove is a rebuild-class count
+  change. Includes a scope fix over the delegated implementation: three
+  phantom `camera` references threw per tick during mover activity (starving
+  the solve) and silently killed the light-refresh lane.
 - Structural rebuilds are now the lowest-priority lane: a rest-held rebuild no
   longer vetoes the continuous lanes, so explicit transform/deform packets and
   the solve keep flowing while topology churn holds a rebuild pending (the

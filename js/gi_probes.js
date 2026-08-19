@@ -36,7 +36,8 @@ import {
 let _buildSpectralScene = null;
 let _createBlasCache = null;
 let _rebindMaterialMapsArenaBuild = null;
-let _collectLights = null;       // cheap light re-collect for reactivity (no BVH rebuild)
+let _collectLights = null;       // cheap light/emitter re-collect for reactivity (no BVH rebuild)
+let _emissiveScaled = null;
 let _LIGHT_STRIDE = 16;
 import { buildTraversal, T_MAX, RAY_EPS, PI } from './spectral_traverse.js';
 import { octEncodeNode, octDecodeNode } from './gi_oct.js';
@@ -1163,6 +1164,8 @@ export function createProbeField({
     let lastSolveList = '';
     let lastUpdatedCount = 0;
     const _sigVec = new THREE.Vector3();
+    const _sigScale = new THREE.Vector3();
+    const _sigEmissive = [0, 0, 0];
 
     // SHARED compute uniforms — a single instance, folded into BOTH cascade U blocks by
     // reference (see below), so one GUI knob writes both cascades. Per-cascade uniforms
@@ -2019,7 +2022,29 @@ export function createProbeField({
                         const ldir = loadLightVec3(lb, 4);
                         const lrange = lights.element(lb.add(uint(10)));
                         const isDir = ltype.lessThan(float(0.5));
-                        const toLight = select(isDir, ldir.mul(-1.0), lpos.sub(hitPos));
+                        const isEmitter = float(ltype.sub(float(3.0)).abs()).lessThan(float(0.5));
+                        const sourceRadius = tslMax(lights.element(lb.add(uint(14))), float(0.0));
+                        const targetPos = lpos.toVar();
+                        If(isEmitter, () => {
+                            // Type-3 sampling changes only the NEE target; the traced ray basis stays gated.
+                            const emitterAxis = lpos.sub(hitPos);
+                            const emitterDir = emitterAxis.div(tslMax(length(emitterAxis), float(1e-4)));
+                            const emitterUp = select(tslAbs(emitterDir.y).lessThan(float(0.999)), vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0));
+                            const emitterTangent = normalize(cross(emitterUp, emitterDir));
+                            const emitterBitangent = cross(emitterDir, emitterTangent);
+                            const emitterSeed = float(k).mul(12.9898).add(float(li).mul(78.233)).add(U.frameJitter.mul(37.719));
+                            const emitterHash0 = sin(emitterSeed).mul(43758.5453);
+                            const emitterHash1 = sin(emitterSeed.add(19.19)).mul(24634.6345);
+                            const emitterU = emitterHash0.sub(floor(emitterHash0));
+                            const emitterV = emitterHash1.sub(floor(emitterHash1));
+                            const emitterDiskRadius = sqrt(emitterU).mul(sourceRadius);
+                            const emitterDiskAngle = emitterV.mul(float(PI).mul(2.0));
+                            targetPos.addAssign(
+                                emitterTangent.mul(cos(emitterDiskAngle).mul(emitterDiskRadius))
+                                    .add(emitterBitangent.mul(sin(emitterDiskAngle).mul(emitterDiskRadius)))
+                            );
+                        });
+                        const toLight = select(isDir, ldir.mul(-1.0), targetPos.sub(hitPos));
                         const dist = select(isDir, float(1e4), tslMax(length(toLight), float(1e-4)));
                         const wi = normalize(toLight);
                         const ndl = tslMax(dot(ng, wi), float(0.0));
@@ -2035,9 +2060,15 @@ export function createProbeField({
                                 const lcosAngle = lights.element(lb.add(uint(12)));
                                 const lcosPen = lights.element(lb.add(uint(13)));
                                 const isSpot = float(ltype.sub(float(2.0)).abs()).lessThan(float(0.5));
-                                const blocked = traverseAny(hitPos, wi, dist.sub(traceBias));
+                                // Stop before the source sphere so its traced shell cannot shadow itself.
+                                const shadowTMax = select(isEmitter,
+                                    tslMax(dist.sub(sourceRadius).sub(traceBias), float(1e-4)),
+                                    dist.sub(traceBias));
+                                const blocked = traverseAny(hitPos, wi, shadowTMax);
                                 If(blocked.lessThan(float(0.5)), () => {
-                                    const falloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
+                                    const pointFalloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
+                                    const emitterFalloff = float(1.0).div(tslMax(dist.mul(dist), sourceRadius.mul(sourceRadius)));
+                                    const falloff = select(isEmitter, emitterFalloff, pointFalloff);
                                     const rr = dist.div(tslMax(lrange, float(1e-4)));
                                     const rr2 = rr.mul(rr);
                                     const win = clamp(float(1.0).sub(rr2.mul(rr2)), float(0.0), float(1.0));
@@ -2094,7 +2125,29 @@ export function createProbeField({
                         const lcosPen = lights.element(lb.add(uint(13)));
                         const isDir = ltype.lessThan(float(0.5));
                         const isSpot = float(ltype.sub(float(2.0)).abs()).lessThan(float(0.5));
-                        const toLight = select(isDir, ldir.mul(-1.0), lpos.sub(hitPos));
+                        const isEmitter = float(ltype.sub(float(3.0)).abs()).lessThan(float(0.5));
+                        const sourceRadius = tslMax(lights.element(lb.add(uint(14))), float(0.0));
+                        const targetPos = lpos.toVar();
+                        If(isEmitter, () => {
+                            // Type-3 sampling changes only the NEE target; the traced ray basis stays gated.
+                            const emitterAxis = lpos.sub(hitPos);
+                            const emitterDir = emitterAxis.div(tslMax(length(emitterAxis), float(1e-4)));
+                            const emitterUp = select(tslAbs(emitterDir.y).lessThan(float(0.999)), vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0));
+                            const emitterTangent = normalize(cross(emitterUp, emitterDir));
+                            const emitterBitangent = cross(emitterDir, emitterTangent);
+                            const emitterSeed = float(k).mul(12.9898).add(float(li).mul(78.233)).add(U.frameJitter.mul(37.719));
+                            const emitterHash0 = sin(emitterSeed).mul(43758.5453);
+                            const emitterHash1 = sin(emitterSeed.add(19.19)).mul(24634.6345);
+                            const emitterU = emitterHash0.sub(floor(emitterHash0));
+                            const emitterV = emitterHash1.sub(floor(emitterHash1));
+                            const emitterDiskRadius = sqrt(emitterU).mul(sourceRadius);
+                            const emitterDiskAngle = emitterV.mul(float(PI).mul(2.0));
+                            targetPos.addAssign(
+                                emitterTangent.mul(cos(emitterDiskAngle).mul(emitterDiskRadius))
+                                    .add(emitterBitangent.mul(sin(emitterDiskAngle).mul(emitterDiskRadius)))
+                            );
+                        });
+                        const toLight = select(isDir, ldir.mul(-1.0), targetPos.sub(hitPos));
                         const dist = select(isDir, float(1e4), tslMax(length(toLight), float(1e-4)));
                         const wi = normalize(toLight);
                         const ndl = tslMax(dot(ng, wi), float(0.0));
@@ -2102,9 +2155,15 @@ export function createProbeField({
                         // skip the shadow ray entirely, not just shade to zero.
                         const lpeak = tslMax(tslMax(lcol.x, lcol.y), lcol.z);
                         If(ndl.mul(lpeak).greaterThan(float(0.0)).and(isDir.or(lrange.lessThanEqual(float(0.0))).or(dist.lessThan(lrange))), () => {
-                            const blocked = traverseAny(hitPos, wi, dist.sub(traceBias));
+                            // Stop before the source sphere so its traced shell cannot shadow itself.
+                            const shadowTMax = select(isEmitter,
+                                tslMax(dist.sub(sourceRadius).sub(traceBias), float(1e-4)),
+                                dist.sub(traceBias));
+                            const blocked = traverseAny(hitPos, wi, shadowTMax);
                             If(blocked.lessThan(float(0.5)), () => {
-                                const falloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
+                                const pointFalloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
+                                const emitterFalloff = float(1.0).div(tslMax(dist.mul(dist), sourceRadius.mul(sourceRadius)));
+                                const falloff = select(isEmitter, emitterFalloff, pointFalloff);
                                 const rr = dist.div(tslMax(lrange, float(1e-4)));
                                 const rr2 = rr.mul(rr);
                                 const win = clamp(float(1.0).sub(rr2.mul(rr2)), float(0.0), float(1.0));
@@ -2833,7 +2892,14 @@ export function createProbeField({
             _buildSpectralScene = mod.buildSpectralScene;
             _createBlasCache = mod.createBlasCache || null;
             _rebindMaterialMapsArenaBuild = mod.rebindMaterialMapsArenaBuild || null;
-            _collectLights = mod.collectLights || null;
+            const collectAnalyticLights = mod.collectLights || null;
+            const collectEmitterRecords = mod.collectEmitterRecords || null;
+            _collectLights = collectAnalyticLights ? (three, root, renderCamera = null) => {
+                const records = collectAnalyticLights(three, root, renderCamera);
+                if (collectEmitterRecords) records.push(...collectEmitterRecords(three, root, renderCamera));
+                return records;
+            } : null;
+            _emissiveScaled = mod.emissiveScaled || null;
             if (Number.isFinite(mod.LIGHT_STRIDE)) _LIGHT_STRIDE = mod.LIGHT_STRIDE;
         }
         return _buildSpectralScene;
@@ -3399,7 +3465,7 @@ export function createProbeField({
         checkCounter++;
         // LIGHTS are the exception: refresh-class, not rebuild-class.
         // refreshLights() is an in-place buffer refill (no BVH, no compile)
-        // and lightSignature() is a bounded lights-only traverse with
+        // and lightSignature() only reads analytic lights plus opted-in emitters with
         // deadbands, so this lane rides THROUGH motion. Rest-gating it made
         // every host light edit read as "GI stopped solving" while the
         // interactive raster light updated live (maxjs 2026-07-24).
@@ -3750,31 +3816,72 @@ export function createProbeField({
         let n = 0, h1 = 0x9e3779b9 | 0, h2 = 0x85ebca6b | 0;
         const q = lightQuant > 1e-6 ? lightQuant : 1;
         scene.traverseVisible((o) => {
-            if (!o.isLight || o.isAmbientLight || o.isHemisphereLight) return;
-            // Excluded lights never reach collectLights (objectIsRenderable) → their
-            // edits must not churn the lane (same rule 2abc2cd applied to the
-            // geo/deform/xform signatures for excluded meshes).
-            if (o.userData?.maxjsVisible === false) return;
+            if (o.isLight && !o.isAmbientLight && !o.isHemisphereLight) {
+                // Excluded lights never reach collectLights (objectIsRenderable) → their
+                // edits must not churn the lane (same rule 2abc2cd applied to the
+                // geo/deform/xform signatures for excluded meshes).
+                if (o.userData?.maxjsVisible === false) return;
+                o.updateWorldMatrix?.(true, false);
+                o.getWorldPosition(_sigVec);
+                const c = o.color;
+                let v = Math.round(_sigVec.x / q);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = Math.round(_sigVec.y / q);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = Math.round(_sigVec.z / q);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = c ? Math.round((c.r * 7 + c.g * 11 + c.b * 13) * 16) : 0;
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = Math.round((o.intensity || 0) * 4);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = Math.round((o.angle || 0) * 50);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                // range/decay were missing from the old string signature — a distance
+                // edit silently never reached the GI records until something else moved.
+                v = Math.round((o.distance || 0) * 4);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = Math.round((o.decay || 0) * 8);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                n++;
+                return;
+            }
+            if (o.userData?.giEmitter !== true || (!o.isMesh && !o.isInstancedMesh)
+                || o.isSkinnedMesh || o.name === '__maxjs_sky__' || o.userData?.maxjsVisible === false) return;
+            const position = o.geometry?.attributes?.position;
+            if (!position || position.count < 3 || position.itemSize < 3 || !position.array) return;
+            const materials = Array.isArray(o.material) ? o.material : [o.material];
+            if (!materials.some((m) => m && m.visible !== false && (!Number.isFinite(m.opacity) || m.opacity > 1e-4))) return;
+            const material = materials[0];
+            if (!material || material.visible === false || (Number.isFinite(material.opacity) && material.opacity <= 1e-4)
+                || !_emissiveScaled) return;
+            const em = _emissiveScaled(material, _sigEmissive);
+            if (Math.max(em[0], em[1], em[2]) <= 0) return;
+            if (!o.geometry.boundingSphere) {
+                try { o.geometry.computeBoundingSphere(); } catch { return; }
+            }
+            const sphere = o.geometry.boundingSphere;
+            if (!sphere || !Number.isFinite(sphere.radius)) return;
             o.updateWorldMatrix?.(true, false);
-            o.getWorldPosition(_sigVec);
-            const c = o.color;
+            _sigVec.copy(sphere.center).applyMatrix4(o.matrixWorld);
+            o.getWorldScale(_sigScale);
+            const radius = sphere.radius * Math.max(Math.abs(_sigScale.x), Math.abs(_sigScale.y), Math.abs(_sigScale.z));
+            if (!Number.isFinite(radius)) return;
+            const emitterScale = Number.isFinite(o.userData?.giEmitterScale) ? o.userData.giEmitterScale : 1;
             let v = Math.round(_sigVec.x / q);
             h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
             v = Math.round(_sigVec.y / q);
             h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
             v = Math.round(_sigVec.z / q);
             h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
-            v = c ? Math.round((c.r * 7 + c.g * 11 + c.b * 13) * 16) : 0;
+            v = Math.round(em[0] * 16);
             h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
-            v = Math.round((o.intensity || 0) * 4);
+            v = Math.round(em[1] * 16);
             h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
-            v = Math.round((o.angle || 0) * 50);
+            v = Math.round(em[2] * 16);
             h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
-            // range/decay were missing from the old string signature — a distance
-            // edit silently never reached the GI records until something else moved.
-            v = Math.round((o.distance || 0) * 4);
+            v = Math.round(emitterScale * 16);
             h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
-            v = Math.round((o.decay || 0) * 8);
+            v = Math.round(radius / q);
             h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
             n++;
         });
@@ -3894,6 +4001,7 @@ export function createProbeField({
         if (Array.isArray(res.materialRanges) && res.materialRanges.length > 0) {
             copySceneStorageRanges('materials', built.materials, res.materialRanges);
         }
+        if (res.emitterTransformsTouched) forceLightingRefresh();
         return true;
     }
     // Material-VALUE fast path: as long as the probes keep tracing, a
@@ -3914,6 +4022,7 @@ export function createProbeField({
         if (Array.isArray(res.materialRanges) && res.materialRanges.length > 0) {
             copySceneStorageRanges('materials', built.materials, res.materialRanges);
         }
+        if (res.emitterValuesTouched) forceLightingRefresh();
         return true;
     }
     // Deforming-object fast path: re-gather the deformed BLAS vertex slices +
@@ -4053,6 +4162,8 @@ export function createProbeField({
     function refreshLights() {
         if (!casc[0].gpu || !_collectLights) return;
         let records;
+        // No camera in this scope by design: the build path collects with
+        // camera = null too, so refresh and build stay filter-consistent.
         try { records = _collectLights(THREE, scene); } catch { return; }
         liveLightRecords = records;
         if (clusteredGi) {
