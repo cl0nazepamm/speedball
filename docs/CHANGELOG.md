@@ -5,6 +5,22 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Textured structural rebuilds now keep material-map `DataArrayTexture`
+  identities resident through a per-probe-field capacity arena. The six PBR
+  map types reserve 1.5x layer headroom, stage async extraction until the build
+  is accepted, and rewrite only byte-changed live layers in place; material
+  record slots 12-16/24 remain the sole layer-index authority, so spare/stale
+  layers are unreachable. Texture generations are ref-counted with scene
+  resources, and any map or scene-storage capacity rebind forks both sides so
+  staggered C0/C1 replacement stays generation-coherent. Within capacity the
+  existing kernel-resident path now covers textured scenes without adding
+  bindings or solve work; overflow/dimension/format changes retain the rare
+  full-kernel fallback. Measured on the textured Sponza demo at rest: worst
+  frame per add/remove structural churn fell from 225-575 ms to 13-29 ms, with
+  kernel-resident reuses climbing one per rebuild, zero material recompiles,
+  and zero texture rebinds; the untextured churn harness stays at its
+  hitchless baseline. Growing the light arena or resizing the probe grid
+  still takes the full rebuild path by design.
 - Hitchless structural rebuilds: the five traced-scene buffers now live in a
   resident capacity arena (1.5× geometric headroom, device-limit capped) whose
   BufferAttribute and TSL storage-node identities survive rebuilds; live
@@ -20,9 +36,8 @@ All notable changes to Speedball GI are documented here. This project follows
   the churn harness at rest: worst frame per topology/enter/leave action fell
   from ~240 ms (pre-cache) and ~110 ms (BLAS cache alone) to 4-5 ms at a
   locked frame rate, with removal changes verified to propagate into the
-  field. Untextured scenes take the resident path today; per-build material
-  map textures still force a kernel rebuild (map-texture residency is the
-  known follow-up for textured scenes).
+  field. Both textured and untextured scenes now take the resident path while
+  their storage and material-map capacities fit.
 - Cross-rebuild BLAS cache: a structural rebuild now pays only for the
   geometries that actually changed. Cached cores (BVH records, soup slices,
   BVH-ordered materials) are keyed by geometry identity × attribute

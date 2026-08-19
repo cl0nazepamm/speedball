@@ -54,6 +54,14 @@ const VERT_STRIDE = 3;          // vertexPos: tightly packed xyz (flat f32 stora
 const VERTEX_DATA_STRIDE = 8;   // GPU interleaved per-vertex: pos(3) + normal(3) + uv(2)
 const BYTES_PER_BVH_NODE = 32;  // three-mesh-bvh BYTES_PER_NODE (8 x u32)
 const TEXTURE_ATLAS_SIZE = 256; // every material map is resampled to this square size and stacked into a DataArrayTexture layer
+const MATERIAL_MAP_TYPES = [
+    { field: 'map', recIdx: 12, out: 'albedo' },
+    { field: 'normalMap', recIdx: 13, out: 'normal' },
+    { field: 'roughnessMap', recIdx: 14, out: 'roughness' },
+    { field: 'metalnessMap', recIdx: 15, out: 'metalness' },
+    { field: 'emissiveMap', recIdx: 16, out: 'emissive' },
+    { field: 'alphaMap', recIdx: 24, out: 'alpha' },
+];
 const SKIP_TRIANGLE_MATERIAL = 0xFFFFFFFF;
 // Keep only genuinely tiny edits synchronous. A few thousand gathered/refit
 // items stay below one frame slice even on slower hosts; anything larger
@@ -368,24 +376,147 @@ function extractTextureRGBA(tex, size) {
     return new Uint8Array(pixels);
 }
 
-// Walk every uber material, extract each map type, build the DataArrayTextures,
-// and write the assigned layer index back into each uber record. Returns
-// { albedo, normal, roughness, metalness, emissive, alpha } (DataArrayTexture | null).
-async function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
-    const TYPES = [
-        { field: 'map', recIdx: 12, out: 'albedo' },
-        { field: 'normalMap', recIdx: 13, out: 'normal' },
-        { field: 'roughnessMap', recIdx: 14, out: 'roughness' },
-        { field: 'metalnessMap', recIdx: 15, out: 'metalness' },
-        { field: 'emissiveMap', recIdx: 16, out: 'emissive' },
-        { field: 'alphaMap', recIdx: 24, out: 'alpha' },
-    ];
-    const layerBytes = size * size * 4;
-    const result = { albedo: null, normal: null, roughness: null, metalness: null, emissive: null, alpha: null };
+function emptyMaterialMaps() {
+    const maps = {};
+    for (const ty of MATERIAL_MAP_TYPES) maps[ty.out] = null;
+    return maps;
+}
 
-    for (const ty of TYPES) {
+function configureMaterialArrayTexture(THREE, texture) {
+    texture.format = THREE.RGBAFormat;
+    texture.type = THREE.UnsignedByteType;
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.wrapS = THREE.RepeatWrapping;   // honour uv repeat > 1
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.colorSpace = THREE.NoColorSpace; // raw bytes; kernel decodes sRGB
+    texture.generateMipmaps = false;
+    texture.needsUpdate = true;
+    return texture;
+}
+
+function materialMapCapacity(required, previous, growth, maxLayers) {
+    const live = Math.max(0, Math.floor(Number(required) || 0));
+    const prior = Math.max(0, Math.floor(Number(previous) || 0));
+    if (live === 0 && prior === 0) return 0;
+    const factor = Number.isFinite(growth) && growth > 1 ? growth : 1.5;
+    const target = Math.max(
+        live,
+        live > 0 ? Math.ceil(live * factor) : 0,
+        prior > 0 ? Math.ceil(prior * factor) : 0,
+    );
+    const limit = Math.max(1, Math.floor(Number(maxLayers) || 256));
+    // Preserve the previous fail-loud behavior when the live scene itself is
+    // beyond the device limit; otherwise use all available geometric headroom.
+    return limit >= live ? Math.min(target, limit) : live;
+}
+
+function materialMapsConfigCompatible(generation, size, format, type) {
+    if (!generation || generation.disposed
+        || generation.width !== size || generation.height !== size
+        || generation.format !== format || generation.type !== type) return false;
+    return MATERIAL_MAP_TYPES.every(({ out }) => {
+        const capacity = generation.capacities?.[out] || 0;
+        const texture = generation.textures?.[out] || null;
+        if (capacity === 0) return texture === null;
+        return !!texture
+            && texture.image?.width === size
+            && texture.image?.height === size
+            && texture.image?.depth === capacity
+            && texture.format === format
+            && texture.type === type;
+    });
+}
+
+function materialMapsGenerationFits(generation, liveLayers, size, format, type) {
+    return materialMapsConfigCompatible(generation, size, format, type)
+        && MATERIAL_MAP_TYPES.every(({ out }) => liveLayers[out] <= generation.capacities[out]);
+}
+
+function materialMapLayerEquals(texture, layer, data, layerBytes) {
+    const resident = texture?.image?.data;
+    const start = layer * layerBytes;
+    if (!resident || !data || start + layerBytes > resident.length || data.length !== layerBytes) return false;
+    for (let i = 0; i < layerBytes; i++) {
+        if (resident[start + i] !== data[i]) return false;
+    }
+    return true;
+}
+
+function createMaterialMapsGeneration(
+    THREE,
+    packedLayers,
+    liveLayers,
+    size,
+    mapsArena,
+    previous,
+    capacityOverrides = null,
+) {
+    const textures = emptyMaterialMaps();
+    const capacities = {};
+    const layerBytes = size * size * 4;
+    for (const { out } of MATERIAL_MAP_TYPES) {
+        const live = liveLayers[out];
+        const capacity = capacityOverrides
+            ? Math.max(live, capacityOverrides[out] || 0)
+            : materialMapCapacity(
+                live,
+                previous?.capacities?.[out],
+                mapsArena.growth,
+                mapsArena.maxLayers,
+            );
+        capacities[out] = capacity;
+        if (capacity === 0) continue;
+        const packed = packedLayers[out];
+        const data = capacity === live && packed
+            ? packed
+            : new Uint8Array(layerBytes * capacity);
+        if (packed && data !== packed) data.set(packed, 0);
+        textures[out] = configureMaterialArrayTexture(
+            THREE,
+            new THREE.DataArrayTexture(data, size, size, capacity),
+        );
+    }
+    return {
+        refs: 0,
+        disposed: false,
+        generation: ++mapsArena.nextGeneration,
+        width: size,
+        height: size,
+        format: THREE.RGBAFormat,
+        type: THREE.UnsignedByteType,
+        textures,
+        capacities,
+        liveLayers: { ...liveLayers },
+    };
+}
+
+// Walk every uber material, extract each map type, and write the assigned layer
+// index back into each uber record. Without an arena this preserves the public
+// spectral-tracer behavior and allocates exact-size DataArrayTextures. With an
+// arena, extraction remains a CPU staging operation: an accepted probe build
+// commits the staged live layers later, at the same boundary as its resident
+// material-buffer rewrite. This prevents an async/stale build from changing the
+// textures still sampled by the live kernels.
+async function buildMaterialTextures(THREE, uberList, uberMaterials, size, mapsArena = null) {
+    const layerBytes = size * size * 4;
+    const packedLayers = {};
+    const liveLayers = {};
+    const changedLayers = {};
+    const comparisonGeneration = mapsArena
+        && materialMapsConfigCompatible(
+            mapsArena.current,
+            size,
+            THREE.RGBAFormat,
+            THREE.UnsignedByteType,
+        )
+        ? mapsArena.current
+        : null;
+
+    for (const ty of MATERIAL_MAP_TYPES) {
         const layers = [];
         const byUuid = new Map();
+        changedLayers[ty.out] = [];
         for (let i = 0; i < uberList.length; i++) {
             const tex = uberMaterials[i]?.[ty.field];
             if (!tex || !tex.isTexture) continue;
@@ -402,26 +533,108 @@ async function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
                 if (!data) continue; // unreadable → leave record layer at −1
                 layer = layers.length;
                 layers.push(data);
+                if (!materialMapLayerEquals(
+                    comparisonGeneration?.textures?.[ty.out], layer, data, layerBytes,
+                )) {
+                    changedLayers[ty.out].push(layer);
+                }
                 byUuid.set(tex.uuid, layer);
             }
             uberList[i][ty.recIdx] = layer;
         }
-        if (layers.length === 0) continue;
+        liveLayers[ty.out] = layers.length;
+        if (layers.length === 0) {
+            packedLayers[ty.out] = null;
+            continue;
+        }
         const merged = new Uint8Array(layerBytes * layers.length);
         for (let l = 0; l < layers.length; l++) merged.set(layers[l], l * layerBytes);
-        const arr = new THREE.DataArrayTexture(merged, size, size, layers.length);
-        arr.format = THREE.RGBAFormat;
-        arr.type = THREE.UnsignedByteType;
-        arr.minFilter = THREE.LinearFilter;
-        arr.magFilter = THREE.LinearFilter;
-        arr.wrapS = THREE.RepeatWrapping;   // honour uv repeat > 1
-        arr.wrapT = THREE.RepeatWrapping;
-        arr.colorSpace = THREE.NoColorSpace; // raw bytes; kernel decodes sRGB
-        arr.generateMipmaps = false;
-        arr.needsUpdate = true;
-        result[ty.out] = arr;
+        packedLayers[ty.out] = merged;
     }
-    return result;
+
+    if (!mapsArena) {
+        const maps = emptyMaterialMaps();
+        for (const { out } of MATERIAL_MAP_TYPES) {
+            const live = liveLayers[out];
+            if (live === 0) continue;
+            maps[out] = configureMaterialArrayTexture(
+                THREE,
+                new THREE.DataArrayTexture(packedLayers[out], size, size, live),
+            );
+        }
+        return { maps, mapsArenaGeneration: null, mapsArenaPlan: null };
+    }
+
+    const previous = mapsArena.current || null;
+    const format = THREE.RGBAFormat;
+    const type = THREE.UnsignedByteType;
+    if (materialMapsGenerationFits(previous, liveLayers, size, format, type)) {
+        return {
+            maps: previous.textures,
+            mapsArenaGeneration: previous,
+            mapsArenaPlan: {
+                kind: 'rewrite',
+                generation: previous,
+                packedLayers,
+                liveLayers,
+                changedLayers,
+                committed: false,
+            },
+        };
+    }
+
+    const hasAnyResidentLayer = MATERIAL_MAP_TYPES.some(({ out }) =>
+        liveLayers[out] > 0 || (previous?.capacities?.[out] || 0) > 0);
+    if (!hasAnyResidentLayer) {
+        return { maps: emptyMaterialMaps(), mapsArenaGeneration: null, mapsArenaPlan: null };
+    }
+
+    const configCompatible = materialMapsConfigCompatible(previous, size, format, type);
+    const generation = createMaterialMapsGeneration(
+        THREE, packedLayers, liveLayers, size, mapsArena, previous,
+    );
+    return {
+        maps: generation.textures,
+        mapsArenaGeneration: generation,
+        mapsArenaPlan: {
+            kind: previous ? (configCompatible ? 'grow' : 'reconfigure') : 'allocate',
+            generation,
+            packedLayers: null, // already copied into the fresh resident arrays
+            liveLayers,
+            committed: false,
+        },
+    };
+}
+
+// If the scene-storage arena must grow while maps themselves still fit, the
+// old staggered cascade needs an immutable map snapshot matching its old
+// material records. Fork the staged rewrite into a fresh texture generation
+// with the same capacities; the caller then rebinds scene storage and maps as
+// one coherent generation. This is the rare storage-growth fallback only.
+export function rebindMaterialMapsArenaBuild(THREE, built, mapsArena) {
+    const plan = built?.mapsArenaPlan;
+    const previous = built?.mapsArenaGeneration;
+    if (!mapsArena || !plan || plan.committed || plan.kind !== 'rewrite' || !previous) return false;
+    const generation = createMaterialMapsGeneration(
+        THREE,
+        plan.packedLayers,
+        plan.liveLayers,
+        previous.width,
+        mapsArena,
+        previous,
+        previous.capacities,
+    );
+    built.maps = generation.textures;
+    built.mapsArenaGeneration = generation;
+    built.mapsArenaPlan = {
+        kind: 'scene-rebind',
+        generation,
+        packedLayers: null,
+        liveLayers: plan.liveLayers,
+        changedLayers: null,
+        committed: false,
+    };
+    return true;
 }
 
 // ── Threaded (stackless) BVH re-flatten ────────────────────────────
@@ -748,7 +961,14 @@ function attrIdentity(attr) {
     return id;
 }
 
-export async function buildSpectralScene({ THREE, scene, camera = null, maxTriangles = 4_000_000, blasCache = null } = {}) {
+export async function buildSpectralScene({
+    THREE,
+    scene,
+    camera = null,
+    maxTriangles = 4_000_000,
+    blasCache = null,
+    mapsArena = null,
+} = {}) {
     if (!scene) return null;
     scene.updateMatrixWorld(true);
 
@@ -994,7 +1214,10 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     // Extract PBR maps into array textures FIRST — this writes each material's
     // assigned layer index into its uber record ([12..16]) before we pack the
     // materials buffer below.
-    const maps = await buildMaterialTextures(THREE, uberList, uberMaterials, TEXTURE_ATLAS_SIZE);
+    const materialTextures = await buildMaterialTextures(
+        THREE, uberList, uberMaterials, TEXTURE_ATLAS_SIZE, mapsArena,
+    );
+    const { maps, mapsArenaGeneration, mapsArenaPlan } = materialTextures;
 
     // Materials buffer with the dynamic tail:
     //   [ ubers (uberCount×MAT_STRIDE) | instances (instCount×MAT_STRIDE) | TLAS (tlasNodes×12) ]
@@ -1638,6 +1861,8 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         lights, lightCount: lightRecords.length,
         env,
         maps, // { albedo, normal, roughness, metalness, emissive, alpha } DataArrayTexture | null
+        mapsArenaGeneration,
+        mapsArenaPlan,
         strides: { NODE_STRIDE_U32, MAT_STRIDE, LIGHT_STRIDE, VERT_STRIDE, VERTEX_DATA_STRIDE, TLAS_STRIDE_F32 },
     };
 }

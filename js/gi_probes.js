@@ -35,6 +35,7 @@ import {
 // NOT drag the CPU BVH builder into that module graph.
 let _buildSpectralScene = null;
 let _createBlasCache = null;
+let _rebindMaterialMapsArenaBuild = null;
 let _collectLights = null;       // cheap light re-collect for reactivity (no BVH rebuild)
 let _LIGHT_STRIDE = 16;
 import { buildTraversal, T_MAX, RAY_EPS, PI } from './spectral_traverse.js';
@@ -167,6 +168,8 @@ const PROBE_COMPUTE_KEYS = [
 ];
 const PROBE_SCENE_BUFFER_KEYS = ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials'];
 const PROBE_SCENE_STORAGE_GROWTH = 1.5;
+const PROBE_MAP_KEYS = ['albedo', 'normal', 'roughness', 'metalness', 'emissive', 'alpha'];
+const TEXTURE_ARRAY_LAYERS_FALLBACK = 256;
 // ── denoise uplift (CORE, docs/GI_SPEEDBALL_design.md §11) tunables ──
 const GI_FILTER_K = 8.0;           // spatial filter: variance→edge-stop bandwidth
 const GI_FILTER_EPS = 0.001;       // spatial filter luma² absolute floor (avoids /0 on black)
@@ -1042,6 +1045,22 @@ export function createProbeField({
     let cachedBuilt = null;
     let blasCache = null;    // cross-rebuild BLAS cache (created with the lazy scene builder)
     let lastBuildSceneRewritten = false; // this build's scene landed as an in-place arena rewrite
+    // Map extraction stages CPU bytes against this per-field arena. Accepted
+    // builds either rewrite the current texture objects layer-by-layer or adopt
+    // a fresh capacity generation. The generation is reference-counted through
+    // sceneResource so staggered C0/C1 replacement cannot dispose old bindings.
+    let mapsArena = {
+        current: null,
+        nextGeneration: 0,
+        growth: PROBE_SCENE_STORAGE_GROWTH,
+        maxLayers: Number(renderer?.backend?.device?.limits?.maxTextureArrayLayers)
+            || TEXTURE_ARRAY_LAYERS_FALLBACK,
+    };
+    let mapsArenaRebinds = 0;
+    let mapsArenaRewrites = 0;
+    let mapsArenaLastUpdate = 'none';
+    let kernelResidentReuses = 0;
+    let kernelRebuilds = 0;
     // C0/C1 trace the same scene soup. Storage lives in a capacity arena whose
     // BufferAttribute + TSL-node identities survive structural rebuilds. Build
     // generations remain ref-counted separately so their material-map textures
@@ -1291,6 +1310,80 @@ export function createProbeField({
         }
     }
 
+    function disposeMapsGeneration(generation) {
+        if (!generation || generation.disposed) return;
+        generation.disposed = true;
+        const disposedMaps = new Set();
+        for (const texture of Object.values(generation.textures || {})) {
+            if (!texture || disposedMaps.has(texture)) continue;
+            disposedMaps.add(texture);
+            texture.dispose?.();
+        }
+    }
+
+    function retainMapsGeneration(generation) {
+        if (generation) generation.refs++;
+        return generation;
+    }
+
+    function releaseMapsGeneration(generation) {
+        if (!generation || generation.refs <= 0) return;
+        generation.refs--;
+        if (generation.refs === 0) disposeMapsGeneration(generation);
+    }
+
+    function commitMapsArenaPlan(built) {
+        const plan = built?.mapsArenaPlan;
+        if (!plan || plan.committed) return { mapsRebound: false, mapsRewritten: false };
+        const generation = plan.generation;
+        if (!generation || generation.disposed || !mapsArena) {
+            throw new Error('SPEEDBALL GI material maps arena generation is unavailable');
+        }
+
+        if (plan.kind === 'rewrite') {
+            if (mapsArena.current !== generation) {
+                throw new Error('SPEEDBALL GI material maps arena changed during a staged rewrite');
+            }
+            const layerBytes = generation.width * generation.height * 4;
+            for (const key of PROBE_MAP_KEYS) {
+                const live = plan.liveLayers[key] | 0;
+                const texture = generation.textures[key];
+                const packed = plan.packedLayers?.[key] || null;
+                const changedLayers = plan.changedLayers?.[key] || [];
+                if (live <= 0 || !texture || !packed || changedLayers.length === 0) continue;
+                if (packed.length !== live * layerBytes) {
+                    throw new Error(`SPEEDBALL GI invalid ${key} map layer staging length`);
+                }
+                for (const layer of changedLayers) {
+                    const start = layer * layerBytes;
+                    texture.image.data.set(packed.subarray(start, start + layerBytes), start);
+                }
+                // Three WebGPU honors DataArrayTexture layerUpdates. Preserve
+                // any earlier pending layers until the renderer consumes them;
+                // add only content that actually changed in this build.
+                if (typeof texture.addLayerUpdate === 'function') {
+                    for (const layer of changedLayers) texture.addLayerUpdate(layer);
+                }
+                texture.needsUpdate = true;
+            }
+            generation.liveLayers = { ...plan.liveLayers };
+            mapsArenaRewrites++;
+            mapsArenaLastUpdate = 'rewrite';
+            plan.committed = true;
+            plan.packedLayers = null;
+            plan.changedLayers = null;
+            return { mapsRebound: false, mapsRewritten: true };
+        }
+
+        mapsArena.current = generation;
+        generation.liveLayers = { ...plan.liveLayers };
+        mapsArenaRebinds++;
+        mapsArenaLastUpdate = plan.kind;
+        plan.committed = true;
+        plan.packedLayers = null;
+        return { mapsRebound: true, mapsRewritten: false };
+    }
+
     function retainSceneResource(resource) {
         if (resource) resource.refs++;
         return resource;
@@ -1300,12 +1393,7 @@ export function createProbeField({
         if (!resource || resource.refs <= 0) return;
         resource.refs--;
         if (resource.refs > 0) return;
-        const disposedMaps = new Set();
-        for (const texture of Object.values(resource.maps || {})) {
-            if (!texture || disposedMaps.has(texture)) continue;
-            disposedMaps.add(texture);
-            texture.dispose?.();
-        }
+        releaseMapsGeneration(resource.mapsGeneration);
         releaseSceneStorage(resource.storage);
     }
 
@@ -1389,8 +1477,9 @@ export function createProbeField({
         };
     }
 
-    function sceneStorageFits(arena, built) {
-        return !!arena && PROBE_SCENE_BUFFER_KEYS.every((key) => built[key].length <= arena.capacities[key]);
+    function sceneStorageFits(arena, built, forceRebind = false) {
+        return !forceRebind && !!arena
+            && PROBE_SCENE_BUFFER_KEYS.every((key) => built[key].length <= arena.capacities[key]);
     }
 
     function rewriteSceneStorage(arena, built) {
@@ -1428,10 +1517,12 @@ export function createProbeField({
 
     function createSceneResource(built, storageArena) {
         const arena = retainSceneStorage(storageArena);
+        const mapsGeneration = retainMapsGeneration(built.mapsArenaGeneration);
         return {
             built,
             refs: 1, // active-root ref
             storage: arena,
+            mapsGeneration,
             buffers: arena.buffers,
             storages: arena.storages,
             traversalUniforms: arena.traversalUniforms,
@@ -1461,10 +1552,27 @@ export function createProbeField({
         if (!sceneResource || sceneResource.built !== built) {
             const previous = sceneResource;
             let arena = previous?.storage || null;
-            if (!sceneStorageFits(arena, built)) {
+            // A map-generation rebind must carry a matching scene-storage
+            // generation. Otherwise staggered C1 would see the new material
+            // layer indices through its old map bindings between C0 and C1.
+            let mapsGenerationRebound = (previous?.mapsGeneration || null)
+                !== (built.mapsArenaGeneration || null);
+            // The inverse coupling matters too: if scene storage grows while a
+            // staged map rewrite fits, old C1 still owns the old material records.
+            // Fork the map generation so its texture contents stay paired with
+            // those records until that old cascade releases both resources.
+            const rawSceneStorageFits = sceneStorageFits(arena, built, false);
+            if (!rawSceneStorageFits && !mapsGenerationRebound && previous
+                && typeof _rebindMaterialMapsArenaBuild === 'function'
+                && _rebindMaterialMapsArenaBuild(THREE, built, mapsArena)) {
+                mapsGenerationRebound = true;
+            }
+            if (!sceneStorageFits(arena, built, mapsGenerationRebound)) {
                 arena = createSceneStorage(built, arena);
                 sceneStorageRebinds++;
-                sceneStorageLastUpdate = previous ? 'grow' : 'allocate';
+                sceneStorageLastUpdate = mapsGenerationRebound && previous
+                    ? 'maps-rebind'
+                    : (previous ? 'grow' : 'allocate');
                 sceneBuffersRebound = true;
             } else {
                 rewriteSceneStorage(arena, built);
@@ -1472,6 +1580,7 @@ export function createProbeField({
                 sceneStorageLastUpdate = 'rewrite';
                 sceneBuffersRewritten = true;
             }
+            commitMapsArenaPlan(built);
             sceneResource = createSceneResource(built, arena);
             releaseSceneResource(previous);
         }
@@ -2706,6 +2815,7 @@ export function createProbeField({
             const mod = await import('./spectral_scene.js');
             _buildSpectralScene = mod.buildSpectralScene;
             _createBlasCache = mod.createBlasCache || null;
+            _rebindMaterialMapsArenaBuild = mod.rebindMaterialMapsArenaBuild || null;
             _collectLights = mod.collectLights || null;
             if (Number.isFinite(mod.LIGHT_STRIDE)) _LIGHT_STRIDE = mod.LIGHT_STRIDE;
         }
@@ -2829,6 +2939,7 @@ export function createProbeField({
                 C.glossyPhase = 0;
                 C.needsClear = false;             // keep the live atlas history (no black flash)
                 C.needsClassify = true;           // refresh per-probe state for the new geometry
+                kernelResidentReuses++;
                 return false;                     // graph kept — no recompile anywhere
             }
             const reuse = {
@@ -2839,6 +2950,7 @@ export function createProbeField({
                 depthBuffer: prev.depthBuffer, stateBuffer: prev.stateBuffer,
             };
             C.gpu = buildKernels(built, C, reuse);
+            kernelRebuilds++;
             disposeKernelOnly(prev); // release old graph/scratch; shared scene data stays resident
             C.U.gridMin.value.copy(gridMin);
             C.U.gridSize.value.copy(gridSize);
@@ -2867,6 +2979,7 @@ export function createProbeField({
         // Resize / first-enable path for this cascade: fresh resources + one recompile.
         disposeCascadeGPU(c);
         C.gpu = buildKernels(built, C);
+        kernelRebuilds++;
         C.U.gridMin.value.copy(gridMin);
         C.U.gridSize.value.copy(gridSize);
         C.U.resX.value = res.x >>> 0; C.U.resY.value = res.y >>> 0; C.U.resZ.value = res.z >>> 0;
@@ -2912,6 +3025,13 @@ export function createProbeField({
     // comes online (stage 1). Returns false on a failed/empty build.
     function disposeUninstalledBuild(built) {
         built?.disposeDeformUpdates?.();
+        if (built?.mapsArenaGeneration) {
+            const generation = built.mapsArenaGeneration;
+            if (generation.refs === 0 && generation !== mapsArena?.current) {
+                disposeMapsGeneration(generation);
+            }
+            return;
+        }
         if (!built?.maps) return;
         const disposedMaps = new Set();
         for (const texture of Object.values(built.maps)) {
@@ -2943,7 +3063,17 @@ export function createProbeField({
             const startedGeneration = buildGeneration;
             const startedGeoSig = geoSignature();
             if (!blasCache && _createBlasCache) blasCache = _createBlasCache();
-            built = await buildSpectralScene({ THREE, scene, maxTriangles: MAX_TRIANGLES, blasCache });
+            if (mapsArena) {
+                mapsArena.maxLayers = Number(renderer?.backend?.device?.limits?.maxTextureArrayLayers)
+                    || mapsArena.maxLayers;
+            }
+            built = await buildSpectralScene({
+                THREE,
+                scene,
+                maxTriangles: MAX_TRIANGLES,
+                blasCache,
+                mapsArena,
+            });
             if (disposed) {
                 disposeUninstalledBuild(built);
                 return false;
@@ -4015,6 +4145,8 @@ export function createProbeField({
         liveLightRecords = null;
         cachedBuilt = null;
         blasCache = null;
+        if (mapsArena) mapsArena.current = null;
+        mapsArena = null;
         pendingTransformTargets.clear();
         pendingAllTransforms = false;
         pendingDeformRefresh = false;
@@ -4221,6 +4353,18 @@ export function createProbeField({
             sceneStorageLiveLengths: sceneResource?.storage
                 ? { ...sceneResource.storage.liveLengths }
                 : null,
+            mapsArenaGeneration: mapsArena?.current?.generation || 0,
+            mapsArenaRebinds,
+            mapsArenaRewrites,
+            mapsArenaLastUpdate,
+            mapsArenaCapacities: mapsArena?.current
+                ? { ...mapsArena.current.capacities }
+                : null,
+            mapsArenaLiveLayers: mapsArena?.current
+                ? { ...mapsArena.current.liveLayers }
+                : null,
+            kernelResidentReuses,
+            kernelRebuilds,
             lightResourceRefs: lightResource?.refs || 0,
             sharedSceneBuffers: !!casc[0].gpu && !!casc[1].gpu
                 && PROBE_SCENE_BUFFER_KEYS.every((key) => casc[0].gpu.buffers[key] === casc[1].gpu.buffers[key]),
