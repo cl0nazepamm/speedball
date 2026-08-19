@@ -553,17 +553,38 @@ applyGiSettings(gi, { giIntensity: 20, giSky: 2, giDepthSharpness: 2 });
 const giTune = {
   sunIntensity: 8, emissiveStrength: 8, pendant: true,
   giIntensity: 20, giSky: 2, giDepthSharpness: 2, giDivisions: 16, giRays: 64,
+  giRayBudget: 98304,                                // per-tick trace budget (light speed vs GPU)
+  giJitterMode: 'gated',                             // 'gated' basis vs 'montecarlo' re-jitter
+  giHysteresis: 0.95, giHysteresisNormalize: true,   // field defaults
 };
 const gui = new GUI({ title: 'GI' });
 gui.add(giTune, 'sunIntensity').min(0).step(0.05).name('sunlight').onChange((v) => { sun.intensity = v; });
-gui.add(giTune, 'emissiveStrength').min(0).step(0.05).name('emissive').onChange((v) => { droneMat.emissiveIntensity = v; });
+// Material VALUES have no fallback scan (the rest-only geo signature hashes
+// material identity, not values) — with EXPLICIT EVENTS off these edits reach
+// the trace only when something else forces a rebuild. With events on they ride
+// the in-place record lane and update live, even mid-churn.
+gui.add(giTune, 'emissiveStrength').min(0).step(0.05).name('emissive').onChange((v) => {
+  droneMat.emissiveIntensity = v;
+  if (churn.events) gi.notifySceneChange?.({ type: 'material', materials: [droneMat] });
+});
 gui.add(giTune, 'pendant').name('pendant').onChange((on) => {
   lampLight.visible = on;
   lampGlobe.material.emissiveIntensity = on ? 2.5 : 0;
+  if (churn.events) gi.notifySceneChange?.({ type: 'material', materials: [lampGlobe.material] });
 });
 gui.add(giTune, 'giIntensity').min(0).step(0.05).name('intensity').onChange((v) => gi.setIntensity(v));
 gui.add(giTune, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi.setDivisions(v); gi.markInteraction?.(); });
 gui.add(giTune, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi.setRays(v); gi.markInteraction?.(); });
+// Light-propagation speed: rays traced per tick. Framerate is owned by the
+// cadence controller either way — this trades GPU headroom for convergence
+// latency (a full pass = probes × rays/probe ÷ this).
+gui.add(giTune, 'giRayBudget', 8192, 524288, 8192).name('rays / tick').onChange((v) => { gi.setRayBudget?.(v); gi.markInteraction?.(); });
+// Jitter regime: 'gated' rotates the ray set only at pass boundaries (hysteresis
+// stable even at extreme low values); 'montecarlo' re-jitters every solve tick
+// (max discovery, disco at low hysteresis). Pair with the hysteresis slider.
+gui.add(giTune, 'giJitterMode', ['gated', 'montecarlo']).name('jitter basis').onChange((v) => gi.setJitterMode?.(v));
+gui.add(giTune, 'giHysteresis', 0, 0.99, 0.01).name('hysteresis').onChange((v) => gi.setHysteresis?.(v));
+gui.add(giTune, 'giHysteresisNormalize').name('normalize hys.').onChange((on) => gi.setHysteresisNormalization?.(on));
 gui.add(giTune, 'giSky', 0, 2, 0.05).name('sky light').onChange((v) => gi.setSkyIntensity?.(v));
 gui.add(giTune, 'giDepthSharpness', 0, 7, 0.1).name('depth sharpness').onChange((v) => gi.setDepthSharpness(v));
 // Probes need the sky the dome shows (the dome itself is excluded from the trace).

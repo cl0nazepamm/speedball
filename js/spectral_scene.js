@@ -311,13 +311,15 @@ const texUuid = (t) => (t && t.isTexture ? t.uuid : '-');
 // Materials sharing scalar params but differing in any bound map must NOT
 // collapse to one uber index, else they'd share a texture layer. Fold the map
 // identities into the dedup key.
+function materialMapTail(material) {
+    return texUuid(material.map) + '|' + texUuid(material.normalMap) + '|'
+        + texUuid(material.roughnessMap) + '|' + texUuid(material.metalnessMap)
+        + '|' + texUuid(material.emissiveMap) + '|' + texUuid(material.alphaMap);
+}
 function uberKey(rec, material) {
     let k = '';
     for (let i = 0; i < MAT_STRIDE; i++) k += Math.round(rec[i] * 1000) + ':';
-    k += texUuid(material.map) + '|' + texUuid(material.normalMap) + '|'
-        + texUuid(material.roughnessMap) + '|' + texUuid(material.metalnessMap)
-        + '|' + texUuid(material.emissiveMap) + '|' + texUuid(material.alphaMap);
-    return k;
+    return k + materialMapTail(material);
 }
 
 // ── Material map extraction ────────────────────────────────────────
@@ -974,6 +976,9 @@ export async function buildSpectralScene({
 
     const uberList = [];
     const uberMaterials = []; // parallel to uberList: source THREE material (for map extraction)
+    const uberSharers = [];   // parallel: EVERY distinct material folded into the record by
+    const uberMapTails = [];  // dedup, and the map-identity tail the record was keyed with —
+                              // both feed updateMaterialValues' fail-closed drift checks.
     const uberMap = new Map();
     function internMaterial(material) {
         const mat = material || {};
@@ -984,7 +989,11 @@ export async function buildSpectralScene({
             idx = uberList.length;
             uberList.push(rec);
             uberMaterials.push(mat);
+            uberSharers.push([mat]);
+            uberMapTails.push(materialMapTail(mat));
             uberMap.set(key, idx);
+        } else if (!uberSharers[idx].includes(mat)) {
+            uberSharers[idx].push(mat);
         }
         return idx;
     }
@@ -1243,6 +1252,11 @@ export async function buildSpectralScene({
         slots.push(slot);
         if (typeof object.uuid === 'string') objectByUuid.set(object.uuid, object);
     }
+    // Material ASSIGNMENT snapshot: the per-triangle uber mapping is baked into
+    // the soup, so the value-only refresh must fail closed if any traced mesh's
+    // material slot identity changed since this build.
+    const objectMaterialSnapshot = new Map();
+    for (const object of slotsByObject.keys()) objectMaterialSnapshot.set(object, meshMaterials(object).slice());
     for (let i = 0; i < uberList.length; i++) materials.set(uberList[i], i * MAT_STRIDE);
 
     function writeDynamic(dyn) {
@@ -1414,6 +1428,63 @@ export async function buildSpectralScene({
             refittedTlasNodes: touchedNodes.length,
             full,
         };
+    }
+
+    // Material-VALUE fast path, the twin of updateLights: scalar/color edits
+    // (emissive, color, roughness, opacity, …) never touch either BVH, so the
+    // affected uber records are re-read from the live materials and rewritten
+    // in place. Layer slots [12..16]/[24] belong to buildMaterialTextures and
+    // are carried over untouched. Anything STRUCTURAL fails closed to null →
+    // full rebuild: a changed map binding, a material reassignment (the
+    // per-triangle uber mapping is baked into the soup), or a dedup split
+    // (two materials shared one record and an edit made them diverge —
+    // compared at uberKey's 1/1000 rounding so raw sub-quantum differences
+    // folded together at build never read as drift).
+    function updateMaterialValues({ materials: targets = null } = {}) {
+        for (const [object, mats] of objectMaterialSnapshot) {
+            const live = meshMaterials(object);
+            if (live.length !== mats.length) return null;
+            for (let i = 0; i < mats.length; i++) if (live[i] !== mats[i]) return null;
+        }
+        let targetSet = null;
+        if (targets != null) {
+            targetSet = new Set();
+            const list = Array.isArray(targets) || targets instanceof Set ? targets : [targets];
+            for (const entry of list) {
+                if (!entry) continue;
+                if (entry.isMaterial) targetSet.add(entry);
+                else for (const m of meshMaterials(entry)) targetSet.add(m);
+            }
+        }
+        const staged = [];
+        for (let i = 0; i < uberList.length; i++) {
+            const sharers = uberSharers[i];
+            if (targetSet && !sharers.some((m) => targetSet.has(m))) continue;
+            if (materialMapTail(sharers[0]) !== uberMapTails[i]) return null;
+            const rec = materialToUber(sharers[0]);
+            for (let s = 1; s < sharers.length; s++) {
+                if (materialMapTail(sharers[s]) !== uberMapTails[i]) return null;
+                const r2 = materialToUber(sharers[s]);
+                for (let f = 0; f < MAT_STRIDE; f++) {
+                    if (Math.round(r2[f] * 1000) !== Math.round(rec[f] * 1000)) return null;
+                }
+            }
+            const b = i * MAT_STRIDE;
+            rec[12] = materials[b + 12]; rec[13] = materials[b + 13]; rec[14] = materials[b + 14];
+            rec[15] = materials[b + 15]; rec[16] = materials[b + 16]; rec[24] = materials[b + 24];
+            for (let f = 0; f < MAT_STRIDE; f++) {
+                if (Math.fround(rec[f]) !== materials[b + f]) { staged.push([i, rec]); break; }
+            }
+        }
+        // Validate-everything-first, THEN commit: a drift found on record k must
+        // not leave records < k half-applied in the CPU mirror of a buffer the
+        // held rebuild may take many frames to replace.
+        const changed = [];
+        for (const [i, rec] of staged) {
+            materials.set(rec, i * MAT_STRIDE);
+            changed.push(i);
+        }
+        return { materialRanges: recordRanges(changed, 0, MAT_STRIDE), updatedRecords: changed.length };
     }
 
     let asyncDeformRequestSerial = 0;
@@ -1853,6 +1924,7 @@ export async function buildSpectralScene({
         materials, materialCount: uberList.length,
         instBase, instCount, tlasBase, tlasNodeCount,
         updateTransforms,
+        updateMaterialValues,
         updateDeforms,
         updateDeformsAsync,
         cancelDeformUpdates,

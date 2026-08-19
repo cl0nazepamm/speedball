@@ -1104,6 +1104,16 @@ export function createProbeField({
     // adapts to the observed tick cadence: halve when frames slip, creep back up when
     // they're comfortably fast. Measures GPU pressure on THIS machine — no tuning knob.
     let tickBudgetRays = RAYS_PER_TICK;
+    // Experimentation knob (setRayBudget): the per-tick trace budget TARGET the
+    // auto-throttle recovers toward and the kernel build sizes its scratch from.
+    // More rays/tick = faster light propagation for more GPU; frame pacing stays
+    // owned by the cadence controller either way.
+    let rayBudgetCeiling = RAYS_PER_TICK;
+    // Ray-jitter regime (setJitterMode): 'gated' (default) = GATED BASIS — the
+    // pass-boundary rotation gate, hysteresis stable at extreme low values.
+    // 'montecarlo' = re-jitter every C0 solve tick, maximum discovery rate,
+    // stability owed entirely to the hysteresis dose (flickers at low h).
+    let jitterMode = 'gated';
     let lastTickAt = 0;
     let tickDtEma = 0;
     // Temporal cadence must survive auto-throttle's deliberate tickDtEma resets.
@@ -1141,6 +1151,9 @@ export function createProbeField({
     const pendingTransformTargets = new Set();
     let pendingAllTransforms = false;
     let pendingDeformRefresh = false;
+    const pendingMaterialValueTargets = new Set();
+    let pendingAllMaterialValues = false;
+    let lastMaterialValueRecords = 0;  // uber records rewritten by the most recent value refresh (debug/stats)
     let geoStable = -1;       // -1 = no pending geo change; >=0 = stable-check count since a change (debounce, A1)
     let checkCounter = 0;
     let lastIdleMs = Infinity;
@@ -2714,6 +2727,10 @@ export function createProbeField({
             lightResource: sharedLights,
             maps: sharedScene.maps,
             lightCount: clusteredGi ? giSelectedCount : giLegacyLightCount,
+            // Scratch + compute grids above were sized from updatedCap() at THIS
+            // moment; the tick clamps its dispatch to this snapshot so a raised
+            // budget ceiling cannot overrun a held (not-yet-rebuilt) kernel set.
+            probeCapBuilt: updatedCap(),
         };
         // Retain only after the complete graph exists. If TSL construction throws,
         // the active roots remain the sole owners and no half-built cascade leaks a ref.
@@ -2735,7 +2752,7 @@ export function createProbeField({
         // is why re-convergence took ~10 s and low hysteresis was the only way to speed
         // it up... at the price of flicker). Also sizes the per-cascade ray scratch —
         // this is the BUILD-TIME ceiling; the live per-tick count is tickCap() below.
-        return Math.max(1, Math.min(MAX_PROBES_PER_TICK, Math.floor(RAYS_PER_TICK / Math.max(1, raysPerProbe))));
+        return Math.max(1, Math.min(MAX_PROBES_PER_TICK, Math.floor(rayBudgetCeiling / Math.max(1, raysPerProbe))));
     }
     // Live per-tick probe count under the AUTO-THROTTLED ray budget (≤ updatedCap()).
     function tickCap() {
@@ -3295,17 +3312,20 @@ export function createProbeField({
         // synchronous build every tick.
         if (rebuildBackoff > 0) rebuildBackoff--;
 
-        if (dirty || !casc[0].gpu) {
+        // Topology is the RAREST change class, so a pending rest-gated rebuild
+        // gets the LOWEST scheduling priority — never a veto over the lanes
+        // beneath it. While the host keeps playing, the tick falls through:
+        // transform/deform packets and the solve keep working against the
+        // current build, and the rebuild lands at the next rest window. The
+        // FIRST bring-up still builds immediately even mid-motion: a host
+        // playing from frame 0 never gets a rest window, and there is no
+        // converged GI to disturb yet, so the one-time boot hitch is the
+        // cheaper failure mode by construction.
+        const buildHeld = !restOnly && fieldEverReady && !!casc[0].gpu;
+        if ((dirty || !casc[0].gpu) && !buildHeld) {
             // A CPU soup/kernel build is not evidence that the previous GPU
             // solve was too expensive. Keep it out of the cadence interval.
             resetFramePacing();
-            // REbuilds never run mid-motion (hitch source) — but the FIRST
-            // bring-up must: a host that is playing from frame 0 (game loop,
-            // continuous deform) otherwise never gets a rest window, and the
-            // field stays dirty forever. There is no converged GI to disturb
-            // yet, so the one-time build hitch on a boot frame is the cheaper
-            // failure mode by construction.
-            if (!restOnly && fieldEverReady) return;
             if (rebuildBackoff > 0) return;
             inFlight = true; let ok = false;
             try { ok = await rebuild(); } finally { inFlight = false; }
@@ -3317,9 +3337,8 @@ export function createProbeField({
 
         // (A2/#2) Staggered build: advance exactly ONE build stage per idle tick so no
         // single frame does 2× the build. C1 comes online one idle tick after C0. Held for rest.
-        if (buildStage < 2) {
+        if (buildStage < 2 && !buildHeld) {
             resetFramePacing();
-            if (!restOnly && fieldEverReady) return;   // same first-bring-up exception as stage 0
             inFlight = true;
             try { await advanceBuildStageC1(); } finally { inFlight = false; }
             return;
@@ -3344,8 +3363,8 @@ export function createProbeField({
                     budgetCooldown = 120; // hold ~2 s before growing again — a render-bound
                                           // scene that misses 60 fps at ANY budget otherwise
                                           // saw-tooths between floor and max
-                } else if (budgetCooldown === 0 && tickDtEma < 17.2 && tickBudgetRays < RAYS_PER_TICK) {
-                    tickBudgetRays = Math.min(RAYS_PER_TICK, tickBudgetRays + 1024);
+                } else if (budgetCooldown === 0 && tickDtEma < 17.2 && tickBudgetRays < rayBudgetCeiling) {
+                    tickBudgetRays = Math.min(rayBudgetCeiling, tickBudgetRays + 1024);
                 }
             } else if (dt >= TICK_OVERLOAD_MS && dt < TICK_PAUSE_MS) {
                 // computeAsync submits without waiting for GPU completion, so this is
@@ -3390,9 +3409,12 @@ export function createProbeField({
             lastLightSig = ls;
         }
         if (clusteredGi && giLightGridDirty) {
+            const dirtyBefore = dirty;
             inFlight = true;
             try { await flushGiLightGrid(); } finally { inFlight = false; }
-            if (disposed || dirty || giLightGridDirty) return;
+            // Abort only on state that changed UNDER the await — a rebuild that
+            // was already pending (held for rest) must not stall this tick.
+            if (disposed || (dirty && !dirtyBefore) || giLightGridDirty) return;
         }
         // Explicit host changes bypass the scene-wide/rest-only signature
         // scans. One moving object rewrites only its stable instance rows and
@@ -3406,11 +3428,21 @@ export function createProbeField({
             // it must not replay this already-committed packet as a full refit.
             lastXformSig = null;
         }
+        // Material-value packets ride THROUGH motion like transforms; no
+        // signature baseline exists to reset (no fallback scan reads values).
+        if (pendingAllMaterialValues || pendingMaterialValueTargets.size > 0) {
+            const targets = pendingAllMaterialValues ? null : Array.from(pendingMaterialValueTargets);
+            pendingAllMaterialValues = false;
+            pendingMaterialValueTargets.clear();
+            if (!refreshMaterialValues(targets)) return;
+        }
         if (pendingDeformRefresh) {
             pendingDeformRefresh = false;
+            const dirtyBefore = dirty;
             inFlight = true;
             try { await refreshDeforms(); } finally { inFlight = false; }
-            if (disposed || dirty) return;
+            // Same rule as above: a pre-existing held rebuild does not abort.
+            if (disposed || (dirty && !dirtyBefore)) return;
             lastDeformSig = null;
         }
         if (restOnly) {
@@ -3473,7 +3505,7 @@ export function createProbeField({
                 const gpu = C.gpu;
                 if (!gpu) continue;
 
-                const updated = Math.min(tickCap(), C.probeTotal);
+                const updated = Math.min(tickCap(), gpu.probeCapBuilt ?? Infinity, C.probeTotal);
                 // Normalize per CASCADE from its accepted service cadence. In partial
                 // mode C0/C1 alternate and may have very different sizes, so the old
                 // union-wide ceil(total/cap) coefficient could make the fine grid boil
@@ -3506,7 +3538,11 @@ export function createProbeField({
                 // this tick (rotation happens BEFORE any dispatch). Multi-tick (round-robin)
                 // passes keep the ROT_MIN_TICKS spacing.
                 C.ticksSinceRot++;
-                if (ci === 0 && C.probeCursor === 0 && (fullPassPerTick || C.ticksSinceRot >= ROT_MIN_TICKS)) {
+                // 'gated' (default): rotate ONLY at a C0 pass boundary — the exact
+                // legacy condition, untouched. 'montecarlo': rotate every C0 solve
+                // tick, mid-pass (see jitterMode above).
+                if (ci === 0 && (jitterMode === 'montecarlo'
+                    || (C.probeCursor === 0 && (fullPassPerTick || C.ticksSinceRot >= ROT_MIN_TICKS)))) {
                     if (C.refreshStarted && !debugFreezeRayJitter) {
                         frameCounter = (frameCounter + 1) >>> 0;
                         U.frameJitter.value = debugFrameJitterOverride ?? ((frameCounter * 0.61803398875) % 1);
@@ -3604,6 +3640,19 @@ export function createProbeField({
     function markDeformsDirty() {
         pendingDeformRefresh = true;
     }
+    // Value-only material edits (emissive, color, roughness, …). targets may be
+    // materials or meshes (expanded to their materials); null refreshes every
+    // record. Structural material changes self-escalate inside the refresh.
+    function markMaterialValuesDirty(targets = null) {
+        if (targets == null) {
+            pendingAllMaterialValues = true;
+            pendingMaterialValueTargets.clear();
+            return;
+        }
+        if (pendingAllMaterialValues) return;
+        const list = Array.isArray(targets) || targets instanceof Set ? targets : [targets];
+        for (const target of list) if (target != null) pendingMaterialValueTargets.add(target);
+    }
     function markTopologyDirty() {
         requestRebuild(true);
     }
@@ -3626,13 +3675,20 @@ export function createProbeField({
             case 'lighting':
                 forceLightingRefresh();
                 return true;
+            // Value lane, not the rebuild lane: the refresh itself detects
+            // structural material changes (reassignment, map binding, dedup
+            // split) and escalates to the full rebuild, so hosts just say
+            // "material changed" and get the cheapest correct path.
+            case 'material':
+            case 'materials':
+                markMaterialValuesDirty(change?.materials ?? change?.material ?? change?.objects ?? change?.target ?? null);
+                return true;
             case 'add':
             case 'added':
             case 'remove':
             case 'removed':
             case 'topology':
             case 'geometry':
-            case 'material':
             case 'structure':
                 markTopologyDirty();
                 return true;
@@ -3835,6 +3891,26 @@ export function createProbeField({
         if (res.bounds && built.bounds?.copy) built.bounds.copy(res.bounds);
         lastTransformInstanceCount = res.updatedInstances | 0;
         lastTlasRefitCount = res.refittedTlasNodes | 0;
+        if (Array.isArray(res.materialRanges) && res.materialRanges.length > 0) {
+            copySceneStorageRanges('materials', built.materials, res.materialRanges);
+        }
+        return true;
+    }
+    // Material-VALUE fast path: as long as the probes keep tracing, a
+    // non-structural material edit is FREE — the affected resident uber records
+    // are rewritten in place (spectral_scene updateMaterialValues) and those few
+    // floats re-uploaded; the field re-converges through the bounded per-texel
+    // change detector, multi-bounce included. No soup rewrite, no MeshBVH, no
+    // recompile. Structural drift (map binding, material reassignment, dedup
+    // split) fails closed to the full rebuild lane at its usual lowest priority.
+    function refreshMaterialValues(targets = null) {
+        const built = cachedBuilt;
+        if (!built?.updateMaterialValues || !casc[0].gpu) return false;
+        if (sceneResource?.built !== built) { requestRebuild(); return false; }
+        let res = null;
+        try { res = built.updateMaterialValues(targets == null ? undefined : { materials: targets }); } catch { res = null; }
+        if (!res) { requestRebuild(); return false; }
+        lastMaterialValueRecords = res.updatedRecords | 0;
         if (Array.isArray(res.materialRanges) && res.materialRanges.length > 0) {
             copySceneStorageRanges('materials', built.materials, res.materialRanges);
         }
@@ -4150,6 +4226,8 @@ export function createProbeField({
         pendingTransformTargets.clear();
         pendingAllTransforms = false;
         pendingDeformRefresh = false;
+        pendingMaterialValueTargets.clear();
+        pendingAllMaterialValues = false;
         buildDirty = true;
         node.setEnabled(false);
     }
@@ -4200,6 +4278,21 @@ export function createProbeField({
             requestRebuild(false); // ray budget only → reuse cached BVH+textures (kernel rebuild, no MeshBVH stall)
         },
         getRays: () => raysPerProbe,
+        // ── STRUCTURAL knob: per-tick trace budget. More rays/tick = faster light
+        // propagation for more GPU; the cadence controller still shrinks the live
+        // budget on frame-time pressure, so pacing is protected at any target.
+        // Kernel rebuild only (scratch is budget-sized) — cached BVH soup reused.
+        // Note MAX_PROBES_PER_TICK (2048) still bounds probes/tick, so at low
+        // rays/probe a very high budget saturates early (e.g. 131k rays @64).
+        setRayBudget: (v) => {
+            if (!Number.isFinite(v)) return;
+            const budget = THREE.MathUtils.clamp(Math.round(v), RAYS_PER_TICK_MIN, 524_288);
+            if (budget === rayBudgetCeiling) return;
+            rayBudgetCeiling = budget;
+            tickBudgetRays = budget;   // take effect now; the throttle pulls back if the GPU can't
+            requestRebuild(false);
+        },
+        getRayBudget: () => rayBudgetCeiling,
         // ── UNIFORM knobs (apply INSTANTLY — no recompile, no rebuild). ──
         setFilterStrength: (v) => { if (Number.isFinite(v)) U.filterStrength.value = THREE.MathUtils.clamp(v, 0, 1); }, // CORE denoise: 0 = off (harness baseline), 1 = full
         setSmoothness: (v) => { if (Number.isFinite(v)) U.filterSmooth.value = THREE.MathUtils.clamp(v, 0, 1); }, // UI "Smoothness": widen the denoise edge-stop
@@ -4214,6 +4307,14 @@ export function createProbeField({
             if (!hysteresisNormalize) U.hysteresisExponent.value = 1;
         },
         getHysteresisNormalization: () => hysteresisNormalize,
+        // Ray-jitter regime: 'gated' (GATED BASIS, default) vs 'montecarlo'.
+        // CPU-side gate decision only — instant, no recompile, no rebuild.
+        setJitterMode: (mode) => {
+            const m = String(mode ?? '').toLowerCase().replace(/[\s_-]/g, '');
+            if (m === 'gated' || m === 'gatedbasis') jitterMode = 'gated';
+            else if (m === 'montecarlo' || m === 'mc') jitterMode = 'montecarlo';
+        },
+        getJitterMode: () => jitterMode,
         setNormalBias: (v) => {
             if (!Number.isFinite(v)) return;
             normalBiasScale = THREE.MathUtils.clamp(v, 0, 8);   // × the auto minCell·SURFACE_NORMAL_BIAS_CELL offset
@@ -4290,6 +4391,7 @@ export function createProbeField({
         requestRebuild,
         markTransformsDirty,
         markDeformsDirty,
+        markMaterialValuesDirty,
         markTopologyDirty,
         notifySceneChange,
         setBounds,
@@ -4340,6 +4442,7 @@ export function createProbeField({
             hysteresisExponent: U.hysteresisExponent.value,
             frameJitter: U.frameJitter.value,
             frameCounter,
+            jitterMode,
             tickBudgetRays,
             tickDtEma,
             sceneResourceRefs: sceneResource?.refs || 0,
@@ -4383,6 +4486,8 @@ export function createProbeField({
                 : null,
             pendingTransformCount: pendingAllTransforms ? -1 : pendingTransformTargets.size,
             pendingDeformRefresh,
+            pendingMaterialValueCount: pendingAllMaterialValues ? -1 : pendingMaterialValueTargets.size,
+            lastMaterialValueRecords,
             solveList: lastSolveList,
             updatedCount: lastUpdatedCount,
             cascades: cascades,

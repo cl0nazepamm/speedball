@@ -5,6 +5,37 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Structural rebuilds are now the lowest-priority lane: a rest-held rebuild no
+  longer vetoes the continuous lanes, so explicit transform/deform packets and
+  the solve keep flowing while topology churn holds a rebuild pending (the
+  current build keeps serving until the scheduler reaches it at rest). Downstream
+  await blocks abort only on a rebuild newly armed under them, never on a
+  pre-existing held one. Verified on the churn harness with every lane running:
+  transform packets land each tick at an 8 ms worst frame while the rebuild
+  stays held, then land kernel-resident at rest.
+- Material-VALUE fast lane: scalar/color material edits (emissive strength,
+  color, roughness, ...) rewrite the affected resident uber records in place —
+  the twin of `updateLights` — and re-upload only those floats. No BVH, no
+  kernel, flows mid-motion beside the transform lane. Structural drift
+  (map-binding change, material reassignment, dedup split) fails closed to the
+  full rebuild lane. `notifySceneChange('material')` now routes here instead of
+  straight to a rebuild; new `markMaterialValuesDirty(targets)` API. Verified
+  live: one record rewritten mid-churn with zero rebuild armed.
+- `setRayBudget(raysPerTick)` / `getRayBudget()`: the per-tick trace budget the
+  cadence auto-throttle recovers toward is now a knob (default unchanged at
+  98,304). More rays/tick converges light faster for more GPU; frame pacing
+  stays owned by the controller, and a held rebuild can never dispatch beyond
+  the scratch its kernels were built with. Changing it is a rest-gated kernel
+  rebuild (cached BVH soup reused).
+- `setJitterMode('gated' | 'montecarlo')`: runtime switch between the shipped
+  pass-boundary rotation gate ("gated basis" — hysteresis stable at extreme low
+  values) and per-solve-tick re-jitter ("monte carlo" — maximum discovery rate,
+  stability owed entirely to the hysteresis dose). Default 'gated' is the exact
+  legacy condition, untouched; the switch is a CPU-side gate decision with no
+  recompile.
+- Churn harness: hysteresis + normalization, jitter-basis, and rays/tick GUI
+  rows; the emissive slider and pendant toggle now send material events so
+  value edits reach the trace live when explicit events are on.
 - Textured structural rebuilds now keep material-map `DataArrayTexture`
   identities resident through a per-probe-field capacity arena. The six PBR
   map types reserve 1.5x layer headroom, stage async extraction until the build
