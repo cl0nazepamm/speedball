@@ -28,38 +28,6 @@
 <div id="bootwash"></div>
 
 <div id="ui">
-  <header class="topstrip">
-    <div class="brand">
-      <a class="brand-pill" href="https://github.com/cl0nazepamm/speedball" target="_blank" rel="noreferrer">SPEEDBALL<i class="arrow"></i></a>
-      <div class="brand-mark">/ GI</div>
-      <div class="brand-meta">
-        <span id="scene-meta">SPONZA + PREETHAM SKY</span>
-      </div>
-    </div>
-
-    <div class="topcenter">
-      <span class="live">LIVE FIELD</span>
-      <i class="sep"></i>
-      <span id="engine-note">PHOTON CAUSTIC · REFLECTION · DDGI</span>
-    </div>
-
-    <nav class="nav">
-      <!-- One Sponza scene, two install-time lighting structures. -->
-      <div class="seg" role="group" aria-label="Sponza lighting">
-        <button id="scene-sun" type="button" aria-pressed="true">SUN</button>
-        <button id="scene-cluster" type="button" aria-pressed="false">50 LIGHTS</button>
-      </div>
-      <i class="divider"></i>
-      <!-- Light-transport engine. Exclusive: only one runs at a time. -->
-      <div class="seg" role="group" aria-label="Engine">
-        <button id="engine-raster" type="button" aria-pressed="true">RASTER</button>
-        <button id="engine-pt" type="button" aria-pressed="false">PATH TRACE</button>
-      </div>
-      <i class="divider"></i>
-      <button id="gui-toggle" type="button" aria-pressed="false"><span class="num">[ ]</span>ADVANCED</button>
-    </nav>
-  </header>
-
   <!-- Transport: drives the centre sphere so the GI lane can be watched reacting
        to real motion rather than to a still frame. -->
   <div class="transport" id="transport">
@@ -91,9 +59,9 @@
         <i class="glyph" aria-hidden="true"></i><span class="label">ANIMATE</span>
       </button>
       <i class="rule"></i>
-      <div class="readout transport-stat"><span class="k">Effect</span><span class="v accent" id="t-effect">METAL · CAUSTIC</span></div>
+      <button id="gui-toggle" type="button" aria-pressed="false"><span class="num">[ ]</span><span>ADVANCED</span></button>
       <i class="rule transport-stat"></i>
-      <div class="readout transport-stat"><span class="k">Engine</span><span class="v" id="t-engine">RASTER</span></div>
+      <div class="readout transport-stat"><span class="k">Effect</span><span class="v accent" id="t-effect">METAL · CAUSTIC</span></div>
       <i class="rule transport-stat"></i>
       <div class="readout transport-stat"><span class="k" id="t-metric-k">FPS</span><span class="v" id="t-metric">—</span></div>
     </div>
@@ -112,7 +80,6 @@ import { positionWorld, normalWorld, pass } from 'three/tsl';
 import { FilmPipeline, FILM_PRESETS, applyFilmPreset, filmPass } from 'powershot-threejs';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
-import { createSpectralTracer } from './js/spectral_tracer.js';
 import { createCausticEngine, causticReceiverFloor } from './js/caustic_engine.js';
 
 // ── Scene ──────────────────────────────────────────────────────────────────────
@@ -271,12 +238,6 @@ const params = {
   ballOrbit: 2.6, ballSpeed: 0.22, ballBob: 0.55,
   // Cluster mode: the point-light grid.
   lightCount: 50, lightIntensity: 8, lightRange: 7, markers: true,
-  // Spectral path tracer. ptEnvIntensity is an EYEBALL match, not a conversion:
-  // the raster GI lane multiplies its sky term by giSky and its bounce by
-  // giIntensity, and giIntensity is an artistic gain with no physical counterpart
-  // in an integrator — so there is no factor that makes the two agree by
-  // construction. This is the knob for matching them by eye.
-  ptSamplesPerFrame: 1, ptSampleLimit: 2048, ptEnvIntensity: 16,
   // PowerShot film (pinned look — one Film checkbox). Kodak 500T + these overrides.
   filmEnabled: true, filmStock: 'kodak_500t', filmAmount: 1.0, filmExposure: 1.55, filmGamma: 0.6,
   filmGrain: 0, filmGrainSize: 2.35, filmGrainSat: 0.8,
@@ -359,21 +320,10 @@ function updateSun() {
   markGiInteraction();
 }
 
-let lastInteractionMs = 0;
-let guiInteractionActive = false;
-let guiRestUntilMs = 0;
 let sunGiDirty = false;
-const GUI_REST_MS = 450;
-function markInteraction() { lastInteractionMs = performance.now(); }
-function markGiInteraction() { markInteraction(); gi?.markInteraction?.(); }
-function markGuiInteraction() {
-  const now = performance.now();
-  lastInteractionMs = now;
-  guiRestUntilMs = now + GUI_REST_MS;
-}
-function guiIsInteracting() {
-  return guiInteractionActive || performance.now() < guiRestUntilMs;
-}
+function markInteraction() { gi?.markInteraction?.(); }
+function markGiInteraction() { markInteraction(); }
+function markGuiInteraction() { markInteraction(); }
 function flushSunGiRefresh() {
   if (gi?.forceLightingRefresh) {
     gi.forceLightingRefresh();
@@ -400,16 +350,15 @@ const gui = new GUI({ title: 'SPEEDBALL GI · Sky' });
 function installGuiIdleGate(gui) {
   const el = gui?.domElement;
   if (!el) return;
-  const begin = () => { guiInteractionActive = true; markGuiInteraction(); };
+  const begin = () => { markGuiInteraction(); };
   const touch = () => { markGuiInteraction(); };
-  const end = () => { if (!guiInteractionActive) return; guiInteractionActive = false; markGuiInteraction(); };
+  const end = () => { markGuiInteraction(); };
   for (const type of ['pointerdown', 'mousedown', 'touchstart']) el.addEventListener(type, begin, true);
   for (const type of ['pointermove', 'mousemove', 'touchmove', 'wheel', 'input', 'change', 'keydown']) el.addEventListener(type, touch, true);
   for (const type of ['pointerup', 'mouseup', 'touchend', 'touchcancel', 'blur']) window.addEventListener(type, end, true);
 }
 installGuiIdleGate(gui);
-// CONTROLS in the top strip parks the whole panel off-screen — the render is the
-// specimen, so it has to be possible to clear the glass off it.
+// Advanced lives with the other bottom-deck controls and parks the panel off-screen.
 const guiToggleEl = document.getElementById('gui-toggle');
 gui.domElement.classList.add('gui-hidden');
 guiToggleEl.addEventListener('click', () => {
@@ -436,7 +385,7 @@ function prepareSponzaMaterialForGi(material) {
 
   // This Sponza glTF imports with scalar metalness = 1 on stone/fabric surfaces.
   // SPEEDBALL GI intentionally kills diffuse bounce for metals, so normalize the demo
-  // asset to dielectric before the spectral scene is packed.
+  // asset to dielectric before the GI trace scene is packed.
   if (Number.isFinite(material.metalness) && material.metalness > 0.5) {
     material.metalness = 0;
     material.needsUpdate = true;
@@ -654,9 +603,6 @@ let metalCaustics = null;
 let glassCaustics = null;
 let causticCaster = null;
 let causticLastSyncMs = 0;
-let engine = 'raster';
-let tracer = null;
-const engineNoteEl = document.getElementById('engine-note');
 let playing = false;
 let animClock = 0;          // seconds of animation played, paused-time excluded
 let lastAnimMs = 0;
@@ -763,10 +709,8 @@ function setBallMode(next, { initial = false } = {}) {
     // type-3 NEE source without rebuilding its geometry.
     gi?.markMaterialValuesDirty?.(ball);
     gi?.forceLightingRefresh?.();
-    tracer?.markSceneDirty?.();
   }
   if (!initial) markGiInteraction();
-  updateEngineNote();
 }
 
 for (const mode of Object.keys(BALL_MODE_COPY)) {
@@ -781,7 +725,6 @@ fBall.add(params, 'ballRoughness', 0, 0.6, 0.005).name('roughness').onChange((v)
   ball.material.roughness = params.ballMode === 'glass' ? Math.min(v, 0.18) : v;
   activeCaustics()?.setRoughness(ball.material.roughness);
   gi?.markMaterialValuesDirty?.(ball);
-  tracer?.markSceneDirty?.();
   markGiInteraction();
 });
 fBall.add(params, 'ballOrbit', 0, 6, 0.05).name('orbit radius').onChange(markInteraction);
@@ -794,32 +737,17 @@ if (CLUSTER) {
   fLights.add(params, 'lightCount', 10, 500, 10).name('light count (stress)').onFinishChange((v) => {
     rebuildLights(v);
     gi.forceLightingRefresh();     // count change = arena refill in clustered mode, never a rebuild
-    tracer?.markLightsDirty();
   });
   fLights.add(params, 'lightIntensity', 0, 40, 0.1).name('intensity').onChange((v) => {
     for (const l of pointLights) l.intensity = v;
     gi.forceLightingRefresh();
-    tracer?.markLightsDirty();
   });
   fLights.add(params, 'lightRange', 0, 20, 0.1).name('range').onChange((v) => {
     for (const l of pointLights) l.distance = v;
     gi.forceLightingRefresh();     // the light lane catches this within ~6 ticks; kick it for instant response
-    tracer?.markLightsDirty();
   });
   fLights.add(params, 'markers').name('markers').onChange((v) => { if (markerMesh) markerMesh.visible = v; });
 }
-
-// ── Spectral path tracer ──────────────────────────────────────────────────────
-// Live setOptions writes only — changing either knob restarts accumulation, which
-// is exactly what should happen when the integrator's terms move.
-const fPt = gui.addFolder('Path tracer');
-fPt.add(params, 'ptSamplesPerFrame', 1, 8, 1).name('samples / frame').onChange((v) => tracer?.setOptions({ samplesPerFrame: v }));
-fPt.add(params, 'ptSampleLimit', 64, 8192, 64).name('SPP limit').onChange((v) => tracer?.setOptions({ sampleLimit: v }));
-fPt.add(params, 'ptEnvIntensity', 0, 64, 0.5).name('sky gain').onChange((v) => {
-  // Read off scene.environmentIntensity per frame by the tracer; a change resets
-  // accumulation, which is correct — the integrand moved.
-  if (skyEnvTexture) scene.environmentIntensity = v;
-});
 
 if (compactControls.matches) gui.close();
 
@@ -851,12 +779,9 @@ function updateBallAnimation(nowMs) {
   ball.updateMatrixWorld(true);
   gi?.markTransformsDirty?.(ball);
   syncActiveCaustic(nowMs);
-  // Every move invalidates path-trace accumulation.
-  tracer?.markTransformsDirty();
 }
 
 const playEl = document.getElementById('play');
-const tEngineEl = document.getElementById('t-engine');
 const tEffectEl = document.getElementById('t-effect');
 const tMetricEl = document.getElementById('t-metric');
 const tMetricKEl = document.getElementById('t-metric-k');
@@ -1137,104 +1062,10 @@ function updateProbeHelpers() {
   probeHelperMesh.visible = true;
 }
 
-// ── Sky environment for the path tracer ───────────────────────────────────────
-// The Preetham dome is excluded from the traced scene (excludeFromGI), so with no
-// environment the tracer integrates sun-only light while the raster GI enjoys the
-// SH sky — the A/B would be comparing two different worlds. Bake the SAME
-// zenith/horizon/ground model that updateGiSky feeds the probes into a small
-// equirect and hand it to the tracer through the documented
-// scene.userData.maxjsPathTraceEnvironment hook, so both engines integrate one
-// sky definition. No sun disc is drawn into it: the directional sun is already an
-// explicit light record, and painting it here would double-count it.
-const SKY_ENV_W = 128, SKY_ENV_H = 64;
-let skyEnvTexture = null;
-let prevEnvIntensity = null;
-function buildSkyEnvTexture() {
-  updateGiSky();   // refresh _giSky* from the current turbidity/rayleigh/elevation
-  const data = new Float32Array(SKY_ENV_W * SKY_ENV_H * 4);
-  for (let y = 0; y < SKY_ENV_H; y++) {
-    // three's equirectUV puts v = asin(dir.y)/π + 0.5, and DataTexture does not
-    // flip, so row 0 is the nadir and the last row is the zenith.
-    const sinElev = ((y + 0.5) / SKY_ENV_H - 0.5) * 2;
-    const k = Math.pow(Math.abs(sinElev), 0.6);
-    const to = sinElev >= 0 ? _giSkyZenith : _giSkyGround;
-    const r = THREE.MathUtils.lerp(_giSkyHorizon.r, to.r, k);
-    const g = THREE.MathUtils.lerp(_giSkyHorizon.g, to.g, k);
-    const b = THREE.MathUtils.lerp(_giSkyHorizon.b, to.b, k);
-    for (let x = 0; x < SKY_ENV_W; x++) {
-      const i = (y * SKY_ENV_W + x) * 4;
-      data[i] = r; data[i + 1] = g; data[i + 2] = b; data[i + 3] = 1;
-    }
-  }
-  const tex = new THREE.DataTexture(data, SKY_ENV_W, SKY_ENV_H, THREE.RGBAFormat, THREE.FloatType);
-  tex.mapping = THREE.EquirectangularReflectionMapping;
-  tex.colorSpace = THREE.LinearSRGBColorSpace;
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  tex.wrapS = THREE.RepeatWrapping;
-  tex.needsUpdate = true;
-  return tex;
-}
-
-function attachSkyEnv() {
-  if (CLUSTER) return;    // no sky in cluster mode; the grid is the only source
-  releaseSkyEnv();
-  skyEnvTexture = buildSkyEnvTexture();
-  scene.userData.maxjsPathTraceEnvironment = skyEnvTexture;
-  // The tracer reads its env gain off scene.environmentIntensity every frame.
-  // Safe to set here: this scene has no scene.environment, so the raster path
-  // never sees it. Save and restore anyway rather than assuming that stays true.
-  prevEnvIntensity = scene.environmentIntensity;
-  scene.environmentIntensity = params.ptEnvIntensity;
-}
-function releaseSkyEnv() {
-  if (scene.userData.maxjsPathTraceEnvironment === skyEnvTexture) {
-    delete scene.userData.maxjsPathTraceEnvironment;
-  }
-  if (prevEnvIntensity !== null) { scene.environmentIntensity = prevEnvIntensity; prevEnvIntensity = null; }
-  skyEnvTexture?.dispose();
-  skyEnvTexture = null;
-}
-
-// ── Light-transport engine: raster GI ↔ spectral path tracer ─────────────────
-// Exclusive by construction. Both engines trace the same BVH-backed scene, so the
-// switch is a fair A/B: same geometry, same lights, same camera — one converges
-// probes and rasterises, the other integrates paths.
-//
-// Teardown discipline (the whole point of an exclusive switch):
-//   • the tracer is DISPOSED on the way out, not just paused — it owns GPU
-//     buffers for the whole scene BVH and would otherwise sit on them;
-//   • the render target is unbound, since the tracer blits through its own;
-//   • the GI field is told the view just moved, so returning to raster does not
-//     dump a full solve into the first frame after the switch;
-//   • the switch is locked while the tracer is arming, so a double-click cannot
-//     leave two engines half-alive.
-let prevDamping = null;
-const engineRasterEl = document.getElementById('engine-raster');
-const enginePtEl = document.getElementById('engine-pt');
-const PT_NOTE = 'SPECTRAL PATH TRACE · PROGRESSIVE · GROUND TRUTH';
-
-function updateEngineNote() {
-  engineNoteEl.textContent = engine === 'pt' ? PT_NOTE : BALL_MODE_COPY[params.ballMode];
-}
-
-function disposeTracer() {
-  if (!tracer) return;
-  const t = tracer;
-  tracer = null;                 // drop the handle FIRST: the render loop must not
-  t.dispose();                   // touch a tracer that is mid-teardown
-  renderer.setRenderTarget(null);
-  releaseSkyEnv();               // the baked equirect exists only for the tracer
-  if (prevDamping !== null) { controls.enableDamping = prevDamping; prevDamping = null; }
-}
-
 async function disposeForStructuralReload() {
-  // Both scene and reflection quality rebuild install-time GPU structure. Stop the
-  // submitting loop first, then release the compute owners and WebGPU device before
-  // asking the next document to create its renderer. Without this handoff, repeated
-  // High <-> Ultra changes can race the old device teardown and fall back to WebGL2.
+  // Reflection quality and optional scene query modes rebuild install-time GPU
+  // structure. Retire the old device before the next document allocates one.
   renderer.setAnimationLoop(null);
-  disposeTracer();
   disposeBallCaustics();
   gi?.dispose?.();
   controls.dispose();
@@ -1246,141 +1077,9 @@ async function disposeForStructuralReload() {
   if (deviceLost) await deviceLost;
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
+window.addEventListener('pagehide', disposeBallCaustics);
 
-function setEngine(next) {
-  if (next === engine) return;
-  if (next === 'pt' && !tracer) {
-    // A progressive integrator and a moving subject cancel each other out: every
-    // frame of motion throws the accumulation away. Park the transport so the
-    // first traced image actually converges.
-    if (playing) setPlaying(false);
-    // Damping keeps writing the camera matrix for a second or more after the
-    // mouse is released, and the tracer throws away its accumulation on ANY
-    // camera change — so with damping on the image never banks more than a
-    // sample or two. Park it while tracing; the drag itself stays 1:1, it just
-    // stops coasting, and the frame starts converging the instant you let go.
-    prevDamping = controls.enableDamping;
-    controls.enableDamping = false;
-    controls.update();   // flush the in-flight coast so the first traced frame is at rest
-    enginePtEl.dataset.busy = '1';
-    engineRasterEl.dataset.busy = '1';
-    setStatus('building spectral BVH…');
-    attachSkyEnv();   // must be on the scene BEFORE the tracer builds its scene
-    tracer = createSpectralTracer({
-      renderer, scene, camera,
-      enabled: true,
-      settings: {
-        samplesPerFrame: params.ptSamplesPerFrame,
-        sampleLimit: params.ptSampleLimit,
-        // Primary-miss rays return black. The Preetham sky dome is excluded from
-        // the traced scene (excludeFromGI), so there is no env to show anyway —
-        // claiming one would just be a lie in the background.
-        envBackground: false,
-      },
-      onStatus: (msg) => setStatus(String(msg)),
-      onError: (err) => { console.error('spectral tracer', err); setStatus('Path tracer:\n' + (err?.message || err), true); },
-    });
-    if (!tracer.isSupported()) {
-      setStatus('The spectral path tracer needs WebGPU storage features.', true);
-      disposeTracer();
-      delete enginePtEl.dataset.busy; delete engineRasterEl.dataset.busy;
-      return;
-    }
-    tracer.start();
-    tracer.prebuild();
-    delete enginePtEl.dataset.busy; delete engineRasterEl.dataset.busy;
-    hideStatus();
-  } else if (next === 'raster') {
-    disposeTracer();
-    // Coming back from a trace, the probe field has been sitting un-updated for
-    // however long the trace ran — its temporal state, and the rough-reflection
-    // cache riding on it, are stale. Marking an interaction alone only defers the
-    // solve; it does not ask for one, which leaves the mirror sphere reflecting a
-    // cache that was never refreshed. Force the lighting refresh and a rebuild so
-    // the first settled raster frame is actually current.
-    markGiInteraction();
-    gi?.forceLightingRefresh?.();
-    gi?.requestRebuild?.();
-    renderer.toneMapping = params.filmEnabled ? THREE.NoToneMapping : THREE.NeutralToneMapping;
-    hideStatus();
-  }
-  engine = next;
-  engineRasterEl.setAttribute('aria-pressed', String(engine === 'raster'));
-  enginePtEl.setAttribute('aria-pressed', String(engine === 'pt'));
-  updateEngineNote();
-  tEngineEl.textContent = engine === 'pt' ? 'PATH TRACE' : 'RASTER';
-  tEngineEl.classList.toggle('accent', engine === 'pt');
-  window.tracer = tracer;
-  window.overlayStats = () => ({ paints: overlayPaints, previewing: ptPreviewing, engine });
-}
-engineRasterEl.addEventListener('click', () => setEngine('raster'));
-enginePtEl.addEventListener('click', () => setEngine('pt'));
-// A tab close must not leave tracer or photon buffers alive.
-window.addEventListener('pagehide', () => { disposeTracer(); disposeBallCaustics(); });
-
-// ── Scene buttons — see SCENE_MODE: install-time, so they reload ─────────────
-document.getElementById('scene-meta').textContent = CLUSTER ? 'SPONZA + 50 LIGHTS' : MODEL.meta;
-for (const [id, mode] of [['scene-sun', 'sun'], ['scene-cluster', 'cluster']]) {
-  const el = document.getElementById(id);
-  el.setAttribute('aria-pressed', String(SCENE_MODE === mode));
-  el.addEventListener('click', () => {
-    if (SCENE_MODE === mode) return;
-    reloadWithStructuralSetting('scene', mode, 'sun');
-  });
-}
-
-// ── PT raster overlay ─────────────────────────────────────────────────────────
-// Holding a mouse button on the canvas while path tracing drops to the raster GI
-// frame instantly: it costs ~7ms, it is already resident (the field stays
-// installed while tracing, only its solve is parked), and it shows the same
-// world — so it is the cheap way to look around or reframe without waiting on
-// the integrator.
-//
-// Bound to the drag itself rather than to camera motion: every button on this
-// canvas moves the camera (left orbits, right pans, middle dollies), so pressing
-// one IS the intent to move. Watching the camera matrix instead fires on drift
-// far too small to see and makes the traced image flicker away underneath you.
-// The overlay only takes over presentation — the tracer keeps its accumulation,
-// so letting go shows the traced frame exactly as it was.
-let ptPreviewing = false;
-let overlayPaints = 0;   // diagnostics handle
-
-// Painting the overlay from the ANIMATION LOOP is too late. A traced frame costs
-// ~140ms on this scene, so the loop ticks at ~7Hz: the press sets the flag
-// instantly, but the pixels only change on the next rAF — up to a frame of dead
-// time with the button already down, which reads as "the click didn't register".
-// Paint straight out of the event handler instead. By the time a pointer event is
-// delivered the rAF callback has already returned (single thread), so this is
-// just an extra cheap draw, and it lands on the press rather than after it.
-function paintRasterOverlay() {
-  renderer.toneMapping = THREE.NeutralToneMapping;
-  renderer.render(scene, camera);
-  overlayPaints++;
-}
-const endOverlay = () => { ptPreviewing = false; };
-renderer.domElement.addEventListener('pointerdown', () => {
-  ptPreviewing = true;
-  if (engine === 'pt') paintRasterOverlay();
-}, { capture: true });   // ahead of OrbitControls' own handler
-// Release is watched on the window, not the canvas: a drag that ends off-canvas
-// (or off-window) must still clear, or the overlay latches on forever.
-window.addEventListener('pointerup', endOverlay);
-window.addEventListener('pointercancel', endOverlay);
-window.addEventListener('blur', endOverlay);
-
-// The SOLVER marker in the top strip reflects the real idle gate rather than
-// blinking decoratively: held while the view moves, solving once it rests.
-let solverStateDueMs = 0;
-function updateSolverMarker(nowMs) {
-  if (nowMs < solverStateDueMs) return;
-  solverStateDueMs = nowMs + 200;
-  const solving = engine === 'raster'
-    ? gi?.hasData?.() !== false && performance.now() - lastInteractionMs >= GUI_REST_MS
-    : tracer?.isStarted() === true && !ptPreviewing;
-  uiEl.classList.toggle('solving', solving);
-}
-
-// ── Transport readout: FPS while rastering, sample count while tracing ────────
+// ── Transport readout ─────────────────────────────────────────────────────────
 let fpsFrames = 0, fpsWindowMs = 0, readoutDueMs = 0;
 function updateTransportReadout(nowMs) {
   fpsFrames++;
@@ -1402,51 +1101,15 @@ function updateTransportReadout(nowMs) {
     tEffectEl.classList.toggle('accent', caustic.converged);
   }
 
-  if (engine === 'pt') {
-    // Progressive tracing: samples, not framerate, is the number that matters —
-    // except while the overlay is up, when nothing is being sampled at all and a
-    // frozen spp count would read as a stall rather than as a deliberate skip.
-    if (ptPreviewing) {
-      tMetricKEl.textContent = 'VIEW';
-      tMetricEl.textContent = 'RASTER';
-      tMetricEl.classList.remove('accent');
-    } else {
-      const spp = tracer?.getSampleCount() ?? 0;
-      const done = spp >= params.ptSampleLimit;
-      tMetricKEl.textContent = 'SPP';
-      tMetricEl.textContent = `${spp} / ${params.ptSampleLimit}`;
-      tMetricEl.classList.toggle('accent', done);
-    }
-  } else {
-    tMetricKEl.textContent = 'FPS';
-    tMetricEl.textContent = String(fps).padStart(2, '0');
-    tMetricEl.classList.remove('accent');
-  }
+  tMetricKEl.textContent = 'FPS';
+  tMetricEl.textContent = String(fps).padStart(2, '0');
+  tMetricEl.classList.remove('accent');
 }
 
 renderer.setAnimationLoop((nowMs) => {
   controls.update();
   updateBallAnimation(nowMs);
-  updateSolverMarker(nowMs);
   updateTransportReadout(nowMs);
-
-  if (engine === 'pt') {
-    // Pressed → overlay. FIRST, and unconditionally: nothing below may pre-empt
-    // it. Behind the tracer guards this was dead during the very window it is
-    // most wanted — the initial BVH build returns early on !isSceneBuilt(), so
-    // holding the mouse through a build left the canvas frozen instead of
-    // showing the raster frame.
-    // (The press itself already painted one of these from the event handler; this
-    // is what keeps the overlay live for the rest of the drag — cheap, so the
-    // loop runs at raster rate while the button is down.)
-    if (ptPreviewing) { paintRasterOverlay(); return; }
-    // Path trace owns the rest of the frame outright: no GI solve, no probe
-    // helpers, no film chain. The tracer presents to the canvas itself.
-    if (!tracer) return;
-    if (!tracer.isSceneBuilt()) { tracer.prebuild(); return; }
-    tracer.render();
-    return;
-  }
 
   if (sunGiDirty) flushSunGiRefresh();
   activeCaustics()?.update();

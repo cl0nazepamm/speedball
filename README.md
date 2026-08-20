@@ -26,8 +26,7 @@ re-jitters every solve and uses 0.90 hysteresis to absorb that sample blast.
 
 Locally: `npm start` then open `http://127.0.0.1:8777/`. The centre-sphere
 buttons switch live between emissive-mesh NEE, reflective-metal caustics, and
-refractive glass caustics; the same page also carries the sun/clustered and
-raster/path-trace comparisons.
+refractive glass caustics in one raster GI scene.
 
 Requires a WebGPU-capable browser (Chrome/Edge stable; Safari 26+).
 

@@ -5,6 +5,9 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Simplified the public Sponza page to one raster GI instrument: removed its top
+  bar and embedded path-tracer runtime, and moved Advanced into the bottom deck.
+  The package path-tracer modules and exports are unchanged.
 - Fixed Gated ray-basis startup being dependent on probe-batch divisibility. A
   one-batch field previously re-jittered every six solves and looked like Monte
   Carlo until resize or a divisions change altered the adaptive batch modulo.
