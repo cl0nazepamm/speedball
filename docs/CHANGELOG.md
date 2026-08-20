@@ -9,7 +9,8 @@ All notable changes to Speedball GI are documented here. This project follows
   now disables its three halo passes, PowerShot receives scene-linear input through
   `RenderPipeline`, the diagnostic sphere no longer invalidates the full 2048²
   103-caster shadow map while moving, and opaque UI chrome replaces live canvas
-  backdrop blur. Sun/light refreshes, resize allocation, and hidden Advanced GUI
+  backdrop blur. The full-resolution scene pass is single-sampled instead of 4x
+  MSAA by default. Sun/light refreshes, resize allocation, and hidden Advanced GUI
   synchronization are coalesced to frame boundaries; dead hidden FPS DOM work and
   the internal-node probe visualizer were removed.
 - Added complete demo teardown for GI, post nodes/targets, film targets, scene

@@ -144,7 +144,9 @@ window.addEventListener('unhandledrejection', onUnhandledRejection);
 
 // ── Renderer ────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('c');
-const renderer = new THREE.WebGPURenderer({ canvas, antialias: true });
+// At 4K, 4x MSAA multiplies the full-resolution scene-pass bandwidth before
+// PowerShot even develops the frame. Keep the demo single-sampled by default.
+const renderer = new THREE.WebGPURenderer({ canvas, antialias: false });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.NeutralToneMapping;
