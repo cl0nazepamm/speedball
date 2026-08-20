@@ -211,7 +211,7 @@ input:focus-visible { outline: 1px solid var(--v2-blue); outline-offset: 2px; }
     border-right: 1px solid var(--v2-rule);
 }
 
-.hysteresis-meter input { background: linear-gradient(90deg, #656565 0 var(--danger-stop), #b3b3b3 var(--danger-stop) 100%); }
+.hysteresis-meter input { background: linear-gradient(90deg, var(--v2-red) 0 var(--danger-stop), #b3b3b3 var(--danger-stop) 100%); }
 .hysteresis-meter input::-webkit-slider-thumb { background: #f5f5f5; }
 .meter-head,
 .meter-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
