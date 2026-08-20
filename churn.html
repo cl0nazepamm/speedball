@@ -553,7 +553,7 @@ const giTune = {
   giIntensity: 20, giSky: 0, giDepthSharpness: 2, giDivisions: 16, giRays: 64,
   giRayBudget: 98304,                                // per-tick trace budget (light speed vs GPU)
   giJitterMode: 'gated',                             // 'gated' basis vs 'montecarlo' re-jitter
-  giHysteresis: 0.95, giHysteresisNormalize: true,   // field defaults
+  giHysteresis: gi.getHysteresis?.() ?? 0.6, giHysteresisNormalize: true,
   giFireflyClamp: 6,                                 // temporal clamp band in σ (GI_TEMPORAL_CLAMP_SIGMA)
 };
 const gui = new GUI({ title: 'GI' });
@@ -580,11 +580,15 @@ gui.add(giTune, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi
 // cadence controller either way — this trades GPU headroom for convergence
 // latency (a full pass = probes × rays/probe ÷ this).
 gui.add(giTune, 'giRayBudget', 8192, 524288, 8192).name('rays / tick').onChange((v) => { gi.setRayBudget?.(v); gi.markInteraction?.(); });
-// Jitter regime: 'gated' rotates the ray set only at pass boundaries (hysteresis
-// stable even at extreme low values); 'montecarlo' re-jitters every solve tick
-// (max discovery, disco at low hysteresis). Pair with the hysteresis slider.
-gui.add(giTune, 'giJitterMode', ['gated', 'montecarlo']).name('jitter basis').onChange((v) => gi.setJitterMode?.(v));
-gui.add(giTune, 'giHysteresis', 0, 0.99, 0.01).name('hysteresis').onChange((v) => gi.setHysteresis?.(v));
+// Each mode starts from its stable temporal profile: Gated 0.60 for low latency,
+// Monte Carlo 0.90 to absorb its fresh sample set every solve. The slider remains
+// an explicit override and each mode remembers its own value.
+const hysteresisController = gui.add(giTune, 'giHysteresis', 0, 0.99, 0.01).name('hysteresis').onChange((v) => gi.setHysteresis?.(v));
+gui.add(giTune, 'giJitterMode', ['gated', 'montecarlo']).name('jitter basis').onChange((v) => {
+  gi.setJitterMode?.(v);
+  giTune.giHysteresis = gi.getHysteresis?.() ?? giTune.giHysteresis;
+  hysteresisController.updateDisplay();
+});
 gui.add(giTune, 'giHysteresisNormalize').name('normalize hys.').onChange((on) => gi.setHysteresisNormalization?.(on));
 // Temporal firefly clamp: per-texel step limited to ±band·σ. Lower = steadier
 // emissive-only image (kills lucky-ray sparkles), more lag on real changes.

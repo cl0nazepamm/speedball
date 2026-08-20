@@ -1,410 +1,584 @@
-/* ─────────────────────────────────────────────────────────────────────────────
-   SPEEDBALL GI — dossier chrome
-   ─────────────────────────────────────────────────────────────────────────────
-   Ported from the clone.llc "speculative-engineering dossier" skin (site.html
-   @6d4d3a0, 2026-05-18) and retuned for a full-bleed WebGPU demo: the render is
-   the specimen, the UI is the folder wrapped around it.
-
-   Type:  Archivo Black (display) / Archivo (mid weights) /
-          JetBrains Mono (data) / Newsreader Italic (editorial)
-   Color: bone on carbon, hairline rules, glass panels. Probe-lime is reserved
-          for LIVE / converged markers only; stamp-red for faults only.
-   ───────────────────────────────────────────────────────────────────────────── */
+/* SPEEDBALL GI — clone.llc v2 operating-system chrome */
 
 :root {
-    --bone:     #FAFAF6;
-    --pure:     #FFFFFF;
-    --carbon:   #0A0D12;
-    --char:     #11151B;
-    --mute:     #8d97a3;
-    --soft:     #c2cad3;
-    --rule:     rgba(250, 250, 246, 0.18);
-    --rule-hi:  rgba(250, 250, 246, 0.40);
-    --panel-bg: rgba(10, 13, 18, 0.84);
-    --stamp:    #C9241C;
-    --probe:    #B6FF3E;
-
-    --glass:      rgba(10, 13, 18, 0.42);
-    --glass-deep: rgba(8, 11, 15, 0.62);
-    --blur:       blur(18px) saturate(136%);
-
-    --display:      'Archivo Black', 'Archivo', system-ui, sans-serif;
-    --display-cond: 'Archivo', system-ui, sans-serif;
-    --headline:     'Manrope', system-ui, sans-serif;
-    --mono:         'JetBrains Mono', ui-monospace, Consolas, monospace;
-
-    --top-h: 52px;
+    --v2-bg: #efefef;
+    --v2-paper: #e4e4e4;
+    --v2-soft: #d8d8d8;
+    --v2-panel: #c6c6c6;
+    --v2-ink: #010101;
+    --v2-sub: #474747;
+    --v2-rule: rgba(1, 1, 1, 0.14);
+    --v2-rule-soft: rgba(1, 1, 1, 0.08);
+    --v2-blue: #009fe8;
+    --v2-cyan: #006f9c;
+    --v2-red: #e60000;
+    --v2-chrome: linear-gradient(to bottom, #f4f4f4, #d4d4d4);
+    --v2-chrome-soft: linear-gradient(to bottom, #f2f2f2, #c8c8c8);
+    --v2-float: rgba(239, 239, 239, 0.96);
+    --display: "Arial Nova", "Segoe UI Variable Display", "Helvetica Neue", Arial, sans-serif;
+    --mono: "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
+    --top-h: 44px;
+    --fast: 90ms;
+    --ui: 140ms;
+    --move: 220ms;
 }
 
 *, *::before, *::after { box-sizing: border-box; }
 
 html, body {
-    margin: 0;
+    width: 100%;
     height: 100%;
-    background: var(--carbon);
+    margin: 0;
     overflow: hidden;
     overscroll-behavior: none;
+    background: #050505;
 }
+
 body {
-    color: var(--bone);
-    font-family: var(--display-cond);
+    color: var(--v2-ink);
+    font-family: var(--display);
     font-size: 12px;
-    line-height: 1.5;
+    line-height: 1.4;
     -webkit-font-smoothing: antialiased;
 }
-button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; padding: 0; }
+
+button { margin: 0; padding: 0; border: 0; color: inherit; background: none; font: inherit; cursor: pointer; }
 a { color: inherit; text-decoration: none; }
 
-/* The render surface sits under everything and takes the whole viewport. */
 #c {
-    display: block;
     position: fixed;
     inset: 0;
+    z-index: 0;
+    display: block;
     width: 100vw;
     height: 100vh;
-    z-index: 0;
     touch-action: none;
 }
 
-/* Chrome shell — click-through by default, opt back in per widget so nothing
-   steals an orbit drag. */
 #ui {
     position: fixed;
     inset: 0;
     z-index: 10;
-    pointer-events: none;
     opacity: 0;
-    transition: opacity 0.5s ease 0.1s;
+    pointer-events: none;
+    transition: opacity 340ms ease;
 }
+
 #ui.ready { opacity: 1; }
 
-/* ── Registration cross — the corner mark on every document/panel ─────────── */
-.reg {
-    position: absolute;
-    width: 14px; height: 14px;
-    color: var(--bone);
-    opacity: 0.55;
-    pointer-events: none;
-}
-.reg::before, .reg::after { content: ''; position: absolute; background: currentColor; }
-.reg::before { left: 0; right: 0; top: 50%; height: 1px; transform: translateY(-50%); }
-.reg::after  { top: 0; bottom: 0; left: 50%; width: 1px;  transform: translateX(-50%); }
-
-/* ── Top strip ───────────────────────────────────────────────────────────── */
+/* Top operating strip */
 .topstrip {
     position: absolute;
-    top: 0; left: 0; right: 0;
-    height: var(--top-h);
-    padding: 0 clamp(12px, 2vw, 28px);
+    inset: 0 0 auto;
+    z-index: 20;
     display: grid;
     grid-template-columns: 1fr auto 1fr;
     align-items: center;
-    gap: clamp(12px, 3vw, 32px);
-    border-bottom: 1px solid var(--rule);
-    /* Sponza blows out to near-white behind this bar, so the glass has to carry
-       enough carbon for mono type at 9.5px to stay legible over it. */
-    background: linear-gradient(180deg, rgba(8, 11, 15, 0.74), rgba(10, 13, 18, 0.58));
-    backdrop-filter: blur(16px) saturate(118%);
-    -webkit-backdrop-filter: blur(16px) saturate(118%);
-    z-index: 20;
+    gap: 22px;
+    height: var(--top-h);
+    padding: 0 18px;
+    color: var(--v2-ink);
+    background: var(--v2-chrome);
+    border-bottom: 1px solid rgba(1, 1, 1, 0.34);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 2px 8px rgba(0, 0, 0, 0.18);
 }
 
-.brand { display: flex; align-items: center; gap: 14px; pointer-events: auto; }
+.brand,
+.nav { pointer-events: auto; }
+
+.brand {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    height: 100%;
+    gap: 10px;
+}
+
 .brand-pill {
-    display: inline-flex; align-items: center; gap: 8px;
-    padding: 5px 9px;
-    border: 1px solid var(--bone);
-    background: var(--bone);
-    color: var(--carbon);
-    font: 700 10px/1 var(--display);
-    letter-spacing: 0.2em;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font: 800 10px/1 var(--display);
+    letter-spacing: 0.16em;
 }
-.brand-pill .arrow {
-    display: inline-block; width: 10px; height: 10px;
-    background-color: var(--carbon);
-    mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'><path d='M2 8 L8 2 M3 2 H8 V7' stroke='black' stroke-width='1.4' fill='none'/></svg>") no-repeat center / contain;
-    -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'><path d='M2 8 L8 2 M3 2 H8 V7' stroke='black' stroke-width='1.4' fill='none'/></svg>") no-repeat center / contain;
-}
-.brand-mark { font: 800 17px/1 var(--headline); letter-spacing: -0.01em; color: var(--bone); }
-.brand-meta {
-    display: flex; flex-direction: column; gap: 2px;
-    padding-left: 14px;
-    border-left: 1px solid var(--rule);
-    font: 500 9.5px/1.25 var(--mono);
-    letter-spacing: 0.08em;
-    color: var(--mute);
-    text-transform: uppercase;
-}
-.brand-meta b { color: var(--bone); font-weight: 500; }
 
-.topcenter {
-    display: flex; align-items: center; gap: 10px;
-    font: 500 10px/1 var(--mono);
-    letter-spacing: 0.30em;
-    color: var(--mute);
+.brand-pill:hover { color: var(--v2-blue); }
+
+.brand-pill .arrow {
+    width: 9px;
+    height: 9px;
+    background: currentColor;
+    clip-path: polygon(13% 0, 100% 0, 100% 87%, 80% 87%, 80% 34%, 14% 100%, 0 86%, 66% 20%, 13% 20%);
+}
+
+.brand-mark {
+    color: var(--v2-blue);
+    font: 700 10px/1 var(--mono);
+}
+
+.brand-meta {
+    min-width: 0;
+    padding-left: 11px;
+    overflow: hidden;
+    border-left: 1px solid var(--v2-rule);
+    color: var(--v2-sub);
+    font: 600 8px/1 var(--mono);
+    letter-spacing: 0.08em;
+    text-overflow: ellipsis;
     text-transform: uppercase;
     white-space: nowrap;
 }
-.topcenter .sep { width: 1px; height: 12px; background: var(--rule); }
-.topcenter .live { display: inline-flex; align-items: center; gap: 7px; color: var(--bone); }
+
+.topcenter {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    color: var(--v2-sub);
+    font: 600 8px/1 var(--mono);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.topcenter .sep { width: 1px; height: 11px; background: var(--v2-rule); }
+.topcenter .live { display: inline-flex; align-items: center; gap: 7px; color: var(--v2-ink); }
 .topcenter .live::before {
-    content: ''; width: 6px; height: 6px; border-radius: 50%;
-    background: var(--probe);
-    box-shadow: 0 0 0 0 rgba(182, 255, 62, 0.55);
-    animation: pulse 2.4s ease-out infinite;
+    content: "";
+    width: 5px;
+    height: 5px;
+    background: var(--v2-red);
+    border-radius: 50%;
 }
-@keyframes pulse {
-    0%   { box-shadow: 0 0 0 0 rgba(182, 255, 62, 0.55); }
-    70%  { box-shadow: 0 0 0 7px rgba(182, 255, 62, 0); }
-    100% { box-shadow: 0 0 0 0 rgba(182, 255, 62, 0); }
-}
-/* Solve in flight → amber-free: the marker just stops breathing and dims. */
-#ui.solving .topcenter .live::before { animation-duration: 0.9s; }
+#ui.solving .topcenter .live::before { animation: signal 760ms steps(2, end) infinite; }
 
 .nav {
-    display: flex; justify-content: flex-end; align-items: center;
-    gap: 2px;
-    pointer-events: auto;
+    display: flex;
+    align-items: stretch;
+    justify-content: flex-end;
+    height: 100%;
 }
-.nav a, .nav button {
-    position: relative;
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 9px 13px;
-    font: 800 11px/1 var(--display);
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    white-space: nowrap;          /* "PATH TRACE" must not wrap and grow the bar */
-    color: var(--bone);
-    transition: background 0.18s ease, color 0.18s ease;
-}
-.nav a .num, .nav button .num {
-    font: 500 9.5px/1 var(--mono);
-    letter-spacing: 0;
-    color: var(--mute);
-    transition: color 0.18s ease;
-}
-.nav a:hover, .nav button:hover { background: var(--bone); color: var(--carbon); }
-.nav a:hover .num, .nav button:hover .num { color: var(--carbon); }
-.nav .divider { width: 1px; height: 18px; background: var(--rule); margin: 0 6px; }
-.nav button[aria-pressed="true"] { background: var(--probe); color: var(--carbon); }
-.nav button[aria-pressed="true"] .num { color: var(--carbon); }
-.nav a:focus-visible, .nav button:focus-visible { outline: 2px solid var(--probe); outline-offset: -2px; }
 
-/* Segmented control — mutually exclusive modes read as one switch, not two
-   buttons that happen to sit together. */
-.seg {
+.nav .seg,
+.nav > button {
     display: inline-flex;
-    border: 1px solid var(--rule-hi);
+    align-items: stretch;
 }
-.seg button { padding: 8px 12px; }
-.seg button + button { border-left: 1px solid var(--rule-hi); }
-.seg button[aria-pressed="false"] { color: var(--mute); }
-.seg button[aria-pressed="false"]:hover { color: var(--carbon); }
-/* A mode that is arming (compiling / building its BVH) is not yet the truth on
-   screen — dim it and lock it out rather than lying with a lit segment. */
-.seg button[data-busy="1"] { opacity: 0.5; pointer-events: none; }
 
-/* ── Transport — bottom-centre animation control ─────────────────────────── */
+.nav button {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    padding: 0 9px;
+    color: var(--v2-sub);
+    font: 750 8.5px/1 var(--display);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    transition: color var(--ui) ease, background var(--ui) ease;
+}
+
+.nav button::after {
+    content: "";
+    position: absolute;
+    right: 9px;
+    bottom: 0;
+    left: 9px;
+    height: 2px;
+    background: var(--v2-blue);
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform var(--ui) ease;
+}
+
+.nav button:hover { color: var(--v2-ink); background: rgba(255, 255, 255, 0.28); }
+.nav button[aria-pressed="true"] { color: var(--v2-ink); }
+.nav button[aria-pressed="true"]::after { transform: scaleX(1); }
+.nav button[data-busy="1"] { opacity: 0.42; pointer-events: none; }
+.nav .num { margin-right: 2px; color: var(--v2-blue); font-family: var(--mono); }
+.nav .divider { width: 1px; height: 18px; margin: auto 5px; background: var(--v2-rule); }
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible { outline: 1px solid var(--v2-blue); outline-offset: 2px; }
+
+.seg { display: inline-flex; }
+.seg button + button { border-left: 1px solid var(--v2-rule); }
+
+/* Primary instrument deck */
 .transport {
     position: absolute;
+    bottom: clamp(14px, 2.8vh, 28px);
     left: 50%;
-    bottom: clamp(18px, 4vh, 40px);
-    transform: translateX(-50%);
-    display: inline-flex; align-items: center; gap: 14px;
-    padding: 7px 8px 7px 7px;
-    background: var(--glass-deep);
-    backdrop-filter: var(--blur);
-    -webkit-backdrop-filter: var(--blur);
-    border: 1px solid var(--rule-hi);
-    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
-    pointer-events: auto;
     z-index: 25;
+    display: flex;
+    align-items: stretch;
+    width: min(1120px, calc(100vw - 32px));
+    color: var(--v2-ink);
+    background: var(--v2-float);
+    border: 1px solid rgba(1, 1, 1, 0.34);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.88), 0 4px 20px rgba(0, 0, 0, 0.32);
+    transform: translateX(-50%);
+    pointer-events: auto;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
 }
-.transport .rule { width: 1px; height: 18px; background: var(--rule); }
-.transport #play {
-    display: inline-flex; align-items: center; gap: 9px;
-    padding: 8px 14px 8px 11px;
-    border: 1px solid transparent;
-    background: var(--bone);
-    color: var(--carbon);
-    font: 800 11px/1 var(--display);
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    transition: background 0.18s ease, color 0.18s ease;
-}
-.transport #play:hover { background: var(--probe); }
-.transport #play[aria-pressed="true"] { background: var(--probe); color: var(--carbon); }
-.transport #play:focus-visible { outline: 2px solid var(--probe); outline-offset: 2px; }
-/* Play triangle → pause bars, drawn in CSS so there is no icon payload. */
-.transport #play .glyph {
-    width: 9px; height: 11px;
-    background: currentColor;
-    clip-path: polygon(0 0, 100% 50%, 0 100%);
-}
-.transport #play[aria-pressed="true"] .glyph {
-    clip-path: polygon(0 0, 34% 0, 34% 100%, 0 100%, 0 0, 66% 0, 100% 0, 100% 100%, 66% 100%, 66% 0);
-}
-.transport .readout {
-    display: inline-flex; align-items: baseline; gap: 8px;
-    font-family: var(--mono);
-    font-size: 11px; line-height: 1;
-    padding-right: 6px;
-}
-.transport .readout .k {
-    color: var(--mute);
-    text-transform: uppercase;
-    letter-spacing: 0.16em;
-    font-size: 9.5px;
-}
-.transport .readout .v { font-variant-numeric: tabular-nums; font-weight: 500; color: var(--bone); }
-.transport .readout .v.accent { color: var(--probe); }
 
-/* ── Boot / status plate ─────────────────────────────────────────────────── */
+.transport::before {
+    content: "";
+    position: absolute;
+    inset: -5px;
+    z-index: -1;
+    pointer-events: none;
+    background:
+        linear-gradient(var(--v2-ink), var(--v2-ink)) left top / 13px 1px no-repeat,
+        linear-gradient(var(--v2-ink), var(--v2-ink)) left top / 1px 13px no-repeat,
+        linear-gradient(var(--v2-ink), var(--v2-ink)) right top / 13px 1px no-repeat,
+        linear-gradient(var(--v2-ink), var(--v2-ink)) right top / 1px 13px no-repeat,
+        linear-gradient(var(--v2-ink), var(--v2-ink)) left bottom / 13px 1px no-repeat,
+        linear-gradient(var(--v2-ink), var(--v2-ink)) left bottom / 1px 13px no-repeat,
+        linear-gradient(var(--v2-ink), var(--v2-ink)) right bottom / 13px 1px no-repeat,
+        linear-gradient(var(--v2-ink), var(--v2-ink)) right bottom / 1px 13px no-repeat;
+}
+
+.transport::after {
+    content: "";
+    position: absolute;
+    top: -1px;
+    left: 18px;
+    width: 96px;
+    height: 2px;
+    background: var(--v2-blue);
+}
+
+.core-controls {
+    display: grid;
+    grid-template-columns: 124px 110px 86px 104px minmax(250px, 1fr);
+    flex: 1 1 auto;
+    align-items: center;
+    gap: 14px;
+    min-width: 0;
+    padding: 11px 15px;
+    border-right: 1px solid var(--v2-rule);
+    background: var(--v2-chrome-soft);
+}
+
+.sun-control { display: flex; align-items: center; gap: 9px; }
+
+#sun-ball {
+    position: relative;
+    flex: 0 0 42px;
+    width: 42px;
+    height: 42px;
+    overflow: hidden;
+    background:
+        linear-gradient(var(--v2-rule), var(--v2-rule)) 50% 0 / 1px 100% no-repeat,
+        linear-gradient(90deg, var(--v2-rule), var(--v2-rule)) 0 50% / 100% 1px no-repeat,
+        radial-gradient(circle, #f7f7f7 0 47%, #d2d2d2 48% 100%);
+    border: 1px solid rgba(1, 1, 1, 0.28);
+    border-radius: 50%;
+    box-shadow: inset 0 1px 1px white;
+    touch-action: none;
+}
+
+#sun-ball::after { content: ""; position: absolute; inset: 7px; border: 1px solid var(--v2-rule); border-radius: 50%; }
+#sun-dot {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    z-index: 1;
+    width: 8px;
+    height: 8px;
+    background: var(--v2-blue);
+    border: 1px solid var(--v2-ink);
+    border-radius: 50%;
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.72);
+    transform: translate(-50%, -50%);
+}
+
+.core-copy,
+.core-slider,
+.hysteresis-meter { display: flex; flex-direction: column; }
+.core-copy { gap: 4px; }
+.core-slider { gap: 8px; min-width: 0; }
+
+.core-copy b,
+.core-slider > span,
+.meter-head,
+.transport .material-switch > .k {
+    color: var(--v2-sub);
+    font: 700 7.5px/1 var(--mono);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+}
+
+.core-copy b { color: var(--v2-ink); font-family: var(--display); font-size: 8.5px; }
+.core-copy small { color: var(--v2-cyan); font: 650 8.5px/1 var(--mono); }
+.core-slider > span { display: flex; justify-content: space-between; }
+.core-slider > span b { color: var(--v2-ink); font-weight: 700; }
+
+.core-slider input,
+.hysteresis-meter input {
+    width: 100%;
+    height: 3px;
+    margin: 0;
+    appearance: none;
+    background: rgba(1, 1, 1, 0.2);
+    border: 0;
+    border-radius: 0;
+}
+
+.core-slider input::-webkit-slider-thumb,
+.hysteresis-meter input::-webkit-slider-thumb {
+    width: 7px;
+    height: 14px;
+    appearance: none;
+    background: var(--v2-blue);
+    border: 1px solid var(--v2-ink);
+    border-radius: 0;
+    cursor: ew-resize;
+}
+
+.hysteresis-meter {
+    --danger-stop: 20.4%;
+    gap: 7px;
+    padding-left: 15px;
+    border-left: 1px solid var(--v2-rule);
+}
+
+.hysteresis-meter input { background: linear-gradient(90deg, var(--v2-red) 0 var(--danger-stop), var(--v2-blue) var(--danger-stop) 100%); }
+.hysteresis-meter input::-webkit-slider-thumb { background: #f5f5f5; }
+.meter-head,
+.meter-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.meter-head strong { color: var(--v2-ink); font: 800 18px/1 var(--mono); letter-spacing: -0.06em; }
+.meter-foot small { color: var(--v2-cyan); font: 700 7px/1 var(--mono); letter-spacing: 0.09em; }
+.hysteresis-meter.danger .meter-head strong,
+.hysteresis-meter.danger #hysteresis-state { color: var(--v2-red); }
+
+.transport .seg.mini button,
+.transport .material-switch button {
+    position: relative;
+    padding: 4px 7px 6px;
+    color: var(--v2-sub);
+    font: 750 8px/1 var(--display);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    transition: color var(--ui) ease, background var(--ui) ease;
+}
+
+.transport .seg.mini button::after,
+.transport .material-switch button::after {
+    content: "";
+    position: absolute;
+    right: 7px;
+    bottom: 0;
+    left: 7px;
+    height: 2px;
+    background: var(--v2-blue);
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform var(--ui) ease;
+}
+
+.transport .seg button:hover { color: var(--v2-ink); background: rgba(255, 255, 255, 0.45); }
+.transport .seg button[aria-pressed="true"] { color: var(--v2-ink); }
+.transport .seg button[aria-pressed="true"]::after { transform: scaleX(1); }
+
+.transport-row {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 11px;
+    padding: 10px 13px;
+    background: rgba(239, 239, 239, 0.96);
+}
+
+.transport .material-switch { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.transport .rule { width: 1px; height: 18px; background: var(--v2-rule); }
+.transport .transport-stat { display: none !important; }
+
+.transport #play {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 30px;
+    padding: 0 10px;
+    color: var(--v2-ink);
+    background: var(--v2-chrome);
+    border: 1px solid rgba(1, 1, 1, 0.28);
+    box-shadow: inset 0 1px 0 white;
+    font: 750 8px/1 var(--display);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    transition: border-color var(--ui) ease, color var(--ui) ease;
+}
+
+.transport #play:hover,
+.transport #play[aria-pressed="true"] { color: var(--v2-blue); border-color: var(--v2-blue); }
+.transport #play .glyph { width: 8px; height: 10px; background: currentColor; clip-path: polygon(0 0, 100% 50%, 0 100%); }
+.transport #play[aria-pressed="true"] .glyph { clip-path: polygon(0 0, 34% 0, 34% 100%, 0 100%, 0 0, 66% 0, 100% 0, 100% 100%, 66% 100%, 66% 0); }
+
+/* Boot and fault plate */
 #status {
     position: fixed;
-    left: 50%; top: 50%;
-    transform: translate(-50%, -50%);
+    top: 50%;
+    left: 50%;
     z-index: 60;
     min-width: min(360px, calc(100vw - 48px));
-    padding: 26px 30px 24px;
-    background: var(--glass-deep);
-    backdrop-filter: blur(24px) saturate(150%);
-    -webkit-backdrop-filter: blur(24px) saturate(150%);
-    border: 1px solid var(--rule-hi);
-    color: var(--bone);
-    text-align: left;
+    padding: 25px 28px 23px;
+    color: var(--v2-ink);
+    background: var(--v2-float);
+    border: 1px solid rgba(1, 1, 1, 0.32);
+    box-shadow: inset 0 1px 0 white, 0 8px 34px rgba(0, 0, 0, 0.28);
+    font: 600 10px/1.6 var(--mono);
+    letter-spacing: 0.05em;
     white-space: pre-wrap;
-    font: 500 11px/1.6 var(--mono);
-    letter-spacing: 0.06em;
-    box-shadow: 0 30px 90px rgba(0, 0, 0, 0.6);
-    transition: opacity 0.4s ease;
+    transform: translate(-50%, -50%);
+    transition: opacity 340ms ease;
 }
-#status::before {
-    content: 'SPEEDBALL GI / BOOT';
-    display: block;
-    margin-bottom: 12px;
-    padding-bottom: 10px;
-    border-bottom: 1px solid var(--rule);
-    font: 800 10px/1 var(--display);
-    letter-spacing: 0.28em;
-    color: var(--mute);
-}
-#status .reg.tl { top: 8px; left: 8px; }
-#status .reg.br { bottom: 8px; right: 8px; }
-#status.err { border-color: var(--stamp); color: var(--bone); }
-#status.err::before { content: 'SPEEDBALL GI / FAULT'; color: var(--stamp); border-bottom-color: rgba(201, 36, 28, 0.5); }
-#status.hide { opacity: 0; pointer-events: none; }
 
-/* Boot grid wash behind the plate — reads as a drafting sheet. */
+#status::before {
+    content: "SPEEDBALL GI / BOOT";
+    display: block;
+    margin-bottom: 11px;
+    padding-bottom: 9px;
+    color: var(--v2-sub);
+    border-bottom: 1px solid var(--v2-rule);
+    font: 800 9px/1 var(--display);
+    letter-spacing: 0.2em;
+}
+
+#status::after {
+    content: "";
+    position: absolute;
+    top: -1px;
+    left: 18px;
+    width: 72px;
+    height: 2px;
+    background: var(--v2-blue);
+}
+
+#status.err { border-color: var(--v2-red); }
+#status.err::before { content: "SPEEDBALL GI / FAULT"; color: var(--v2-red); }
+#status.err::after { background: var(--v2-red); }
+#status.hide { opacity: 0; pointer-events: none; }
+.reg { display: none; }
+
 #bootwash {
-    position: fixed; inset: 0; z-index: 55;
+    position: fixed;
+    inset: 0;
+    z-index: 55;
     background:
-        linear-gradient(var(--rule) 1px, transparent 1px),
-        linear-gradient(90deg, var(--rule) 1px, transparent 1px),
-        var(--carbon);
-    background-size: 40px 40px, 40px 40px, auto;
-    opacity: 0.5;
+        linear-gradient(var(--v2-rule-soft) 1px, transparent 1px),
+        linear-gradient(90deg, var(--v2-rule-soft) 1px, transparent 1px),
+        var(--v2-bg);
+    background-size: 32px 32px, 32px 32px, auto;
     pointer-events: none;
-    transition: opacity 0.5s ease;
+    transition: opacity 340ms ease;
 }
 #bootwash.hide { opacity: 0; }
 
-/* ── lil-gui — dossier glass skin ────────────────────────────────────────── */
+/* Advanced settings use the same v2 chrome, without a second visual system. */
 .lil-gui {
     --width: 296px;
     --font-size: 11px;
     --input-font-size: 11px;
     --background-color: transparent;
-    --text-color: var(--bone);
-    --title-background-color: rgba(250, 250, 246, 0.06);
-    --title-text-color: var(--bone);
-    --widget-color: rgba(250, 250, 246, 0.10);
-    --hover-color: rgba(250, 250, 246, 0.17);
-    --focus-color: rgba(182, 255, 62, 0.24);
-    --number-color: var(--probe);
-    --string-color: var(--soft);
-    --font-family: var(--display-cond);
+    --text-color: var(--v2-ink);
+    --title-background-color: rgba(1, 1, 1, 0.05);
+    --title-text-color: var(--v2-ink);
+    --widget-color: rgba(1, 1, 1, 0.09);
+    --hover-color: rgba(0, 159, 232, 0.12);
+    --focus-color: rgba(0, 159, 232, 0.22);
+    --number-color: var(--v2-cyan);
+    --string-color: var(--v2-sub);
+    --font-family: var(--display);
     --font-family-mono: var(--mono);
     --widget-height: 22px;
     --padding: 7px;
     --spacing: 5px;
 }
+
 .lil-gui.root {
     position: fixed !important;
-    top: calc(var(--top-h) + 16px) !important;
-    right: 16px !important;
-    /* The panel is taller than most viewports once every folder is open — cap it
-       and let it scroll rather than running off the bottom edge. */
-    max-height: calc(100dvh - var(--top-h) - 32px);
-    overflow-y: auto;
-    overscroll-behavior: contain;
+    top: calc(var(--top-h) + 12px) !important;
+    right: 12px !important;
     z-index: 30;
-    border: 1px solid var(--rule-hi);
-    background: var(--glass-deep);
-    backdrop-filter: blur(22px) saturate(150%);
-    -webkit-backdrop-filter: blur(22px) saturate(150%);
-    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.5);
-    transition: opacity 0.28s ease, transform 0.28s cubic-bezier(.25,.46,.45,.94);
-}
-.lil-gui.root.gui-hidden { opacity: 0; transform: translateX(12px); pointer-events: none; }
-.lil-gui.root > .title {
-    border-bottom: 1px solid var(--rule);
-    font: 800 10px/1 var(--display);
-    letter-spacing: 0.24em;
-    text-transform: uppercase;
-    padding: 11px var(--padding);
-    color: var(--bone);
-}
-.lil-gui .title { text-transform: uppercase; letter-spacing: 0.14em; font-weight: 700; }
-.lil-gui .children { background: transparent; }
-.lil-gui .controller { border-left: 1px solid transparent; }
-.lil-gui .controller:hover { border-left-color: var(--probe); }
-.lil-gui .controller .name {
-    font: 500 10.5px/1 var(--mono);
-    letter-spacing: 0.06em;
-    color: var(--soft);
-    text-transform: uppercase;
-}
-.lil-gui input, .lil-gui select { font-family: var(--mono); }
-.lil-gui .slider { border-radius: 0; }
-.lil-gui .fill { background: var(--probe); opacity: 0.75; }
-.lil-gui .display { border-radius: 0; }
-.lil-gui button, .lil-gui .widget { border-radius: 0; }
-.lil-gui.root .children > .lil-gui > .title { border-top: 1px solid var(--rule); }
-.lil-gui .number input { color: var(--probe); }
-.lil-gui::-webkit-scrollbar, .lil-gui .children::-webkit-scrollbar { width: 6px; }
-.lil-gui::-webkit-scrollbar-thumb, .lil-gui .children::-webkit-scrollbar-thumb { background: var(--rule-hi); }
-
-/* ── Entrance choreography ───────────────────────────────────────────────── */
-@keyframes enter-down { from { opacity: 0; transform: translateY(-14px); } to { opacity: 1; transform: none; } }
-#ui.ready .topstrip { animation: enter-down 0.62s 0.05s cubic-bezier(.25,.46,.45,.94) both; }
-@media (prefers-reduced-motion: reduce) {
-    #ui.ready .topstrip { animation: none; }
+    max-height: calc(100dvh - var(--top-h) - 24px);
+    overflow-y: auto;
+    background: var(--v2-float);
+    border: 1px solid rgba(1, 1, 1, 0.34);
+    box-shadow: inset 0 1px 0 white, 0 4px 20px rgba(0, 0, 0, 0.28);
+    overscroll-behavior: contain;
+    transition: opacity var(--move) ease, transform var(--move) cubic-bezier(.2, .8, .2, 1);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
 }
 
-/* ── Compact ─────────────────────────────────────────────────────────────── */
+.lil-gui.root.gui-hidden { opacity: 0; transform: translateX(10px); pointer-events: none; }
+.lil-gui.root > .title { padding: 10px var(--padding); border-bottom: 1px solid var(--v2-rule); font: 800 9px/1 var(--display); letter-spacing: 0.18em; text-transform: uppercase; }
+.lil-gui .title { font-weight: 750; letter-spacing: 0.1em; text-transform: uppercase; }
+.lil-gui .controller { border-left: 2px solid transparent; }
+.lil-gui .controller:hover { border-left-color: var(--v2-blue); }
+.lil-gui .controller .name { color: var(--v2-sub); font: 600 9.5px/1 var(--mono); letter-spacing: 0.04em; text-transform: uppercase; }
+.lil-gui input,
+.lil-gui select { font-family: var(--mono); }
+.lil-gui .slider,
+.lil-gui .display,
+.lil-gui button,
+.lil-gui .widget { border-radius: 0; }
+.lil-gui .fill { background: var(--v2-blue); }
+.lil-gui.root .children > .lil-gui > .title { border-top: 1px solid var(--v2-rule); }
+.lil-gui::-webkit-scrollbar,
+.lil-gui .children::-webkit-scrollbar { width: 6px; }
+.lil-gui::-webkit-scrollbar-thumb,
+.lil-gui .children::-webkit-scrollbar-thumb { background: rgba(1, 1, 1, 0.3); }
+
+@keyframes signal { 50% { opacity: 0.2; } }
+@keyframes enter-down { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
+#ui.ready .topstrip { animation: enter-down 220ms cubic-bezier(.2, .8, .2, 1) both; }
+
+@media (max-width: 1120px) {
+    .transport { display: grid; grid-template-columns: 1fr; width: min(840px, calc(100vw - 24px)); }
+    .core-controls { border-right: 0; border-bottom: 1px solid var(--v2-rule); }
+    .transport-row { justify-content: space-between; }
+    .transport-row > .rule { display: none; }
+}
+
 @media (max-width: 900px) {
-    .brand-meta { display: none; }
+    .brand-meta,
     .topcenter { display: none; }
+    .topstrip { grid-template-columns: auto 1fr; }
 }
+
 @media (max-width: 700px), (max-height: 560px) {
-    :root { --top-h: 46px; }
-    .nav a, .nav button { padding: 8px 9px; font-size: 10px; letter-spacing: 0.1em; }
-    .nav a .num, .nav button .num { display: none; }
-    .nav .divider { display: none; }
-    .seg button { padding: 7px 8px; }
-    /* The panel takes the bottom of a small screen, so the transport moves up out
-       of its way rather than stacking on top of it. */
-    .transport { bottom: auto; top: calc(var(--top-h) + 10px); gap: 10px; }
-    .transport .readout .k { display: none; }
+    :root { --top-h: 42px; }
+    .topstrip { gap: 5px; padding: 0 9px; }
+    .brand { gap: 0; }
+    .brand-pill { font-size: 9px; letter-spacing: 0.1em; }
+    .brand-pill .arrow,
+    .brand-mark { display: none; }
+    .nav { min-width: 0; overflow-x: auto; scrollbar-width: none; }
+    .nav::-webkit-scrollbar { display: none; }
+    .nav button { padding: 0 6px; font-size: 7.5px; letter-spacing: 0.035em; }
+    .nav button::after { right: 6px; left: 6px; }
+    .nav .num,
+    .nav .divider,
+    #gui-toggle { display: none; }
+    .transport { right: 8px; bottom: calc(8px + env(safe-area-inset-bottom, 0px)); left: 8px; width: auto; transform: none; }
+    .core-controls { grid-template-columns: 116px 1fr; gap: 11px; padding: 10px 11px; }
+    .core-controls .compact-core { display: none; }
+    .hysteresis-meter { grid-column: 1 / -1; padding: 9px 0 0; border-top: 1px solid var(--v2-rule); border-left: 0; }
+    .transport-row { padding: 9px 11px; }
+    .transport .material-switch button { padding: 6px 7px; }
     .lil-gui { --width: calc(100vw - 16px); --font-size: 12px; --widget-height: 26px; }
-    .lil-gui.root {
-        left: 8px !important; right: 8px !important;
-        top: auto !important;
-        bottom: calc(8px + env(safe-area-inset-bottom, 0px)) !important;
-        width: auto !important;
-        max-height: min(38vh, 380px);
-        touch-action: pan-y;
-    }
+    .lil-gui.root { top: auto !important; right: 8px !important; bottom: calc(8px + env(safe-area-inset-bottom, 0px)) !important; left: 8px !important; width: auto !important; max-height: min(38vh, 380px); touch-action: pan-y; }
     .lil-gui.root.closed { max-height: 34px; overflow: hidden; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #ui,
+    #ui.ready .topstrip,
+    .nav button,
+    .transport button,
+    .lil-gui.root { animation: none; transition: none; }
 }

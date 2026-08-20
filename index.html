@@ -3,12 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0A0D12">
+<meta name="theme-color" content="#E4E4E4">
 <title>SPEEDBALL GI — real-time DDGI for three.js WebGPU</title>
 <link rel="icon" href="data:,">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Archivo:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;700;800&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="./css/dossier.css">
 <script type="importmap">
 {
@@ -34,27 +31,23 @@
   <header class="topstrip">
     <div class="brand">
       <a class="brand-pill" href="https://github.com/cl0nazepamm/speedball" target="_blank" rel="noreferrer">SPEEDBALL<i class="arrow"></i></a>
-      <div class="brand-mark">GI</div>
+      <div class="brand-mark">/ GI</div>
       <div class="brand-meta">
-        <span>REAL-TIME DDGI / <b>WEBGPU</b></span>
-        <span>SPECIMEN <b id="scene-meta">SPONZA + PREETHAM SKY</b></span>
+        <span id="scene-meta">SPONZA + PREETHAM SKY</span>
       </div>
     </div>
 
     <div class="topcenter">
-      <span class="live">SOLVER</span>
+      <span class="live">LIVE FIELD</span>
       <i class="sep"></i>
-      <span id="engine-note">BVH-TRACED · INFINITE BOUNCE · NO BAKE</span>
+      <span id="engine-note">PHOTON CAUSTIC · REFLECTION · DDGI</span>
     </div>
 
     <nav class="nav">
-      <!-- Scene: Sponza sunlit, Sponza under the 50-light no-sun clustered grid,
-           or Bistro. Each reloads — the clustered lights node is chosen at install
-           time, and the models are far too heavy to swap in place. -->
-      <div class="seg" role="group" aria-label="Scene">
-        <button id="scene-sun" type="button" aria-pressed="true">SPONZA</button>
-        <button id="scene-cluster" type="button" aria-pressed="false">CLUSTER</button>
-        <button id="scene-bistro" type="button" aria-pressed="false">BISTRO</button>
+      <!-- One Sponza scene, two install-time lighting structures. -->
+      <div class="seg" role="group" aria-label="Sponza lighting">
+        <button id="scene-sun" type="button" aria-pressed="true">SUN</button>
+        <button id="scene-cluster" type="button" aria-pressed="false">50 LIGHTS</button>
       </div>
       <i class="divider"></i>
       <!-- Light-transport engine. Exclusive: only one runs at a time. -->
@@ -63,20 +56,47 @@
         <button id="engine-pt" type="button" aria-pressed="false">PATH TRACE</button>
       </div>
       <i class="divider"></i>
-      <button id="gui-toggle" type="button" aria-pressed="true"><span class="num">[ ]</span>CONTROLS</button>
+      <button id="gui-toggle" type="button" aria-pressed="false"><span class="num">[ ]</span>ADVANCED</button>
     </nav>
   </header>
 
   <!-- Transport: drives the centre sphere so the GI lane can be watched reacting
        to real motion rather than to a still frame. -->
   <div class="transport" id="transport">
-    <button id="play" type="button" aria-pressed="false" title="Play the sphere animation">
-      <i class="glyph" aria-hidden="true"></i><span class="label">ANIMATE</span>
-    </button>
-    <i class="rule"></i>
-    <div class="readout"><span class="k">Engine</span><span class="v" id="t-engine">RASTER</span></div>
-    <i class="rule"></i>
-    <div class="readout"><span class="k" id="t-metric-k">FPS</span><span class="v" id="t-metric">—</span></div>
+    <div class="core-controls">
+      <div class="sun-control">
+        <button id="sun-ball" type="button" aria-label="Drag to set sun azimuth and elevation"><i id="sun-dot"></i></button>
+        <span class="core-copy"><b>SPEEDBALL</b><small id="sun-readout">119° / 62.5°</small></span>
+      </div>
+      <label class="core-slider intensity-control"><span>INTENSITY <b id="intensity-value">20</b></span><input id="intensity-slider" type="range" min="0" max="40" step="0.1" value="20"></label>
+      <label class="core-slider compact-core"><span>DIVISIONS <b id="divisions-value">16</b></span><input id="divisions-slider" type="range" min="2" max="32" step="1" value="16"></label>
+      <label class="core-slider compact-core"><span>RAYS / PROBE <b id="rays-value">64</b></span><input id="rays-slider" type="range" min="32" max="256" step="16" value="64"></label>
+      <div class="hysteresis-meter" id="hysteresis-meter">
+        <span class="meter-head"><b>HYSTERESIS</b><strong id="hysteresis-value">0.60</strong></span>
+        <input id="hysteresis-slider" type="range" min="0.5" max="0.99" step="0.01" value="0.6">
+        <span class="meter-foot"><small id="hysteresis-state">GATED · STABLE</small><span class="seg mini" role="group" aria-label="Ray jitter mode"><button id="jitter-gated" type="button" aria-pressed="true">GATED</button><button id="jitter-mc" type="button" aria-pressed="false">MONTE CARLO</button></span></span>
+      </div>
+    </div>
+    <div class="transport-row">
+      <div class="material-switch">
+        <span class="k">SPHERE MATERIAL</span>
+        <div class="seg" role="group" aria-label="Centre sphere material">
+          <button id="ball-emissive" type="button" aria-pressed="false" title="Emissive mesh with NEE">EMISSION</button>
+          <button id="ball-metal" type="button" aria-pressed="true" title="Reflective metal with ground caustics">METAL</button>
+          <button id="ball-glass" type="button" aria-pressed="false" title="Refractive glass with ground caustics">GLASS</button>
+        </div>
+      </div>
+      <i class="rule"></i>
+      <button id="play" type="button" aria-pressed="false" title="Play the sphere animation">
+        <i class="glyph" aria-hidden="true"></i><span class="label">ANIMATE</span>
+      </button>
+      <i class="rule"></i>
+      <div class="readout transport-stat"><span class="k">Effect</span><span class="v accent" id="t-effect">METAL · CAUSTIC</span></div>
+      <i class="rule transport-stat"></i>
+      <div class="readout transport-stat"><span class="k">Engine</span><span class="v" id="t-engine">RASTER</span></div>
+      <i class="rule transport-stat"></i>
+      <div class="readout transport-stat"><span class="k" id="t-metric-k">FPS</span><span class="v" id="t-metric">—</span></div>
+    </div>
   </div>
 </div>
 
@@ -90,27 +110,22 @@ import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
 import { positionWorld, normalWorld, pass } from 'three/tsl';
 import { FilmPipeline, FILM_PRESETS, applyFilmPreset, filmPass } from 'powershot-threejs';
-import { installSpeedballGI, excludeFromGI, prepareMaterialsForGI } from './js/index.js';
+import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
 import { createSpectralTracer } from './js/spectral_tracer.js';
+import { createCausticEngine, causticReceiverFloor } from './js/caustic_engine.js';
 
 // ── Scene ──────────────────────────────────────────────────────────────────────
 // 'sun'     — Sponza's sunlit atrium: Preetham sky + directional sun.
 // 'cluster' — Sponza with no sky, no sun, no ambient: a 50-point-light grid drawn
 //             by the Forward+ clustered lights node, GI on its fixed
 //             importance-budgeted arena.
-// 'bistro'  — Amazon Lumberyard Bistro under the same sky/sun rig. Two orders of
-//             magnitude more geometry than Sponza, so it is the scale test.
-//
 // The scene is a URL parameter and NOT a live toggle on purpose. clusteredLighting
 // is an install-time decision (the lights factory must be in place before any lit
-// material compiles), and swapping a 191MB model in place would mean disposing
-// every geometry, material and texture of the old one mid-frame. Reloading is the
-// honest way to change either.
+// material compiles), so the Sponza lighting comparison reloads cleanly.
 const SCENES = {
-  sun:     { model: 'sponza', clustered: false },
-  cluster: { model: 'sponza', clustered: true  },
-  bistro:  { model: 'bistro', clustered: false },
+  sun:     { clustered: false },
+  cluster: { clustered: true  },
 };
 const URL_PARAMS = new URLSearchParams(location.search);
 const SCENE_MODE = SCENES[URL_PARAMS.get('scene')] ? URL_PARAMS.get('scene') : 'sun';
@@ -133,39 +148,12 @@ async function reloadWithStructuralSetting(name, value, defaultValue) {
   location.href = `${location.pathname}${search ? `?${search}` : ''}${location.hash}`;
 }
 
-// Per-model load config. `hero` is a dialed-in camera; models without one are
-// auto-framed from their own bounds (use window.dumpCamera() to bake one in).
-const MODELS = {
-  sponza: {
-    url: './Sponza/glTF/Sponza.gltf',
-    meta: 'SPONZA + PREETHAM SKY',
-    hero: { cam: [1.1982, 4.5833, -3.463], target: [-3.2952, 4.4996, -3.2815] },
-    ballHeight: 0.30,   // fraction of model height above its floor
-    // This Sponza glTF imports with scalar metalness = 1 on stone/fabric. Fixed
-    // per-material below rather than through prepareMaterialsForGI, because it
-    // also wants roughness floored much higher than the library default.
-    prep: 'sponza',
-  },
-  bistro: {
-    url: './Bistro/Bistro_Godot.glb',
-    meta: 'BISTRO + PREETHAM SKY',
-    // Street-level view onto the café terrace — the shot Bistro is known for.
-    hero: { cam: [-14.9916, 1.1808, -5.3656], target: [15.2637, 3.2573, 2.6702] },
-    ballHeight: 0.22,    // Bistro's floor sits well above its bounds minimum
-    // Bistro has genuine metal and glass. Flattening it the way Sponza needs
-    // would destroy the look, so use the library's own conservative normalizer.
-    prep: 'library',
-    // Bistro's albedos and scale are not Sponza's: at Sponza's sun and film
-    // exposure it clips to white across most of the frame. These are the look
-    // overrides that put it back on the film's shoulder. The sphere scales too —
-    // a 0.55-unit ball is invisible in a 108-unit street.
-    look: {
-      sunIntensity: 3, filmExposure: 0.4, giIntensity: 12,
-      ballRadius: 1.2, ballOrbit: 7, ballBob: 1.5,
-    },
-  },
+const MODEL = {
+  url: './Sponza/glTF/Sponza.gltf',
+  meta: 'SPONZA + PREETHAM SKY',
+  hero: { cam: [1.1982, 4.5833, -3.463], target: [-3.2952, 4.4996, -3.2815] },
+  ballHeight: 0.30,
 };
-const MODEL = MODELS[SCENES[SCENE_MODE].model];
 
 // ── Dossier chrome handles (see css/dossier.css) ───────────────────────────────
 const uiEl = document.getElementById('ui');
@@ -227,6 +215,17 @@ sun.shadow.normalBias = 0.05;
 // Tiny pre-convergence safety fill; SPEEDBALL probes carry the real sky ambient.
 const hemi = new THREE.HemisphereLight(0x9fc6ff, 0x4a4036, 0.05);
 
+// A focused, physically present key drives both specular sphere modes and the
+// photon solver. Keeping the real SpotLight and the caustic engine on the same
+// position/color/cone avoids a bright pattern from an invisible light source.
+const CAUSTIC_KEY_INTENSITY = 36;
+const causticKey = new THREE.SpotLight(0xffedcf, 0, 18, 0.48, 0.35, 2);
+causticKey.name = 'Centre Sphere Caustic Key';
+causticKey.castShadow = true;
+causticKey.shadow.mapSize.set(1024, 1024);
+causticKey.shadow.bias = -0.00025;
+causticKey.shadow.normalBias = 0.025;
+
 if (CLUSTER) {
   scene.background = new THREE.Color(0x000000);
 } else {
@@ -235,13 +234,12 @@ if (CLUSTER) {
   scene.add(sun.target);
   scene.add(hemi);
 }
+scene.add(causticKey);
+scene.add(causticKey.target);
 
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-// The sun shadow is re-rendered ON DEMAND, not every frame. Measured on Bistro:
-// the shadow pass is 1534 extra draw calls and doubles the triangles submitted
-// (2526 draws / 4.88M tris per frame, vs 992 / 2.44M without it) — for a sun that
-// only moves when someone drags a slider. refreshSunConsumers() already sets
+// The sun shadow is re-rendered ON DEMAND. refreshSunConsumers() sets
 // sun.shadow.needsUpdate on every sun change, and the render loop flags it while
 // the transport animates the sphere, so the map is current exactly when it
 // matters and free the rest of the time.
@@ -259,7 +257,7 @@ const params = {
   sunIntensity: 20, exposure: 1,
   giEnabled: true, giIntensity: 20, giDivisions: 16, giCascades: 1, giContinuous: true, showProbes: false,
   // quality knobs (defaults mirror gi_probes.js). smoothness is pinned to 1 (no slider).
-  giRays: 64, giHysteresis: 0.6, giHysteresisNormalize: true, giNormalBias: 1.75,
+  giRays: 64, giHysteresis: 0.6, giHysteresisNormalize: true, giJitterMode: 'gated', giNormalBias: 1.75,
   giRadianceClamp: 8, giDepthSharpness: 7, giLeak: 0.85, giSolid: 0, giSky: 2, giNormalDetail: 1,
   giReflectionQuality: REFLECTION_QUALITY, giReflectionIntensity: 1, giRoughnessLimit: 1,
   giChangeThreshold: 2.5, giSnapAmount: 0.30, giFireflyClamp: 6.0,   // adaptive temporal blend
@@ -268,7 +266,9 @@ const params = {
   camX: 1.1982, camY: 4.5833, camZ: -3.463,
   targetX: -3.2952, targetY: 4.4996, targetZ: -3.2815,
   // Centre sphere + its transport animation.
-  ballRadius: 0.55, ballRoughness: 0.06, ballOrbit: 2.6, ballSpeed: 0.22, ballBob: 0.55,
+  ballMode: 'metal', ballRadius: 0.55, ballRoughness: 0.06,
+  ballEmissiveIntensity: 10, ballGlassIor: 1.52, ballGlassDispersion: 0.32,
+  ballOrbit: 2.6, ballSpeed: 0.22, ballBob: 0.55,
   // Cluster mode: the point-light grid.
   lightCount: 50, lightIntensity: 8, lightRange: 7, markers: true,
   // Spectral path tracer. ptEnvIntensity is an EYEBALL match, not a conversion:
@@ -293,9 +293,7 @@ if (CLUSTER) {
   params.exposure = 1;
   params.filmEnabled = false;   // the grid's saturated point lights already carry the look
 }
-// Per-model look overrides (exposure, sun, GI gain) applied over the Sponza baseline.
-if (MODEL.look) Object.assign(params, MODEL.look);
-// …and the model's hero view, so applyCamera() frames the right scene.
+// Apply the one Sponza hero view.
 if (MODEL.hero) {
   [params.camX, params.camY, params.camZ] = MODEL.hero.cam;
   [params.targetX, params.targetY, params.targetZ] = MODEL.hero.target;
@@ -413,6 +411,7 @@ installGuiIdleGate(gui);
 // CONTROLS in the top strip parks the whole panel off-screen — the render is the
 // specimen, so it has to be possible to clear the glass off it.
 const guiToggleEl = document.getElementById('gui-toggle');
+gui.domElement.classList.add('gui-hidden');
 guiToggleEl.addEventListener('click', () => {
   const hidden = gui.domElement.classList.toggle('gui-hidden');
   guiToggleEl.setAttribute('aria-pressed', String(!hidden));
@@ -458,7 +457,7 @@ gi = installSpeedballGI({
   enabled: params.giEnabled,
   intensity: params.giIntensity,
   divisions: params.giDivisions,
-  hysteresis: 0.95,
+  hysteresis: params.giHysteresis,
   // Balanced local reflections: 8x8 glossy texels, interleaved half-rate resolve,
   // and a continuous 8-probe receiver. Use `ultra` for a 16x16/full-rate cache.
   reflectionQuality: params.giReflectionQuality,
@@ -490,6 +489,107 @@ addGiPanel(gui, gi, params, {
     if (quality !== REFLECTION_QUALITY) reloadWithStructuralSetting('reflections', quality, 'high');
   },
 });
+
+// ── Centre-bottom core interface ──────────────────────────────────────────────
+// The drawer keeps the full expert surface; these are the handful of controls
+// that define the demo and stay visible beside the material modes.
+const sunBallEl = document.getElementById('sun-ball');
+const sunDotEl = document.getElementById('sun-dot');
+const sunReadoutEl = document.getElementById('sun-readout');
+const intensitySliderEl = document.getElementById('intensity-slider');
+const intensityValueEl = document.getElementById('intensity-value');
+const divisionsSliderEl = document.getElementById('divisions-slider');
+const divisionsValueEl = document.getElementById('divisions-value');
+const raysSliderEl = document.getElementById('rays-slider');
+const raysValueEl = document.getElementById('rays-value');
+const hysteresisMeterEl = document.getElementById('hysteresis-meter');
+const hysteresisSliderEl = document.getElementById('hysteresis-slider');
+const hysteresisValueEl = document.getElementById('hysteresis-value');
+const hysteresisStateEl = document.getElementById('hysteresis-state');
+const jitterGatedEl = document.getElementById('jitter-gated');
+const jitterMcEl = document.getElementById('jitter-mc');
+
+function refreshGuiDisplays() {
+  gui.controllersRecursive?.().forEach((controller) => controller.updateDisplay());
+}
+
+function syncCoreControls() {
+  const az = THREE.MathUtils.degToRad(params.azimuth);
+  const el = THREE.MathUtils.degToRad(params.elevation);
+  const orbit = 19;
+  const x = Math.sin(az) * Math.cos(el) * orbit;
+  const y = -Math.sin(el) * orbit;
+  sunDotEl.style.transform = `translate(calc(-50% + ${x}px), calc(-50% + ${y}px))`;
+  sunReadoutEl.textContent = `${Math.round(params.azimuth)}° / ${params.elevation.toFixed(1)}°`;
+  intensitySliderEl.value = String(params.sunIntensity);
+  intensityValueEl.textContent = Number(params.sunIntensity).toFixed(1).replace(/\.0$/, '');
+  divisionsSliderEl.value = String(params.giDivisions);
+  divisionsValueEl.textContent = String(params.giDivisions);
+  raysSliderEl.value = String(params.giRays);
+  raysValueEl.textContent = String(params.giRays);
+  hysteresisSliderEl.value = String(params.giHysteresis);
+  hysteresisValueEl.textContent = Number(params.giHysteresis).toFixed(2);
+  const threshold = params.giJitterMode === 'montecarlo' ? 0.9 : 0.6;
+  const danger = params.giHysteresis < threshold;
+  const dangerStop = ((threshold - 0.5) / (0.99 - 0.5)) * 100;
+  hysteresisMeterEl.style.setProperty('--danger-stop', `${dangerStop}%`);
+  hysteresisMeterEl.classList.toggle('danger', danger);
+  hysteresisStateEl.textContent = danger ? 'UNSTABLE' : 'STABLE';
+  jitterGatedEl.setAttribute('aria-pressed', String(params.giJitterMode === 'gated'));
+  jitterMcEl.setAttribute('aria-pressed', String(params.giJitterMode === 'montecarlo'));
+}
+
+let sunDrag = null;
+sunBallEl.addEventListener('pointerdown', (event) => {
+  sunDrag = { x: event.clientX, y: event.clientY, azimuth: params.azimuth, elevation: params.elevation };
+  sunBallEl.setPointerCapture(event.pointerId);
+});
+sunBallEl.addEventListener('pointermove', (event) => {
+  if (!sunDrag || !sunBallEl.hasPointerCapture(event.pointerId)) return;
+  params.azimuth = (sunDrag.azimuth + (event.clientX - sunDrag.x) * 1.4 + 360) % 360;
+  params.elevation = THREE.MathUtils.clamp(sunDrag.elevation - (event.clientY - sunDrag.y) * 0.9, -3, 88);
+  updateSun();
+  syncCoreControls();
+  refreshGuiDisplays();
+});
+sunBallEl.addEventListener('pointerup', () => { sunDrag = null; });
+sunBallEl.addEventListener('pointercancel', () => { sunDrag = null; });
+
+intensitySliderEl.addEventListener('input', () => {
+  params.sunIntensity = Number(intensitySliderEl.value);
+  updateSun(); syncCoreControls(); refreshGuiDisplays();
+});
+divisionsSliderEl.addEventListener('input', () => {
+  params.giDivisions = Number(divisionsSliderEl.value);
+  syncCoreControls(); refreshGuiDisplays();
+});
+divisionsSliderEl.addEventListener('change', () => {
+  gi.setDivisions(params.giDivisions); updateProbeHelpers(); markGiInteraction();
+});
+raysSliderEl.addEventListener('input', () => {
+  params.giRays = Number(raysSliderEl.value);
+  syncCoreControls(); refreshGuiDisplays();
+});
+raysSliderEl.addEventListener('change', () => {
+  gi.setRays(params.giRays); markGiInteraction();
+});
+hysteresisSliderEl.addEventListener('input', () => {
+  params.giHysteresis = Number(hysteresisSliderEl.value);
+  gi.setHysteresis(params.giHysteresis); markGiInteraction();
+  syncCoreControls(); refreshGuiDisplays();
+});
+function setJitterMode(mode) {
+  gi.setJitterMode?.(mode);
+  params.giJitterMode = gi.getJitterMode?.() ?? mode;
+  params.giHysteresis = gi.getHysteresis?.() ?? params.giHysteresis;
+  markGiInteraction();
+  syncCoreControls(); refreshGuiDisplays();
+}
+jitterGatedEl.addEventListener('click', () => setJitterMode('gated'));
+jitterMcEl.addEventListener('click', () => setJitterMode('montecarlo'));
+setJitterMode(params.giJitterMode);
+syncCoreControls();
+
 window.gi = gi; // console handle for poking
 window.gui = gui;
 window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = gi.markMaterialsDirty; // diagnostics
@@ -546,10 +646,141 @@ gui.add(params, 'filmEnabled').name('Film').onChange((on) => {
 });
 
 // ── Centre sphere ─────────────────────────────────────────────────────────────
+let ball = null;
+let sponzaBounds = null;
+const ballHome = new THREE.Vector3();
+let metalCaustics = null;
+let glassCaustics = null;
+let causticCaster = null;
+let causticLastSyncMs = 0;
+let engine = 'raster';
+let tracer = null;
+const engineNoteEl = document.getElementById('engine-note');
+let playing = false;
+let animClock = 0;          // seconds of animation played, paused-time excluded
+let lastAnimMs = 0;
+
+const BALL_MODE_COPY = {
+  emissive: 'MESH EMITTER · NEE · INFINITE BOUNCE',
+  metal: 'PHOTON CAUSTIC · REFLECTION · DDGI',
+  glass: 'PHOTON CAUSTIC · REFRACTION · DISPERSION',
+};
+
+function activeCaustics() {
+  if (params.ballMode === 'metal') return metalCaustics;
+  if (params.ballMode === 'glass') return glassCaustics;
+  return null;
+}
+
+function syncBallModeButtons() {
+  for (const mode of Object.keys(BALL_MODE_COPY)) {
+    document.getElementById(`ball-${mode}`).setAttribute('aria-pressed', String(params.ballMode === mode));
+  }
+}
+
+function syncCausticLight(engineHandle) {
+  if (!engineHandle || !ball) return;
+  const direction = new THREE.Vector3().subVectors(ball.position, causticKey.position).normalize();
+  engineHandle.setLight(causticKey.position.x, causticKey.position.y, causticKey.position.z);
+  engineHandle.setLightColor(causticKey.color.r, causticKey.color.g, causticKey.color.b);
+  engineHandle.setLightIntensity(CAUSTIC_KEY_INTENSITY, CAUSTIC_KEY_INTENSITY);
+  engineHandle.setLightCone(direction, causticKey.angle, causticKey.penumbra);
+}
+
+function syncActiveCaustic(nowMs = performance.now(), force = false) {
+  const active = activeCaustics();
+  if (!active || !ball || !causticCaster) return;
+  // A moving glossy caster invalidates accumulation. Refit the lightweight
+  // 1.2k-triangle proxy at 12 Hz; the final pause/switch always forces an exact
+  // sync so the converged caustic and rendered sphere cannot disagree.
+  if (!force && nowMs - causticLastSyncMs < 80) return;
+  causticLastSyncMs = nowMs;
+  causticCaster.position.copy(ball.position);
+  causticCaster.quaternion.copy(ball.quaternion);
+  causticCaster.scale.copy(ball.scale);
+  causticCaster.updateMatrixWorld(true);
+  causticKey.target.position.copy(ball.position);
+  causticKey.target.updateMatrixWorld(true);
+  syncCausticLight(active);
+  active.setCasterMesh(causticCaster);
+}
+
+function applyBallMaterialMode() {
+  if (!ball) return;
+  const m = ball.material;
+  m.emissive.set(0x000000);
+  m.emissiveIntensity = 0;
+  m.transmission = 0;
+  m.thickness = 0;
+  m.attenuationDistance = Infinity;
+  m.clearcoat = 0;
+
+  if (params.ballMode === 'emissive') {
+    m.color.set(0x321408);
+    m.metalness = 0;
+    m.roughness = 0.34;
+    m.emissive.set(0xff8a2b);
+    m.emissiveIntensity = params.ballEmissiveIntensity;
+  } else if (params.ballMode === 'glass') {
+    m.color.set(0xe9f5ff);
+    m.metalness = 0;
+    m.roughness = Math.min(params.ballRoughness, 0.18);
+    m.transmission = 1;
+    m.ior = params.ballGlassIor;
+    m.thickness = params.ballRadius * 1.8;
+    m.attenuationColor.set(0xb8ddff);
+    m.attenuationDistance = 4;
+  } else {
+    m.color.set(0xc6d0d8);
+    m.metalness = 1;
+    m.roughness = params.ballRoughness;
+    m.ior = 1.5;
+  }
+
+  // Transmission changes the render graph; dispose the compiled variant so the
+  // WebGPU material recompiles immediately for the selected physical mode.
+  m.dispose();
+  m.needsUpdate = true;
+}
+
+function setBallMode(next, { initial = false } = {}) {
+  if (!BALL_MODE_COPY[next]) return;
+  params.ballMode = next;
+  syncBallModeButtons();
+  applyBallMaterialMode();
+
+  causticKey.intensity = next === 'emissive' ? 0 : CAUSTIC_KEY_INTENSITY;
+  causticKey.updateMatrixWorld(true);
+  causticKey.shadow.needsUpdate = true;
+  if (metalCaustics) metalCaustics.overlayMesh.visible = next === 'metal';
+  if (glassCaustics) glassCaustics.overlayMesh.visible = next === 'glass';
+  if (next !== 'emissive') syncActiveCaustic(performance.now(), true);
+
+  if (ball) {
+    // The mesh is permanently opted into emitter discovery. Emissive black means
+    // zero records in metal/glass; turning emission on adds the same sphere as a
+    // type-3 NEE source without rebuilding its geometry.
+    gi?.markMaterialValuesDirty?.(ball);
+    gi?.forceLightingRefresh?.();
+    tracer?.markSceneDirty?.();
+  }
+  if (!initial) markGiInteraction();
+  updateEngineNote();
+}
+
+for (const mode of Object.keys(BALL_MODE_COPY)) {
+  document.getElementById(`ball-${mode}`).addEventListener('click', () => setBallMode(mode));
+}
+syncBallModeButtons();
+
 const fBall = gui.addFolder('Centre sphere');
 fBall.add(params, 'ballRoughness', 0, 0.6, 0.005).name('roughness').onChange((v) => {
   if (!ball) return;
-  ball.material.roughness = v;   // rough reflections read straight off the probe field
+  if (params.ballMode === 'emissive') return;
+  ball.material.roughness = params.ballMode === 'glass' ? Math.min(v, 0.18) : v;
+  activeCaustics()?.setRoughness(ball.material.roughness);
+  gi?.markMaterialValuesDirty?.(ball);
+  tracer?.markSceneDirty?.();
   markGiInteraction();
 });
 fBall.add(params, 'ballOrbit', 0, 6, 0.05).name('orbit radius').onChange(markInteraction);
@@ -591,24 +822,18 @@ fPt.add(params, 'ptEnvIntensity', 0, 64, 0.5).name('sky gain').onChange((v) => {
 
 if (compactControls.matches) gui.close();
 
-// ── Centre sphere + transport ─────────────────────────────────────────────────
+// ── Centre sphere transport ───────────────────────────────────────────────────
 // The sphere is the demo's moving part. Standing still, GI convergence is easy to
 // fake with a long temporal tail; put a mirror ball on a circuit through the
 // atrium and the reflection lane has to keep up every frame. The transport is
 // therefore the honest stress test, not decoration.
-let ball = null;
-let sponzaBounds = null;
-const ballHome = new THREE.Vector3();
-let playing = false;
-let animClock = 0;          // seconds of animation played, paused-time excluded
-let lastAnimMs = 0;
-
 function updateBallAnimation(nowMs) {
   if (!ball) return;
   if (!playing) { lastAnimMs = nowMs; return; }
   // The sphere is the only thing moving, and shadows are on-demand — so a playing
   // transport is the one case that has to pay for the shadow pass per frame.
   sun.shadow.needsUpdate = true;
+  causticKey.shadow.needsUpdate = true;
   const dt = lastAnimMs ? Math.min(0.1, (nowMs - lastAnimMs) / 1000) : 0;
   lastAnimMs = nowMs;
   animClock += dt;
@@ -623,14 +848,15 @@ function updateBallAnimation(nowMs) {
   );
   ball.rotation.y = t * 0.5;
   ball.updateMatrixWorld(true);
-  // The raster GI lane has its own change detection and refits the BLAS in place,
-  // so it needs no poke here — but the path tracer syncs transforms only when it
-  // is told to, and every move invalidates its accumulated samples.
+  gi?.markTransformsDirty?.(ball);
+  syncActiveCaustic(nowMs);
+  // Every move invalidates path-trace accumulation.
   tracer?.markTransformsDirty();
 }
 
 const playEl = document.getElementById('play');
 const tEngineEl = document.getElementById('t-engine');
+const tEffectEl = document.getElementById('t-effect');
 const tMetricEl = document.getElementById('t-metric');
 const tMetricKEl = document.getElementById('t-metric-k');
 function setPlaying(on) {
@@ -638,6 +864,7 @@ function setPlaying(on) {
   lastAnimMs = 0;
   playEl.setAttribute('aria-pressed', String(playing));
   playEl.querySelector('.label').textContent = playing ? 'PAUSE' : 'ANIMATE';
+  if (!playing) syncActiveCaustic(performance.now(), true);
   markInteraction();
 }
 playEl.addEventListener('click', () => setPlaying(!playing));
@@ -703,6 +930,84 @@ function rebuildLights(count) {
   scene.add(markerMesh);
 }
 
+function createBallCaustics(box, size) {
+  const receiverWidth = Math.min(size.x * 0.72, Math.max(8, params.ballOrbit * 2 + 3.5));
+  const receiverHeight = Math.min(size.z * 0.88, Math.max(5.5, params.ballOrbit * 0.7 + 4.5));
+  const receiver = causticReceiverFloor({
+    y: box.min.y + 0.008,
+    width: receiverWidth,
+    height: receiverHeight,
+  });
+  receiver.origin[0] = ballHome.x;
+  receiver.origin[2] = ballHome.z;
+
+  // The display sphere stays dense and smooth. Photon emission uses a lower-poly
+  // invisible proxy so a moving caustic can refresh without rebuilding a 5k-tri
+  // CPU BVH every frame.
+  causticCaster = new THREE.Mesh(
+    new THREE.SphereGeometry(params.ballRadius, 32, 20),
+    new THREE.MeshBasicMaterial(),
+  );
+  causticCaster.name = 'Centre Sphere Caustic Proxy';
+  causticCaster.position.copy(ball.position);
+  causticCaster.updateMatrixWorld(true);
+
+  metalCaustics = createCausticEngine({
+    THREE, renderer, receiver,
+    mode: 'reflect', grid: 512,
+    targetPhotons: 1_800_000, photonBudget: 180_000,
+  });
+  glassCaustics = createCausticEngine({
+    THREE, renderer, receiver,
+    mode: 'refract', grid: 512,
+    targetPhotons: 2_700_000, photonBudget: 100_000, resolveInterval: 2,
+    ior: params.ballGlassIor,
+    dispersion: params.ballGlassDispersion,
+    thickness: 0.45,
+  });
+
+  metalCaustics.setMetal('chrome');
+  metalCaustics.setRoughness(params.ballRoughness);
+  metalCaustics.setSoftness(0.62);
+  metalCaustics.setThrowFalloff(1 / 144);
+  glassCaustics.setRoughness(Math.min(params.ballRoughness, 0.18));
+  glassCaustics.setSoftness(0.82);
+  glassCaustics.setThrowFalloff(1 / 144);
+  for (const [mode, engineHandle] of [['metal', metalCaustics], ['glass', glassCaustics]]) {
+    engineHandle.overlayMesh.name = `Centre Sphere ${mode} Caustic`;
+    engineHandle.overlayMesh.visible = false;
+    engineHandle.overlayMesh.frustumCulled = false;
+    excludeFromGI(engineHandle.overlayMesh);
+    scene.add(engineHandle.overlayMesh);
+    engineHandle.setReceiverAlbedo(0.82, 0.78, 0.70);
+    engineHandle.setCasterMesh(causticCaster);
+  }
+
+  causticKey.position.set(ballHome.x - 3.4, ballHome.y + 4.6, ballHome.z - 2.7);
+  causticKey.target.position.copy(ball.position);
+  causticKey.updateMatrixWorld(true);
+  causticKey.target.updateMatrixWorld(true);
+  syncCausticLight(metalCaustics);
+  syncCausticLight(glassCaustics);
+  window.caustics = { metal: metalCaustics, glass: glassCaustics };
+}
+
+function disposeBallCaustics() {
+  for (const engineHandle of [metalCaustics, glassCaustics]) {
+    if (!engineHandle) continue;
+    scene.remove(engineHandle.overlayMesh);
+    engineHandle.dispose();
+  }
+  metalCaustics = null;
+  glassCaustics = null;
+  if (causticCaster) {
+    causticCaster.geometry.dispose();
+    causticCaster.material.dispose();
+    causticCaster = null;
+  }
+  delete window.caustics;
+}
+
 // ── Load Sponza ────────────────────────────────────────────────────────────────
 setStatus(`loading ${MODEL.meta.split(' ')[0]}…`);
 new GLTFLoader().load(MODEL.url, (gltf) => {
@@ -711,13 +1016,9 @@ new GLTFLoader().load(MODEL.url, (gltf) => {
     if (!o.isMesh) return;
     o.castShadow = true;
     o.receiveShadow = true;
-    if (MODEL.prep !== 'sponza') return;
     if (Array.isArray(o.material)) o.material.forEach(prepareSponzaMaterialForGi);
     else prepareSponzaMaterialForGi(o.material);
   });
-  // Bistro carries real metal and glass, so it gets the library's conservative
-  // normalizer rather than Sponza's flatten-everything fix.
-  if (MODEL.prep === 'library') prepareMaterialsForGI(root);
   scene.add(root);
 
   // frame the camera to the model and size the shadow camera to its bounds
@@ -744,35 +1045,31 @@ new GLTFLoader().load(MODEL.url, (gltf) => {
   }
 
   // ── Centre sphere ────────────────────────────────────────────────────────
-  // The hero specimen: a near-mirror metal ball parked on the atrium's centre
-  // line, at standing height. Unlike the old corner diagnostic it is a REAL
-  // scene object — in the GI BVH and in the traced scene — so it occludes
-  // probes, casts a shadow, and shows up under the path tracer. A metal surface
-  // contributes no diffuse bounce either way (SPEEDBALL kills Lambert bounce on
-  // metals), so keeping it in costs the bounce lane nothing.
+  // One physical sphere carries all three transport demonstrations. It remains a
+  // real traced scene object in every mode; only its material values, emitter NEE
+  // record, and caustic overlay change.
   sponzaBounds = box.clone();
   const centre = box.getCenter(new THREE.Vector3());
   ballHome.set(centre.x, box.min.y + size.y * (MODEL.ballHeight ?? 0.30), centre.z);
-  const metalBall = new THREE.Mesh(
+  const centreBall = new THREE.Mesh(
     new THREE.SphereGeometry(params.ballRadius, 64, 40),
-    new THREE.MeshStandardMaterial({ color: 0xc6d0d8, metalness: 1, roughness: params.ballRoughness }),
+    new THREE.MeshPhysicalMaterial({ color: 0xc6d0d8, metalness: 1, roughness: params.ballRoughness }),
   );
-  metalBall.name = 'Centre Sphere';
-  metalBall.position.copy(ballHome);
-  metalBall.castShadow = true;
-  metalBall.receiveShadow = true;
-  scene.add(metalBall);
-  ball = metalBall;
+  centreBall.name = 'Centre Sphere';
+  centreBall.position.copy(ballHome);
+  centreBall.castShadow = true;
+  centreBall.receiveShadow = true;
+  centreBall.userData.giEmitter = true;
+  scene.add(centreBall);
+  ball = centreBall;
+  createBallCaustics(box, size);
+  setBallMode(params.ballMode, { initial: true });
 
   camera.near = radius * 0.01; camera.far = radius * 30; camera.updateProjectionMatrix();
   const sc = sun.shadow.camera;
   sc.left = -radius; sc.right = radius; sc.top = radius; sc.bottom = -radius;
   sc.near = 0.1; sc.far = radius * 8; sc.updateProjectionMatrix();
   sky.scale.setScalar(camera.far * 0.5);
-  // The map now costs nothing per frame, so a big scene can afford the resolution
-  // it actually needs: Bistro's shadow camera covers ~5x Sponza's extent, which at
-  // 2048 leaves it starved of texels.
-  if (MODEL.shadowMapSize) sun.shadow.mapSize.setScalar(MODEL.shadowMapSize);
   sun.shadow.needsUpdate = true;   // first and only render until something moves
 
   if (CLUSTER) rebuildLights(params.lightCount);
@@ -784,13 +1081,7 @@ new GLTFLoader().load(MODEL.url, (gltf) => {
 }, (xhr) => {
   if (xhr.total) setStatus(`loading ${MODEL.meta.split(' ')[0]}… ` + Math.min(100, Math.round(xhr.loaded / xhr.total * 100)) + '%');
 }, (err) => {
-  // Bistro is gitignored (~191MB), so "missing" is the expected state on a fresh
-  // clone rather than a fault — say what to do about it instead of a raw stack.
-  if (MODEL.prep === 'library') {
-    setStatus(`Bistro is not present.\n\nIt is gitignored (~191MB). Put the .glb at\n${MODEL.url}\nor switch back to SPONZA.`, true);
-  } else {
-    setStatus(`Failed to load ${MODEL.url}\n` + (err?.message || err), true);
-  }
+  setStatus(`Failed to load ${MODEL.url}\n` + (err?.message || err), true);
 });
 
 // ── Render loop ───────────────────────────────────────────────────────────────
@@ -917,14 +1208,14 @@ function releaseSkyEnv() {
 //     dump a full solve into the first frame after the switch;
 //   • the switch is locked while the tracer is arming, so a double-click cannot
 //     leave two engines half-alive.
-let engine = 'raster';
-let tracer = null;
 let prevDamping = null;
 const engineRasterEl = document.getElementById('engine-raster');
 const enginePtEl = document.getElementById('engine-pt');
-const engineNoteEl = document.getElementById('engine-note');
-const RASTER_NOTE = 'BVH-TRACED · INFINITE BOUNCE · NO BAKE';
 const PT_NOTE = 'SPECTRAL PATH TRACE · PROGRESSIVE · GROUND TRUTH';
+
+function updateEngineNote() {
+  engineNoteEl.textContent = engine === 'pt' ? PT_NOTE : BALL_MODE_COPY[params.ballMode];
+}
 
 function disposeTracer() {
   if (!tracer) return;
@@ -943,6 +1234,7 @@ async function disposeForStructuralReload() {
   // High <-> Ultra changes can race the old device teardown and fall back to WebGL2.
   renderer.setAnimationLoop(null);
   disposeTracer();
+  disposeBallCaustics();
   gi?.dispose?.();
   controls.dispose();
   const deviceLost = renderer.backend?.device?.lost;
@@ -1014,7 +1306,7 @@ function setEngine(next) {
   engine = next;
   engineRasterEl.setAttribute('aria-pressed', String(engine === 'raster'));
   enginePtEl.setAttribute('aria-pressed', String(engine === 'pt'));
-  engineNoteEl.textContent = engine === 'pt' ? PT_NOTE : RASTER_NOTE;
+  updateEngineNote();
   tEngineEl.textContent = engine === 'pt' ? 'PATH TRACE' : 'RASTER';
   tEngineEl.classList.toggle('accent', engine === 'pt');
   window.tracer = tracer;
@@ -1022,12 +1314,12 @@ function setEngine(next) {
 }
 engineRasterEl.addEventListener('click', () => setEngine('raster'));
 enginePtEl.addEventListener('click', () => setEngine('pt'));
-// A tab close mid-trace must not leave the tracer's scene buffers alive.
-window.addEventListener('pagehide', disposeTracer);
+// A tab close must not leave tracer or photon buffers alive.
+window.addEventListener('pagehide', () => { disposeTracer(); disposeBallCaustics(); });
 
 // ── Scene buttons — see SCENE_MODE: install-time, so they reload ─────────────
-document.getElementById('scene-meta').textContent = MODEL.meta;
-for (const [id, mode] of [['scene-sun', 'sun'], ['scene-cluster', 'cluster'], ['scene-bistro', 'bistro']]) {
+document.getElementById('scene-meta').textContent = CLUSTER ? 'SPONZA + 50 LIGHTS' : MODEL.meta;
+for (const [id, mode] of [['scene-sun', 'sun'], ['scene-cluster', 'cluster']]) {
   const el = document.getElementById(id);
   el.setAttribute('aria-pressed', String(SCENE_MODE === mode));
   el.addEventListener('click', () => {
@@ -1098,6 +1390,17 @@ function updateTransportReadout(nowMs) {
   const fps = span > 0 ? Math.round((fpsFrames * 1000) / span) : 0;
   fpsFrames = 0; fpsWindowMs = nowMs;
 
+  const caustic = activeCaustics();
+  if (!caustic) {
+    tEffectEl.textContent = 'EMISSIVE · NEE';
+    tEffectEl.classList.add('accent');
+  } else {
+    const mode = params.ballMode.toUpperCase();
+    const progress = Math.min(100, Math.round((caustic.accum / caustic.targetPhotons) * 100));
+    tEffectEl.textContent = caustic.converged ? `${mode} · READY` : `${mode} · ${progress}%`;
+    tEffectEl.classList.toggle('accent', caustic.converged);
+  }
+
   if (engine === 'pt') {
     // Progressive tracing: samples, not framerate, is the number that matters —
     // except while the overlay is up, when nothing is being sampled at all and a
@@ -1145,6 +1448,7 @@ renderer.setAnimationLoop((nowMs) => {
   }
 
   if (sunGiDirty) flushSunGiRefresh();
+  activeCaustics()?.update();
   // SPEEDBALL GI self-gates on idle: the BVH build + GPU solve are held while orbiting
   // or dragging a slider (world-space GI is lossless held static), then converge
   // once the view rests — so a frame hitch can never land mid-interaction. While the

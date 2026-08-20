@@ -148,6 +148,10 @@ const ROT_MIN_TICKS = 6;           // min ticks between ray-set rotations. Small
                                    // rotate the ray set EVERY tick, injecting fresh per-tick noise
                                    // the temporal blend has to absorb. Large grids (multi-tick
                                    // passes ≥ this) are unaffected — they already rotate per pass.
+const JITTER_HYSTERESIS_DEFAULTS = Object.freeze({
+    gated: 0.60,                   // held basis: low-latency, mostly flicker-free response
+    montecarlo: 0.90,              // fresh basis every solve: history absorbs the sample blast
+});
 const LIGHT_CHECK_INTERVAL = 6;    // ticks between light-change checks
 const XFORM_CHECK_INTERVAL = 2;    // ticks between transform checks (in-place TLAS rewrite = cheap)
 const GEO_CHECK_INTERVAL = 24;     // ticks between STRUCTURE checks (topology → full rebuild = expensive)
@@ -946,7 +950,7 @@ export function createProbeField({
     renderer,
     scene,
     intensity = 1.0,
-    hysteresis = 0.95,
+    hysteresis = JITTER_HYSTERESIS_DEFAULTS.gated,
     onRebuilt = null,
     divisions = TARGET_PROBES_LONG_AXIS,
     roughReflections = false,
@@ -1113,10 +1117,9 @@ export function createProbeField({
     // More rays/tick = faster light propagation for more GPU; frame pacing stays
     // owned by the cadence controller either way.
     let rayBudgetCeiling = RAYS_PER_TICK;
-    // Ray-jitter regime (setJitterMode): 'gated' (default) = GATED BASIS — the
-    // pass-boundary rotation gate, hysteresis stable at extreme low values.
-    // 'montecarlo' = re-jitter every C0 solve tick, maximum discovery rate,
-    // stability owed entirely to the hysteresis dose (flickers at low h).
+    // Ray-jitter regime (setJitterMode): 'gated' (default) holds the basis and
+    // pairs with a low-latency 0.60 history; 'montecarlo' re-jitters every C0
+    // solve tick and pairs with 0.90 history to absorb the sample blast.
     let jitterMode = 'gated';
     let lastTickAt = 0;
     let tickDtEma = 0;
@@ -1137,11 +1140,15 @@ export function createProbeField({
         cadenceOverloadStreak = 0;
     }
     let frameCounter = 0;
-    let emitterVisSeedCounter = 0;   // advances every C0 solve tick (see U.emitterVisSeed)
+    let emitterVisSeedCounter = 0;   // advances with the active ray-sampling epoch
     let quantStep = 1;        // translation deadband (~quarter cell) for the geo signature (A1)
     let lightQuant = 1;       // scene-relative position deadband for the light signature (B4)
     // reactivity: self-detect live light/geometry edits and re-converge fast.
     let baseHysteresis = THREE.MathUtils.clamp(hysteresis, 0, 0.99);
+    const jitterHysteresis = {
+        gated: baseHysteresis,
+        montecarlo: JITTER_HYSTERESIS_DEFAULTS.montecarlo,
+    };
     let hysteresisNormalize = true;
     let chebyBiasScale = 1.0;
     let debugFreezeRayJitter = false;
@@ -1179,15 +1186,13 @@ export function createProbeField({
         lightCount: uniform(0, 'uint'),
         emitterBase: uniform(0, 'uint'),
         emitterCount: uniform(0, 'uint'),
-        // Emitter-vis disk target — decorrelates EVERY solve tick, independent of
-        // the gated frameJitter. The vis EMA is the smoothing filter; a frozen
-        // target converges it to a binary wrong answer (splotches behind partial
-        // occluders when gated churn starves the basis rotation).
+        // Emitter-vis disk target follows the same sampling epoch as frameJitter:
+        // stable across a Gated pass, fresh every Monte Carlo solve tick.
         emitterVisSeed: uniform(0.0),
         frameJitter: uniform(0.0),
         // Raw 60 Hz reference-rate retention. Adaptive signal-specific weights are
         // derived from this first, then normalized once with hysteresisExponent.
-        hysteresis: uniform(THREE.MathUtils.clamp(hysteresis, 0, 0.99)),
+        hysteresis: uniform(baseHysteresis),
         hysteresisExponent: uniform(1.0),
         // Raw cosine exponent. Seven is already a ~25 degree half-power cone and
         // about 7.5 effective samples at the default 64 rays; the old implicit 50
@@ -3729,19 +3734,19 @@ export function createProbeField({
                 // this tick (rotation happens BEFORE any dispatch). Multi-tick (round-robin)
                 // passes keep the ROT_MIN_TICKS spacing.
                 C.ticksSinceRot++;
-                // Emitter-vis targets advance every C0 tick REGARDLESS of jitter mode:
-                // the trace basis stays gated, but the vis shadow ray must keep
-                // sampling fresh disk points or its EMA converges to whatever the
-                // one frozen target sees (binary vis → emissive splotches / leaks).
-                if (ci === 0 && !debugFreezeRayJitter) {
+                const rotateRaySet = ci === 0 && (jitterMode === 'montecarlo'
+                    || (C.probeCursor === 0 && C.ticksSinceRot >= ROT_MIN_TICKS));
+                // Keep every stochastic input in the selected regime. Gated holds
+                // the emitter target stable for a complete probe pass; Monte Carlo
+                // advances it on every C0 solve tick along with the ray basis.
+                if (rotateRaySet && !debugFreezeRayJitter) {
                     emitterVisSeedCounter = (emitterVisSeedCounter + 1) >>> 0;
                     U.emitterVisSeed.value = (emitterVisSeedCounter * 0.61803398875) % 1;
                 }
                 // 'gated' (default): rotate ONLY at a C0 pass boundary — the exact
-                // legacy condition, untouched. 'montecarlo': rotate every C0 solve
-                // tick, mid-pass (see jitterMode above).
-                if (ci === 0 && (jitterMode === 'montecarlo'
-                    || (C.probeCursor === 0 && (fullPassPerTick || C.ticksSinceRot >= ROT_MIN_TICKS)))) {
+                // pass boundary after the minimum hold. This keeps one-tick full
+                // passes gated too. 'montecarlo' rotates every C0 solve tick.
+                if (rotateRaySet) {
                     if (C.refreshStarted && !debugFreezeRayJitter) {
                         frameCounter = (frameCounter + 1) >>> 0;
                         U.frameJitter.value = debugFrameJitterOverride ?? ((frameCounter * 0.61803398875) % 1);
@@ -4571,8 +4576,10 @@ export function createProbeField({
         setHysteresis: (v) => {
             if (!Number.isFinite(v)) return;
             baseHysteresis = THREE.MathUtils.clamp(v, 0, 0.99); // steady-state temporal blend (higher = more stable/slower)
+            jitterHysteresis[jitterMode] = baseHysteresis;      // each sampling mode remembers its deliberate override
             U.hysteresis.value = baseHysteresis;                // apply now; tick() re-asserts it every solve
         },
+        getHysteresis: () => baseHysteresis,
         setHysteresisNormalization: (on) => {
             hysteresisNormalize = on !== false;
             U.hysteresis.value = baseHysteresis;
@@ -4580,11 +4587,17 @@ export function createProbeField({
         },
         getHysteresisNormalization: () => hysteresisNormalize,
         // Ray-jitter regime: 'gated' (GATED BASIS, default) vs 'montecarlo'.
-        // CPU-side gate decision only — instant, no recompile, no rebuild.
+        // Switching restores that mode's remembered hysteresis profile. Both
+        // writes are live uniforms/CPU state — instant, no recompile or rebuild.
         setJitterMode: (mode) => {
             const m = String(mode ?? '').toLowerCase().replace(/[\s_-]/g, '');
-            if (m === 'gated' || m === 'gatedbasis') jitterMode = 'gated';
-            else if (m === 'montecarlo' || m === 'mc') jitterMode = 'montecarlo';
+            const nextMode = (m === 'gated' || m === 'gatedbasis') ? 'gated'
+                : (m === 'montecarlo' || m === 'mc') ? 'montecarlo' : null;
+            if (!nextMode || nextMode === jitterMode) return;
+            jitterHysteresis[jitterMode] = baseHysteresis;
+            jitterMode = nextMode;
+            baseHysteresis = jitterHysteresis[jitterMode];
+            U.hysteresis.value = baseHysteresis;
         },
         getJitterMode: () => jitterMode,
         setNormalBias: (v) => {
@@ -4715,6 +4728,7 @@ export function createProbeField({
             frameJitter: U.frameJitter.value,
             frameCounter,
             jitterMode,
+            jitterHysteresis: { ...jitterHysteresis },
             tickBudgetRays,
             tickDtEma,
             sceneResourceRefs: sceneResource?.refs || 0,

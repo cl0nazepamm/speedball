@@ -18,12 +18,6 @@
 # Sponza demo (index.html).
 /debug/
 
-# Bistro (Amazon Lumberyard Bistro via NVIDIA ORCA, CC BY 4.0) is ~191MB — far
-# too large for a public repo that people clone for a 100KB library. Sponza is
-# committed because it is 52MB and is THE reference scene; Bistro is opt-in and
-# loaded from disk. index.html reports a clear status if it is absent.
-/Bistro/
-
 node_modules/
 
 *.log

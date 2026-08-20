@@ -5,6 +5,12 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Gated sampling now honors its minimum ray-set hold even when the entire probe
+  field fits in one solve tick. The former full-pass bypass made Gated identical
+  to Monte Carlo on medium scenes such as Sponza. Emitter-visibility NEE now
+  follows the same sampling epoch. Sampling modes now retain independent stable
+  hysteresis profiles: Gated starts at 0.60 for low latency, Monte Carlo at 0.90
+  to absorb per-solve re-jitter; explicit overrides remain mode-local.
 - Opt-in emissive NEE promotion ("penumbra hypothesis", tier 1): meshes with
   `userData.giEmitter = true` emit a type-3 sphere-proxy light record (world
   bounding sphere, power = emissive x area/4 x `giEmitterScale`, finite

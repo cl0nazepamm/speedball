@@ -14,11 +14,19 @@ The normalization is bounded on the slow side: one update never blends in more f
 
 The live demo exposes a **normalize hysteresis** switch so you can turn the normalization off and compare against the raw per-update value.
 
+Sampling has two stable working profiles. **Gated** holds the ray basis and uses
+0.60 hysteresis for low-latency, mostly flicker-free lighting. **Monte Carlo**
+re-jitters every solve and uses 0.90 hysteresis to absorb that sample blast.
+`setJitterMode()` remembers explicit hysteresis overrides separately per mode.
+
 ## Launch live demos
 
-**[▶ Sponza GI](https://cl0nazepamm.github.io/speedball/)** · **[▶ Glass dispersion](https://cl0nazepamm.github.io/speedball/dispersion.html)** · **[▶ Clustered lighting](https://cl0nazepamm.github.io/speedball/clustered.html)**
+**[▶ Unified Sponza light-transport demo](https://cl0nazepamm.github.io/speedball/)**
 
-Locally: `npm start` then open `http://127.0.0.1:8777/`, `/dispersion.html`, or `/clustered.html`.
+Locally: `npm start` then open `http://127.0.0.1:8777/`. The centre-sphere
+buttons switch live between emissive-mesh NEE, reflective-metal caustics, and
+refractive glass caustics; the same page also carries the sun/clustered and
+raster/path-trace comparisons.
 
 Requires a WebGPU-capable browser (Chrome/Edge stable; Safari 26+).
 
@@ -160,7 +168,7 @@ BVH rebuild. Pass an object to tune the cluster grid:
 `clusteredLighting: { maxLights: 1024, tileSize: 32, zSlices: 24, maxLightsPerCluster: 64 }`.
 
 The default (`false`) keeps the primary batched path byte-identical to previous
-releases. See `clustered.html` for the no-sun Sponza demo — 50 lights by
+releases. Use the **50 LIGHTS** scene mode in the Sponza demo — 50 lights by
 default, with a stress slider to 500 that exercises the importance cut and the
 rebuild-free count changes.
 
