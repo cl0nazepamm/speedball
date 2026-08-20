@@ -143,9 +143,6 @@ const giLightDataCount = () => MAX_LIGHTS * _LIGHT_STRIDE;
 // is bounded (never below debugTempMinChangeH). A global authority drop read as
 // "flicker for a second, then settle" — a visible fade-out/in on every slider
 // touch. The temporal policy is CONSTANT at all times.
-export const GATED_JITTER_HOLD_TICKS = 240; // Four seconds at a 60 Hz accepted solve cadence.
-                                           // Gated is the stable/low-latency product mode:
-                                           // basis discovery is occasional, not frame noise.
 const JITTER_HYSTERESIS_DEFAULTS = Object.freeze({
     gated: 0.60,                   // held basis: low-latency, mostly flicker-free response
     montecarlo: 0.90,              // fresh basis every solve: history absorbs the sample blast
@@ -202,24 +199,6 @@ export function probeUpdateIntervalTicks(probeTotal, probesPerTick, solveEveryTi
     const cap = Math.max(1, Number(probesPerTick) || 1);
     const schedule = Math.max(1, Number(solveEveryTicks) || 1);
     return schedule * Math.max(1, total / cap);
-}
-
-// Gated jitter must not depend on whether `updated` happens to divide the probe
-// count. The old `probeCursor === 0` boundary made a one-batch grid re-jitter every
-// six ticks, while the same field became stable after resize/divisions changed the
-// batch modulo. Hold for a fixed accepted-solve interval and require at least one
-// complete field coverage; Monte Carlo deliberately bypasses this helper.
-export function shouldRotateGatedJitter(
-    ticksSinceRotation,
-    probeCoverageSinceRotation,
-    probeTotal,
-    holdTicks = GATED_JITTER_HOLD_TICKS,
-) {
-    const ticks = Math.max(0, Math.floor(Number(ticksSinceRotation) || 0));
-    const coverage = Math.max(0, Number(probeCoverageSinceRotation) || 0);
-    const total = Math.max(1, Number(probeTotal) || 1);
-    const hold = Math.max(1, Math.floor(Number(holdTicks) || GATED_JITTER_HOLD_TICKS));
-    return ticks >= hold && coverage >= total;
 }
 
 // Clamp a stale high solve budget when an interaction becomes idle. This is a
@@ -1045,9 +1024,6 @@ export function createProbeField({
             probeCursor: 0,
             lastSolveAt: 0,
             solveDtEma: 0,
-            refreshStarted: false,
-            ticksSinceRot: 0,
-            probeCoverageSinceRot: 0,
             glossyPhase: 0,
             prevAtlasW: 0, prevAtlasH: 0, prevGlossyAtlasW: 0, prevGlossyAtlasH: 0, prevProbeTotal: 0,
             needsClear: true, needsClassify: true,
@@ -1120,10 +1096,9 @@ export function createProbeField({
     // older build when it resumes.
     let buildGeneration = 0;
     let manualVolumes = null; // explicit probe volumes (Probe Origin boxes); null = auto-fit scene
-    // needsClassify / needsClear / probeCursor / refreshStarted / ticksSinceRot /
-    // probeCoverageSinceRot / prev*
-    // are now PER-CASCADE (see makeCascade); frameCounter is SHARED (one ray-set rotation
-    // advanced only from C0's accumulated coverage — both cascades read U.frameJitter).
+    // needsClassify / needsClear / probeCursor / prev* are PER-CASCADE (see
+    // makeCascade); frameCounter is shared because Monte Carlo advances one basis
+    // from C0 and both cascades read the same U.frameJitter.
     let rebuildBackoff = 0;   // ticks remaining before retrying after a failed/empty rebuild (A7)
     // ── auto-throttle (the hard rule: never lag the browser). The per-tick ray budget
     // adapts to the observed tick cadence: halve when frames slip, creep back up when
@@ -3170,9 +3145,6 @@ export function createProbeField({
                 C.probeCursor = 0;
                 C.lastSolveAt = 0;
                 C.solveDtEma = 0;
-                C.refreshStarted = false;
-                C.ticksSinceRot = 0;
-                C.probeCoverageSinceRot = 0;
                 C.glossyPhase = 0;
                 C.needsClear = false;             // keep the live atlas history (no black flash)
                 C.needsClassify = true;           // refresh per-probe state for the new geometry
@@ -3204,9 +3176,6 @@ export function createProbeField({
             C.probeCursor = 0;
             C.lastSolveAt = 0;
             C.solveDtEma = 0;
-            C.refreshStarted = false;
-            C.ticksSinceRot = 0;
-            C.probeCoverageSinceRot = 0;
             C.glossyPhase = 0;
             C.needsClear = false;             // reuse the live atlas history (no black flash)
             C.needsClassify = true;           // refresh per-probe state for the new geometry
@@ -3238,9 +3207,6 @@ export function createProbeField({
         C.probeCursor = 0;
         C.lastSolveAt = 0;
         C.solveDtEma = 0;
-        C.refreshStarted = false;
-        C.ticksSinceRot = 0;
-        C.probeCoverageSinceRot = 0;
         C.glossyPhase = 0;
         C.needsClear = true;      // fresh StorageTextures aren't guaranteed zeroed
         C.needsClassify = true;
@@ -3752,27 +3718,22 @@ export function createProbeField({
                 );
                 C.U.probeOffset.value = C.probeCursor >>> 0;
                 C.U.updatedCount.value = updated >>> 0;
-                // (B1) Both cascades share ONE frameJitter. Monte Carlo advances it
-                // every accepted C0 solve. Gated holds it for a fixed wall-cadence
-                // interval and at least one complete field coverage. It deliberately
-                // does not use probeCursor===0: that made startup behavior depend on
-                // batch divisibility, so resize/divisions appeared to "fix" the mode.
-                C.ticksSinceRot++;
-                const rotateRaySet = ci === 0 && (jitterMode === 'montecarlo'
-                    || shouldRotateGatedJitter(
-                        C.ticksSinceRot,
-                        C.probeCoverageSinceRot,
-                        C.probeTotal,
-                    ));
+                // (B1) The product contract is binary and independent of idle time,
+                // probe count, batch size, or resize cadence:
+                //   Gated      — hold the current ray/emitter sampling basis forever.
+                //   Monte Carlo — advance it on every accepted C0 solve.
+                // Both cascades read the same shared uniforms, so trace and blend
+                // remain byte-identical for whichever cascade runs this tick.
+                const rotateRaySet = ci === 0 && jitterMode === 'montecarlo';
                 // Keep every stochastic input in the selected regime. Gated holds
-                // the emitter target stable for a complete probe pass; Monte Carlo
-                // advances it on every C0 solve tick along with the ray basis.
+                // the emitter target indefinitely; Monte Carlo advances it on every
+                // C0 solve tick along with the ray basis.
                 if (rotateRaySet && !debugFreezeRayJitter) {
                     emitterVisSeedCounter = (emitterVisSeedCounter + 1) >>> 0;
                     U.emitterVisSeed.value = (emitterVisSeedCounter * 0.61803398875) % 1;
                 }
-                // Gated changes sampling epoch only at its fixed hold boundary.
-                // Monte Carlo changes it every C0 solve tick by definition.
+                // Monte Carlo changes sampling epoch every C0 solve by definition;
+                // this block is unreachable in Gated mode.
                 if (rotateRaySet) {
                     if (!debugFreezeRayJitter) {
                         frameCounter = (frameCounter + 1) >>> 0;
@@ -3780,12 +3741,8 @@ export function createProbeField({
                     } else if (debugFrameJitterOverride !== null) {
                         U.frameJitter.value = debugFrameJitterOverride;
                     }
-                    C.refreshStarted = true;
-                    C.ticksSinceRot = 0;
-                    C.probeCoverageSinceRot = 0;
                 }
                 C.probeCursor = C.probeTotal > 0 ? (C.probeCursor + updated) % C.probeTotal : 0;
-                C.probeCoverageSinceRot += updated;
 
                 // (A5) One-time-per-rebuild prep for cascade C ONLY. clear (full rebuild only)
                 // + the cheap uploadState (ALWAYS — sole writer of stateAtlas; skipping it
@@ -4810,9 +4767,6 @@ export function createProbeField({
                 solveDtEma: C.solveDtEma,
                 needsClear: C.needsClear,
                 needsClassify: C.needsClassify,
-                refreshStarted: C.refreshStarted,
-                ticksSinceRot: C.ticksSinceRot,
-                probeCoverageSinceRot: C.probeCoverageSinceRot,
                 hasGpu: !!C.gpu,
                 minCell: C.minCell,
             })),

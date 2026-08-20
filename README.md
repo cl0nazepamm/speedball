@@ -14,8 +14,8 @@ The normalization is bounded on the slow side: one update never blends in more f
 
 The live demo exposes a **normalize hysteresis** switch so you can turn the normalization off and compare against the raw per-update value.
 
-Sampling has two stable working profiles. **Gated** holds the ray basis for a
-stable sampling epoch independent of probe-grid size or batch divisibility, and
+Sampling has two stable working profiles. **Gated** holds the current ray basis
+indefinitely—idle time, probe-grid size, and batch divisibility cannot rotate it—and
 uses 0.60 hysteresis for low-latency, mostly flicker-free lighting. **Monte Carlo**
 re-jitters every solve and uses 0.90 hysteresis to absorb that sample blast.
 `setJitterMode()` remembers explicit hysteresis overrides separately per mode.

@@ -8,18 +8,12 @@ All notable changes to Speedball GI are documented here. This project follows
 - Simplified the public Sponza page to one raster GI instrument: removed its top
   bar and embedded path-tracer runtime, and moved Advanced into the bottom deck.
   The package path-tracer modules and exports are unchanged.
-- Fixed Gated ray-basis startup being dependent on probe-batch divisibility. A
-  one-batch field previously re-jittered every six solves and looked like Monte
-  Carlo until resize or a divisions change altered the adaptive batch modulo.
-  Gated now uses a fixed 240-solve hold plus full-field coverage; Monte Carlo
-  remains fresh every solve. `installSpeedballGI({ jitterMode })` now selects the
-  mode before the first field build and applies its 0.60/0.90 default history.
-- Gated sampling now honors its minimum ray-set hold even when the entire probe
-  field fits in one solve tick. The former full-pass bypass made Gated identical
-  to Monte Carlo on medium scenes such as Sponza. Emitter-visibility NEE now
-  follows the same sampling epoch. Sampling modes now retain independent stable
-  hysteresis profiles: Gated starts at 0.60 for low latency, Monte Carlo at 0.90
-  to absorb per-solve re-jitter; explicit overrides remain mode-local.
+- Made the two sampling modes absolute at core level. Gated never automatically
+  rotates its ray or emitter-visibility basis, including during long idle solves;
+  Monte Carlo advances both every accepted C0 solve. This removes the delayed GI
+  jump and all resize/divisions/batch-size dependence. `installSpeedballGI({
+  jitterMode })` selects the mode before the first field build; mode-local history
+  defaults remain 0.60 Gated and 0.90 Monte Carlo.
 - Opt-in emissive NEE promotion ("penumbra hypothesis", tier 1): meshes with
   `userData.giEmitter = true` emit a type-3 sphere-proxy light record (world
   bounding sphere, power = emissive x area/4 x `giEmitterScale`, finite
