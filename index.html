@@ -80,7 +80,9 @@ import { positionWorld, normalWorld, pass } from 'three/tsl';
 import { FilmPipeline, FILM_PRESETS, applyFilmPreset, filmPass } from 'powershot-threejs';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
-import { createCausticEngine, causticReceiverFloor } from './js/caustic_engine.js';
+// Pin the local caustic module revision: browsers cache ESM modules independently
+// from index.html, and a mixed old-engine/new-demo pair must never break model load.
+import { createCausticEngine, causticReceiverFloor } from './js/caustic_engine.js?v=0.6.7-transform';
 
 // ── Scene ──────────────────────────────────────────────────────────────────────
 // 'sun'     — Sponza's sunlit atrium: Preetham sky + directional sun.
@@ -602,6 +604,7 @@ const ballHome = new THREE.Vector3();
 let metalCaustics = null;
 let glassCaustics = null;
 let causticCaster = null;
+let causticLegacyLastSyncMs = -Infinity;
 let playing = false;
 let animClock = 0;          // seconds of animation played, paused-time excluded
 let lastAnimMs = 0;
@@ -633,7 +636,7 @@ function syncCausticLight(engineHandle) {
   engineHandle.setLightCone(direction, causticKey.angle, causticKey.penumbra);
 }
 
-function syncActiveCaustic() {
+function syncActiveCaustic(nowMs = performance.now(), force = false) {
   const active = activeCaustics();
   if (!active || !ball || !causticCaster) return;
   // The proxy geometry/BVH is uploaded once. Rigid motion now changes only the
@@ -646,7 +649,15 @@ function syncActiveCaustic() {
   causticKey.target.position.copy(ball.position);
   causticKey.target.updateMatrixWorld(true);
   syncCausticLight(active);
-  active.setCasterTransform(causticCaster);
+  if (typeof active.setCasterTransform === 'function') {
+    active.setCasterTransform(causticCaster);
+  } else if (force || nowMs - causticLegacyLastSyncMs >= 80) {
+    // Compatibility for a browser tab that retained the pre-transform ESM module.
+    // The versioned import above prevents this after refresh; this guard keeps the
+    // current document alive instead of misreporting the callback error as a GLTF failure.
+    causticLegacyLastSyncMs = nowMs;
+    active.setCasterMesh(causticCaster);
+  }
 }
 
 function applyBallMaterialMode() {
@@ -698,7 +709,7 @@ function setBallMode(next, { initial = false } = {}) {
   causticKey.shadow.needsUpdate = true;
   if (metalCaustics) metalCaustics.overlayMesh.visible = next === 'metal';
   if (glassCaustics) glassCaustics.overlayMesh.visible = next === 'glass';
-  if (next !== 'emissive') syncActiveCaustic();
+  if (next !== 'emissive') syncActiveCaustic(performance.now(), true);
 
   if (ball) {
     // The mesh is permanently opted into emitter discovery. Emissive black means
@@ -775,7 +786,7 @@ function updateBallAnimation(nowMs) {
   ball.rotation.y = t * 0.5;
   ball.updateMatrixWorld(true);
   gi?.markTransformsDirty?.(ball);
-  syncActiveCaustic();
+  syncActiveCaustic(nowMs);
 }
 
 const playEl = document.getElementById('play');
@@ -787,7 +798,7 @@ function setPlaying(on) {
   lastAnimMs = 0;
   playEl.setAttribute('aria-pressed', String(playing));
   playEl.querySelector('.label').textContent = playing ? 'PAUSE' : 'ANIMATE';
-  if (!playing) syncActiveCaustic();
+  if (!playing) syncActiveCaustic(performance.now(), true);
   markInteraction();
 }
 playEl.addEventListener('click', () => setPlaying(!playing));
