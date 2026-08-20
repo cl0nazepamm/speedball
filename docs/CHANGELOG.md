@@ -5,9 +5,15 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Removed the generic PowerShot adapter's redundant full-resolution HDR output
+  target and presentation blit from the Sponza demo. The exact Kodak 500T
+  negative-to-print curve now develops the scene-linear half-float target directly
+  to the canvas; continuous GI and all fidelity settings are unchanged. Static
+  Sponza primitives are losslessly batched from 103 meshes to 25 material draws,
+  and four byte-identical 1K normal-map uploads now share their existing sources.
 - Hardened the Sponza release demo's default frame path: zero-strength halation
-  now disables its three halo passes, PowerShot receives scene-linear input through
-  `RenderPipeline`, the diagnostic sphere no longer invalidates the full 2048²
+  now disables its three halo passes, PowerShot receives scene-linear input from
+  an explicit half-float target, the diagnostic sphere no longer invalidates the full 2048²
   103-caster shadow map while moving, and opaque UI chrome replaces live canvas
   backdrop blur. The full-resolution scene pass is single-sampled instead of 4x
   MSAA by default. Sun/light refreshes, resize allocation, and hidden Advanced GUI

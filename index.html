@@ -70,9 +70,9 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { pass } from 'three/tsl';
-import { FilmPipeline, FILM_PRESETS, applyFilmPreset, filmPass } from 'powershot-threejs';
+import { FilmPipeline, FILM_PRESETS, applyFilmPreset } from 'powershot-threejs';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
 
@@ -341,6 +341,7 @@ function flushResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  resizeFilmTarget();
 }
 window.addEventListener('resize', onResize);
 
@@ -403,6 +404,64 @@ function prepareSponzaMaterialForGi(material) {
     material.roughness = 0.85;
     material.needsUpdate = true;
   }
+}
+
+// The Khronos Sponza glTF is one static mesh split into 103 primitives even
+// though it uses only 25 materials. Preserve every vertex attribute and material,
+// but bake each primitive's root-local transform and merge equal-material runs so
+// the main view, the shadow map, and GI see 25 meshes instead of 103 draw objects.
+function batchStaticMeshesByMaterial(root) {
+  root.updateMatrixWorld(true);
+  const rootWorldInverse = new THREE.Matrix4().copy(root.matrixWorld).invert();
+  const byMaterial = new Map();
+
+  root.traverse((object) => {
+    if (!object.isMesh || object.isSkinnedMesh || Array.isArray(object.material)) return;
+    if (object.morphTargetInfluences?.length || !object.geometry?.index) return;
+    const meshes = byMaterial.get(object.material) || [];
+    meshes.push(object);
+    byMaterial.set(object.material, meshes);
+  });
+
+  let inputMeshes = 0;
+  let outputMeshes = 0;
+  for (const [material, meshes] of byMaterial) {
+    inputMeshes += meshes.length;
+    if (meshes.length === 1) {
+      outputMeshes += 1;
+      continue;
+    }
+
+    const transformed = meshes.map((mesh) => {
+      const geometry = mesh.geometry.clone();
+      const toRoot = new THREE.Matrix4().multiplyMatrices(rootWorldInverse, mesh.matrixWorld);
+      geometry.applyMatrix4(toRoot);
+      return geometry;
+    });
+    const merged = mergeGeometries(transformed, false);
+    for (const geometry of transformed) geometry.dispose();
+    if (!merged) {
+      outputMeshes += meshes.length;
+      continue;
+    }
+
+    merged.computeBoundingBox();
+    merged.computeBoundingSphere();
+    const batch = new THREE.Mesh(merged, material);
+    batch.name = `Sponza batch · ${material.name || material.uuid}`;
+    batch.castShadow = true;
+    batch.receiveShadow = true;
+    root.add(batch);
+
+    for (const mesh of meshes) {
+      mesh.removeFromParent();
+      mesh.geometry.dispose();
+    }
+    outputMeshes += 1;
+  }
+
+  root.updateMatrixWorld(true);
+  return { inputMeshes, outputMeshes };
 }
 
 // ── SPEEDBALL GI — install at SETUP, before the first render ────────────────────
@@ -562,11 +621,11 @@ window.gui = gui;
 window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = gi.markMaterialsDirty; // diagnostics
 
 // ── PowerShot film emulation (motion-picture negative→print chain) ──────────────
-// The film is the IMAGER: it's fed SCENE-LINEAR radiance (pass() with NO renderOutput,
-// and the render loop puts the renderer in NoToneMapping while it's on) and owns the
+// The film is the IMAGER: it's fed SCENE-LINEAR radiance from one half-float scene
+// target (with NO display transform) and owns the
 // ENTIRE transfer curve — H&D negative → print → display sRGB. Tone-mapping first would
 // stack two response curves (a camera doesn't photograph a tone-mapped JPEG of the world).
-// outputColorTransform=false so the film's own display-encoded sRGB is presented verbatim.
+// LinearSRGBColorSpace presents the film's own display-encoded sRGB verbatim.
 // This mirrors how max.js drives the same physically-correct film.
 const film = new FilmPipeline(renderer);
 film.setInputEncoding('linear');
@@ -592,11 +651,23 @@ P.flicker.value = params.filmFlicker;
 P.printExposure.value = params.filmPrintExposure * 0.301;   // stops → log10 density (matches max.js)
 P.printWarmth.value = params.filmPrintWarmth;
 P.negativeView.value = params.filmNegative ? 1 : 0;
-const scenePassNode = pass(scene, camera);
-const filmPassNode = filmPass(scenePassNode, film);
-const post = new THREE.RenderPipeline(renderer);
-post.outputColorTransform = false;               // film already emits display-encoded sRGB
-post.outputNode = filmPassNode;                         // SCENE-LINEAR in — the film owns the transfer
+const filmSceneTarget = new THREE.RenderTarget(1, 1, {
+  type: THREE.HalfFloatType,
+  minFilter: THREE.LinearFilter,
+  magFilter: THREE.LinearFilter,
+  depthBuffer: true,
+  colorSpace: THREE.NoColorSpace,
+});
+const filmTargetSize = new THREE.Vector2();
+let filmFrame = 0;
+function resizeFilmTarget() {
+  renderer.getDrawingBufferSize(filmTargetSize);
+  const width = Math.max(1, Math.round(filmTargetSize.x));
+  const height = Math.max(1, Math.round(filmTargetSize.y));
+  filmSceneTarget.setSize(width, height);
+  film.setSize(width, height);
+}
+resizeFilmTarget();
 window.film = film;
 
 let displayExposure = params.exposure;
@@ -818,6 +889,8 @@ new GLTFLoader().load(MODEL.url, (gltf) => {
     if (Array.isArray(o.material)) o.material.forEach(prepareSponzaMaterialForGi);
     else prepareSponzaMaterialForGi(o.material);
   });
+  const batches = batchStaticMeshesByMaterial(root);
+  console.info(`Sponza static batches: ${batches.inputMeshes} meshes -> ${batches.outputMeshes} material batches`);
   scene.add(root);
 
   // frame the camera to the model and size the shadow camera to its bounds
@@ -923,9 +996,7 @@ function disposeDemo({ waitForDevice = true } = {}) {
     gui.destroy();
 
     gi?.dispose?.();
-    post.dispose();
-    filmPassNode.dispose();
-    scenePassNode.dispose();
+    filmSceneTarget.dispose();
     film.dispose();
     sun.shadow.dispose?.();
     disposeObjectResources(scene);
@@ -973,9 +1044,14 @@ renderer.setAnimationLoop((nowMs) => {
   gi?.update({ playing });
   if (params.filmEnabled) {
     renderer.toneMapping = THREE.NoToneMapping;       // imager: the film owns the whole transfer curve (scene-linear in)
-    post.render();                                    // PowerShot film post-chain → display-encoded sRGB out
+    renderer.outputColorSpace = THREE.LinearSRGBColorSpace; // film already emits display-encoded sRGB
+    renderer.setRenderTarget(filmSceneTarget);
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(null);
+    film.renderTexture(filmSceneTarget.texture, filmFrame++); // fused Kodak develop directly to the canvas
   } else {
     renderer.toneMapping = THREE.NeutralToneMapping;  // film off → switch back to the display tone-map (sRGB)
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.render(scene, camera);
   }
 });
