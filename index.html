@@ -213,9 +213,8 @@ if (CLUSTER) {
 
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-// The sun shadow is re-rendered ON DEMAND. refreshSunConsumers() flags sun edits;
-// the transport sphere does not cast into this static architectural map, so its
-// animation never turns the 103-caster Sponza shadow pass into per-frame work.
+// The sun shadow is re-rendered ON DEMAND. refreshSunConsumers() flags sun edits,
+// and the transport sphere flags only the frames where it actually moves.
 //
 // It MUST be the light's own flag. three's WebGPU ShadowNode.updateBefore gates on
 // `shadow.needsUpdate || shadow.autoUpdate` and never consults
@@ -750,6 +749,7 @@ function updateBallAnimation(nowMs) {
   );
   ball.rotation.y = t * 0.5;
   ball.updateMatrixWorld(true);
+  if (!CLUSTER) sun.shadow.needsUpdate = true;
   gi?.markTransformsDirty?.(ball);
 }
 
@@ -878,9 +878,7 @@ new GLTFLoader().load(MODEL.url, (gltf) => {
   );
   centreBall.name = 'Centre Sphere';
   centreBall.position.copy(ballHome);
-  // Keep the 103-caster Sponza shadow map static. Re-rendering the entire 2048²
-  // map for this diagnostic mover obscures the GI transform cost being demonstrated.
-  centreBall.castShadow = false;
+  centreBall.castShadow = true;
   centreBall.receiveShadow = true;
   centreBall.userData.giEmitter = true;
   scene.add(centreBall);
