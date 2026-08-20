@@ -132,7 +132,7 @@ sky.sunPosition.value.copy(sunDir);
 excludeFromGI(sky);
 scene.add(sky);
 
-const sun = new THREE.DirectionalLight(0xffffff, 8);
+const sun = new THREE.DirectionalLight(0xffffff, 0);
 sun.position.copy(sunDir).multiplyScalar(90);   // far along a low vector so the light sits outside the yard
 const warm = THREE.MathUtils.clamp(sunElev / 18, 0, 1);
 sun.color.setRGB(1.0, 0.6 + 0.4 * warm, 0.35 + 0.65 * warm);
@@ -547,13 +547,14 @@ if (!gi.isSupported()) setStatus('SPEEDBALL GI needs WebGPU storage features.');
 // overrides (giIntensity 20 / sky 2). This is what makes bounce readable in shadow.
 gi.setSmoothness(1);
 gi.setFilterStrength(1);
-applyGiSettings(gi, { giIntensity: 20, giSky: 2, giDepthSharpness: 2 });
+applyGiSettings(gi, { giIntensity: 20, giSky: 0, giDepthSharpness: 2 });
 const giTune = {
-  sunIntensity: 8, emissiveStrength: 8, emitterNee: true, pendant: true,
-  giIntensity: 20, giSky: 2, giDepthSharpness: 2, giDivisions: 16, giRays: 64,
+  sunIntensity: 0, emissiveStrength: 8, emitterNee: true, pendant: true,
+  giIntensity: 20, giSky: 0, giDepthSharpness: 2, giDivisions: 16, giRays: 64,
   giRayBudget: 98304,                                // per-tick trace budget (light speed vs GPU)
   giJitterMode: 'gated',                             // 'gated' basis vs 'montecarlo' re-jitter
   giHysteresis: 0.95, giHysteresisNormalize: true,   // field defaults
+  giFireflyClamp: 6,                                 // temporal clamp band in σ (GI_TEMPORAL_CLAMP_SIGMA)
 };
 const gui = new GUI({ title: 'GI' });
 gui.add(giTune, 'sunIntensity').min(0).step(0.05).name('sunlight').onChange((v) => { sun.intensity = v; });
@@ -585,6 +586,9 @@ gui.add(giTune, 'giRayBudget', 8192, 524288, 8192).name('rays / tick').onChange(
 gui.add(giTune, 'giJitterMode', ['gated', 'montecarlo']).name('jitter basis').onChange((v) => gi.setJitterMode?.(v));
 gui.add(giTune, 'giHysteresis', 0, 0.99, 0.01).name('hysteresis').onChange((v) => gi.setHysteresis?.(v));
 gui.add(giTune, 'giHysteresisNormalize').name('normalize hys.').onChange((on) => gi.setHysteresisNormalization?.(on));
+// Temporal firefly clamp: per-texel step limited to ±band·σ. Lower = steadier
+// emissive-only image (kills lucky-ray sparkles), more lag on real changes.
+gui.add(giTune, 'giFireflyClamp', 1, 20, 0.5).name('firefly clamp').onChange((v) => gi.setFireflyClamp?.(v));
 gui.add(giTune, 'giSky', 0, 2, 0.05).name('sky light').onChange((v) => gi.setSkyIntensity?.(v));
 gui.add(giTune, 'giDepthSharpness', 0, 7, 0.1).name('depth sharpness').onChange((v) => gi.setDepthSharpness(v));
 // Probes need the sky the dome shows (the dome itself is excluded from the trace).

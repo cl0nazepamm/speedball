@@ -857,14 +857,22 @@ export function collectEmitterRecords(THREE, scene, camera = null) {
         const radius = sphere.radius * Math.max(Math.abs(scale.x), Math.abs(scale.y), Math.abs(scale.z));
         if (!Number.isFinite(radius)) return;
         const emitterScale = Number.isFinite(obj.userData?.giEmitterScale) ? obj.userData.giEmitterScale : 1;
-        const energyScale = (area / 4) * emitterScale;
-        const cr = em[0] * energyScale;
-        const cg = em[1] * energyScale;
-        const cb = em[2] * energyScale;
+        // Color slots carry SURFACE RADIANCE (what a discovery ray returns on
+        // hit) — the probe-injection expectation rule multiplies by solid angle
+        // itself, so folding area in here would double-count it. The Cauchy
+        // projected-area term A/4 rides in the otherwise-unused slot 15: the
+        // kernel forms Omega = min(2*pi, (A/4)/d^2), which matches the sphere
+        // solid angle in the far field but stays honest for long thin emitters
+        // whose bounding sphere swallows half the room. Influence range stays
+        // POWER-based (radiance x A/4).
+        const cr = em[0] * emitterScale;
+        const cg = em[1] * emitterScale;
+        const cb = em[2] * emitterScale;
         if (!Number.isFinite(cr) || !Number.isFinite(cg) || !Number.isFinite(cb)) return;
-        const range = Math.sqrt(Math.max(0, cr, cg, cb) / 0.005);
-        if (!Number.isFinite(range)) return;
-        out.push([3, center.x, center.y, center.z, 0, 0, -1, cr, cg, cb, range, 2, -1, -1, radius, 0, 0]);
+        const projArea = area / 4;
+        const range = Math.sqrt(Math.max(0, cr, cg, cb) * projArea / 0.005);
+        if (!Number.isFinite(range) || !Number.isFinite(projArea)) return;
+        out.push([3, center.x, center.y, center.z, 0, 0, -1, cr, cg, cb, range, 2, -1, -1, radius, projArea, 0]);
     });
     return out;
 }
