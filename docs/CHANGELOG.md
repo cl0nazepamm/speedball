@@ -5,6 +5,12 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Fixed Gated ray-basis startup being dependent on probe-batch divisibility. A
+  one-batch field previously re-jittered every six solves and looked like Monte
+  Carlo until resize or a divisions change altered the adaptive batch modulo.
+  Gated now uses a fixed 240-solve hold plus full-field coverage; Monte Carlo
+  remains fresh every solve. `installSpeedballGI({ jitterMode })` now selects the
+  mode before the first field build and applies its 0.60/0.90 default history.
 - Gated sampling now honors its minimum ray-set hold even when the entire probe
   field fits in one solve tick. The former full-pass bypass made Gated identical
   to Monte Carlo on medium scenes such as Sponza. Emitter-visibility NEE now

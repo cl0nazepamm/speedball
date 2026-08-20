@@ -19,7 +19,7 @@
   },
   "scripts": {
     "start": "python3 -m http.server 8777 --bind 127.0.0.1",
-    "test": "node scripts/webgpu-cleanup-smoke.mjs && node scripts/caustics-smoke.mjs && node scripts/rough-reflections-smoke.mjs && node scripts/gi-hysteresis-normalization-smoke.mjs && node scripts/gi-oct-seam-smoke.mjs && node scripts/gi-deform-refit-smoke.mjs && node scripts/gi-async-deform-refit-smoke.mjs && node scripts/gi-post-scrub-budget-smoke.mjs && node scripts/gi-dynamic-tlas-smoke.mjs && node scripts/gi-blas-cache-smoke.mjs && node scripts/gi-storage-residency-smoke.mjs && node scripts/gi-maps-residency-smoke.mjs"
+    "test": "node scripts/webgpu-cleanup-smoke.mjs && node scripts/caustics-smoke.mjs && node scripts/rough-reflections-smoke.mjs && node scripts/gi-hysteresis-normalization-smoke.mjs && node scripts/gi-jitter-mode-smoke.mjs && node scripts/gi-oct-seam-smoke.mjs && node scripts/gi-deform-refit-smoke.mjs && node scripts/gi-async-deform-refit-smoke.mjs && node scripts/gi-post-scrub-budget-smoke.mjs && node scripts/gi-dynamic-tlas-smoke.mjs && node scripts/gi-blas-cache-smoke.mjs && node scripts/gi-storage-residency-smoke.mjs && node scripts/gi-maps-residency-smoke.mjs"
   },
   "repository": {
     "type": "git",

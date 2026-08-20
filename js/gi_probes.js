@@ -143,11 +143,9 @@ const giLightDataCount = () => MAX_LIGHTS * _LIGHT_STRIDE;
 // is bounded (never below debugTempMinChangeH). A global authority drop read as
 // "flicker for a second, then settle" — a visible fade-out/in on every slider
 // touch. The temporal policy is CONSTANT at all times.
-const ROT_MIN_TICKS = 6;           // min ticks between ray-set rotations. Small grids (≤
-                                   // MAX_PROBES_PER_TICK probes = a 1-tick full pass) otherwise
-                                   // rotate the ray set EVERY tick, injecting fresh per-tick noise
-                                   // the temporal blend has to absorb. Large grids (multi-tick
-                                   // passes ≥ this) are unaffected — they already rotate per pass.
+export const GATED_JITTER_HOLD_TICKS = 240; // Four seconds at a 60 Hz accepted solve cadence.
+                                           // Gated is the stable/low-latency product mode:
+                                           // basis discovery is occasional, not frame noise.
 const JITTER_HYSTERESIS_DEFAULTS = Object.freeze({
     gated: 0.60,                   // held basis: low-latency, mostly flicker-free response
     montecarlo: 0.90,              // fresh basis every solve: history absorbs the sample blast
@@ -204,6 +202,24 @@ export function probeUpdateIntervalTicks(probeTotal, probesPerTick, solveEveryTi
     const cap = Math.max(1, Number(probesPerTick) || 1);
     const schedule = Math.max(1, Number(solveEveryTicks) || 1);
     return schedule * Math.max(1, total / cap);
+}
+
+// Gated jitter must not depend on whether `updated` happens to divide the probe
+// count. The old `probeCursor === 0` boundary made a one-batch grid re-jitter every
+// six ticks, while the same field became stable after resize/divisions changed the
+// batch modulo. Hold for a fixed accepted-solve interval and require at least one
+// complete field coverage; Monte Carlo deliberately bypasses this helper.
+export function shouldRotateGatedJitter(
+    ticksSinceRotation,
+    probeCoverageSinceRotation,
+    probeTotal,
+    holdTicks = GATED_JITTER_HOLD_TICKS,
+) {
+    const ticks = Math.max(0, Math.floor(Number(ticksSinceRotation) || 0));
+    const coverage = Math.max(0, Number(probeCoverageSinceRotation) || 0);
+    const total = Math.max(1, Number(probeTotal) || 1);
+    const hold = Math.max(1, Math.floor(Number(holdTicks) || GATED_JITTER_HOLD_TICKS));
+    return ticks >= hold && coverage >= total;
 }
 
 // Clamp a stale high solve budget when an interaction becomes idle. This is a
@@ -950,7 +966,8 @@ export function createProbeField({
     renderer,
     scene,
     intensity = 1.0,
-    hysteresis = JITTER_HYSTERESIS_DEFAULTS.gated,
+    hysteresis = null,
+    jitterMode: initialJitterMode = 'gated',
     onRebuilt = null,
     divisions = TARGET_PROBES_LONG_AXIS,
     roughReflections = false,
@@ -1120,7 +1137,11 @@ export function createProbeField({
     // Ray-jitter regime (setJitterMode): 'gated' (default) holds the basis and
     // pairs with a low-latency 0.60 history; 'montecarlo' re-jitters every C0
     // solve tick and pairs with 0.90 history to absorb the sample blast.
-    let jitterMode = 'gated';
+    const normalizeJitterMode = (mode) => {
+        const m = String(mode ?? '').toLowerCase().replace(/[\s_-]/g, '');
+        return (m === 'montecarlo' || m === 'mc') ? 'montecarlo' : 'gated';
+    };
+    let jitterMode = normalizeJitterMode(initialJitterMode);
     let lastTickAt = 0;
     let tickDtEma = 0;
     // Temporal cadence must survive auto-throttle's deliberate tickDtEma resets.
@@ -1144,11 +1165,14 @@ export function createProbeField({
     let quantStep = 1;        // translation deadband (~quarter cell) for the geo signature (A1)
     let lightQuant = 1;       // scene-relative position deadband for the light signature (B4)
     // reactivity: self-detect live light/geometry edits and re-converge fast.
-    let baseHysteresis = THREE.MathUtils.clamp(hysteresis, 0, 0.99);
+    let baseHysteresis = Number.isFinite(hysteresis)
+        ? THREE.MathUtils.clamp(hysteresis, 0, 0.99)
+        : JITTER_HYSTERESIS_DEFAULTS[jitterMode];
     const jitterHysteresis = {
-        gated: baseHysteresis,
+        gated: JITTER_HYSTERESIS_DEFAULTS.gated,
         montecarlo: JITTER_HYSTERESIS_DEFAULTS.montecarlo,
     };
+    jitterHysteresis[jitterMode] = baseHysteresis;
     let hysteresisNormalize = true;
     let chebyBiasScale = 1.0;
     let debugFreezeRayJitter = false;
@@ -3728,14 +3752,18 @@ export function createProbeField({
                 );
                 C.U.probeOffset.value = C.probeCursor >>> 0;
                 C.U.updatedCount.value = updated >>> 0;
-                // (B1) Ray-set rotation shares ONE frameJitter, advanced ONLY on C0's pass
-                // boundary. Both cascades read the same U.frameJitter, so rayDir(k,jitter)
-                // stays byte-identical between trace and blend for whichever cascade runs
-                // this tick (rotation happens BEFORE any dispatch). Multi-tick (round-robin)
-                // passes keep the ROT_MIN_TICKS spacing.
+                // (B1) Both cascades share ONE frameJitter. Monte Carlo advances it
+                // every accepted C0 solve. Gated holds it for a fixed wall-cadence
+                // interval and at least one complete field coverage. It deliberately
+                // does not use probeCursor===0: that made startup behavior depend on
+                // batch divisibility, so resize/divisions appeared to "fix" the mode.
                 C.ticksSinceRot++;
                 const rotateRaySet = ci === 0 && (jitterMode === 'montecarlo'
-                    || (C.probeCursor === 0 && C.ticksSinceRot >= ROT_MIN_TICKS));
+                    || shouldRotateGatedJitter(
+                        C.ticksSinceRot,
+                        C.probeCoverageSinceRot,
+                        C.probeTotal,
+                    ));
                 // Keep every stochastic input in the selected regime. Gated holds
                 // the emitter target stable for a complete probe pass; Monte Carlo
                 // advances it on every C0 solve tick along with the ray basis.
@@ -3743,11 +3771,10 @@ export function createProbeField({
                     emitterVisSeedCounter = (emitterVisSeedCounter + 1) >>> 0;
                     U.emitterVisSeed.value = (emitterVisSeedCounter * 0.61803398875) % 1;
                 }
-                // 'gated' (default): rotate ONLY at a C0 pass boundary — the exact
-                // pass boundary after the minimum hold. This keeps one-tick full
-                // passes gated too. 'montecarlo' rotates every C0 solve tick.
+                // Gated changes sampling epoch only at its fixed hold boundary.
+                // Monte Carlo changes it every C0 solve tick by definition.
                 if (rotateRaySet) {
-                    if (C.refreshStarted && !debugFreezeRayJitter) {
+                    if (!debugFreezeRayJitter) {
                         frameCounter = (frameCounter + 1) >>> 0;
                         U.frameJitter.value = debugFrameJitterOverride ?? ((frameCounter * 0.61803398875) % 1);
                     } else if (debugFrameJitterOverride !== null) {

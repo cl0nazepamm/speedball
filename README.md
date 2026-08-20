@@ -14,8 +14,9 @@ The normalization is bounded on the slow side: one update never blends in more f
 
 The live demo exposes a **normalize hysteresis** switch so you can turn the normalization off and compare against the raw per-update value.
 
-Sampling has two stable working profiles. **Gated** holds the ray basis and uses
-0.60 hysteresis for low-latency, mostly flicker-free lighting. **Monte Carlo**
+Sampling has two stable working profiles. **Gated** holds the ray basis for a
+stable sampling epoch independent of probe-grid size or batch divisibility, and
+uses 0.60 hysteresis for low-latency, mostly flicker-free lighting. **Monte Carlo**
 re-jitters every solve and uses 0.90 hysteresis to absorb that sample blast.
 `setJitterMode()` remembers explicit hysteresis overrides separately per mode.
 
@@ -44,6 +45,7 @@ import { installSpeedballGI } from 'speedball-gi';
 // At SETUP before the first render / renderer.setAnimationLoop():
 const gi = installSpeedballGI({
   renderer, scene, camera,
+  jitterMode: 'gated',
   reflectionQuality: 'high', // off | rough | high | ultra; reuses DDGI rays
   // reflectionSkyFallback: true, // only when setSky() should replace a missing environment map
 });

@@ -96,7 +96,8 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @param {boolean} [opts.enabled=true]
  * @param {number}  [opts.intensity=10]        canonical demo tuning (Sponza)
  * @param {number}  [opts.divisions=16]        probes along the longest grid axis
- * @param {number}  [opts.hysteresis=0.6]      Gated-mode temporal stability (higher = steadier / slower)
+ * @param {'gated'|'montecarlo'} [opts.jitterMode='gated'] stable held basis or fresh basis every solve
+ * @param {number}  [opts.hysteresis]          mode default is 0.60 Gated / 0.90 Monte Carlo
  * @param {boolean} [opts.roughReflections=false] legacy reflection switch (`true` = ultra, `false` = off)
  * @param {'off'|'rough'|'high'|'ultra'} [opts.reflectionQuality] structural reflection tier; overrides roughReflections
  * @param {number}  [opts.reflectionIntensity=1] local-vs-environment reflection coverage blend, 0..1
@@ -128,7 +129,8 @@ export function installSpeedballGI({
     enabled = true,
     intensity = 10,
     divisions = 16,
-    hysteresis = 0.6,
+    hysteresis = null,
+    jitterMode = 'gated',
     roughReflections = false,
     reflectionQuality = null,
     reflectionIntensity = 1,
@@ -173,6 +175,7 @@ export function installSpeedballGI({
         scene,
         intensity,
         hysteresis,
+        jitterMode,
         divisions,
         roughReflections,
         reflectionQuality,
