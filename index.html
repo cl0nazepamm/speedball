@@ -54,6 +54,10 @@
         </div>
       </div>
       <div class="deck-actions">
+        <div class="runtime-telemetry" aria-label="Render performance">
+          <span><small>OUTPUT</small><strong id="resolution-readout">—</strong></span>
+          <span><small>FPS</small><strong id="fps-readout">—</strong></span>
+        </div>
         <button id="play" type="button" aria-pressed="false" title="Play the sphere animation">
           <i class="glyph" aria-hidden="true"></i><span class="label">ANIMATE</span>
         </button>
@@ -128,6 +132,8 @@ const uiEl = document.getElementById('ui');
 const statusEl = document.getElementById('status');
 const statusMsgEl = document.getElementById('status-msg');
 const bootWashEl = document.getElementById('bootwash');
+const resolutionReadoutEl = document.getElementById('resolution-readout');
+const fpsReadoutEl = document.getElementById('fps-readout');
 // The plate keeps its registration crosses, so write the copy into the inner span
 // rather than replacing the whole subtree.
 const setStatus = (msg, err = false) => {
@@ -1030,6 +1036,37 @@ function onPageHide(event) {
 }
 window.addEventListener('pagehide', onPageHide);
 
+const telemetrySize = new THREE.Vector2();
+let telemetryLastAt = 0;
+let telemetryFrames = 0;
+let telemetryFps = null;
+let telemetryResolution = '';
+function updateRuntimeTelemetry(nowMs) {
+  if (telemetryLastAt === 0 || nowMs - telemetryLastAt > 2000) {
+    telemetryLastAt = nowMs;
+    telemetryFrames = 0;
+    return;
+  }
+  telemetryFrames += 1;
+  const elapsed = nowMs - telemetryLastAt;
+  if (elapsed < 500) return;
+
+  const measured = telemetryFrames * 1000 / elapsed;
+  telemetryFps = telemetryFps === null ? measured : telemetryFps * 0.65 + measured * 0.35;
+  const fpsLabel = String(Math.round(telemetryFps));
+  if (fpsReadoutEl.textContent !== fpsLabel) fpsReadoutEl.textContent = fpsLabel;
+
+  renderer.getDrawingBufferSize(telemetrySize);
+  const resolutionLabel = `${Math.round(telemetrySize.x)}×${Math.round(telemetrySize.y)}`;
+  if (resolutionLabel !== telemetryResolution) {
+    telemetryResolution = resolutionLabel;
+    resolutionReadoutEl.textContent = resolutionLabel;
+  }
+
+  telemetryLastAt = nowMs;
+  telemetryFrames = 0;
+}
+
 renderer.setAnimationLoop((nowMs) => {
   flushResize();
   controls.update();
@@ -1054,6 +1091,7 @@ renderer.setAnimationLoop((nowMs) => {
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.render(scene, camera);
   }
+  updateRuntimeTelemetry(nowMs);
 });
 </script>
 </body>

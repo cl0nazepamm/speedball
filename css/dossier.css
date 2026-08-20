@@ -251,6 +251,30 @@ input:focus-visible { outline: 1px solid var(--v2-blue); outline-offset: 2px; }
 .transport .material-switch { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 .transport .deck-actions { display: flex; align-items: center; gap: 8px; }
 
+.runtime-telemetry {
+    display: grid;
+    grid-template-columns: minmax(72px, auto) 32px;
+    gap: 8px;
+    margin-right: 2px;
+    padding-right: 10px;
+    border-right: 1px solid var(--v2-rule);
+    font-variant-numeric: tabular-nums;
+}
+
+.runtime-telemetry > span { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.runtime-telemetry small {
+    color: var(--v2-sub);
+    font: 700 6.5px/1 var(--mono);
+    letter-spacing: 0.1em;
+}
+.runtime-telemetry strong {
+    overflow: hidden;
+    color: var(--v2-ink);
+    font: 750 9px/1 var(--mono);
+    letter-spacing: -0.025em;
+    white-space: nowrap;
+}
+
 .transport #play,
 .transport #gui-toggle {
     display: inline-flex;
@@ -414,7 +438,8 @@ input:focus-visible { outline: 1px solid var(--v2-blue); outline-offset: 2px; }
     .hysteresis-meter { padding: 0 0 9px; border-right: 0; border-bottom: 1px solid var(--v2-rule); }
     .transport .material-switch { align-items: stretch; }
     .transport .material-switch .seg { justify-content: space-between; }
-    .deck-actions { grid-column: auto; }
+    .deck-actions { grid-column: auto; flex-wrap: wrap; }
+    .runtime-telemetry { flex: 1 0 100%; padding: 0 0 8px; border-right: 0; border-bottom: 1px solid var(--v2-rule); }
 }
 
 @media (prefers-reduced-motion: reduce) {

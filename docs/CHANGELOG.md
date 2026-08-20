@@ -5,6 +5,8 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Added a compact render-buffer resolution and smoothed FPS instrument to the
+  Sponza transport deck. Telemetry updates at 2 Hz and avoids unchanged DOM writes.
 - Removed the generic PowerShot adapter's redundant full-resolution HDR output
   target and presentation blit from the Sponza demo. The exact Kodak 500T
   negative-to-print curve now develops the scene-linear half-float target directly
