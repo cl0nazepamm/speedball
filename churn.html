@@ -539,6 +539,12 @@ function animateLight(t) {
 // ── SPEEDBALL GI — one call at setup, before the first render ───────────────────
 const gi = installSpeedballGI({
   renderer, scene, camera,
+  intensity: 20,
+  divisions: 16,
+  rays: 64,
+  cascades: 1,
+  continuous: true,
+  hysteresis: 0.6,
   reflectionQuality: 'high',
   reflectionSkyFallback: true,
 });

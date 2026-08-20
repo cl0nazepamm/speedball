@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#E4E4E4">
 <title>SPEEDBALL GI — real-time DDGI for three.js WebGPU</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="./css/dossier.css">
+<link rel="stylesheet" href="./css/dossier.css?v=20260820-swap">
 <script type="importmap">
 {
   "imports": {
@@ -35,15 +35,15 @@
         <button id="sun-ball" type="button" aria-label="Drag to set sun azimuth and elevation"><i id="sun-dot"></i></button>
         <span class="core-copy"><b>SPEEDBALL</b><small id="sun-readout">119° / 62.5°</small></span>
       </div>
-      <label class="core-slider intensity-control"><span>INTENSITY <b id="intensity-value">20</b></span><input id="intensity-slider" type="range" min="0" max="40" step="0.1" value="20"></label>
+      <label class="core-slider gi-intensity-control"><span>GI INTENSITY <b id="gi-intensity-value">20</b></span><input id="gi-intensity-slider" type="range" min="0" max="40" step="0.1" value="20"></label>
       <label class="core-slider compact-core"><span>DIVISIONS <b id="divisions-value">16</b></span><input id="divisions-slider" type="range" min="2" max="32" step="1" value="16"></label>
       <label class="core-slider compact-core"><span>RAYS / PROBE <b id="rays-value">64</b></span><input id="rays-slider" type="range" min="32" max="256" step="16" value="64"></label>
     </div>
     <div class="transport-row">
       <div class="hysteresis-meter" id="hysteresis-meter">
-        <span class="meter-head"><b>HYSTERESIS</b><strong id="hysteresis-value">0.60</strong></span>
-        <input id="hysteresis-slider" type="range" min="0.5" max="0.99" step="0.01" value="0.6">
-        <span class="meter-foot"><small id="hysteresis-state">GATED · STABLE</small><span class="seg mini" role="group" aria-label="Ray jitter mode"><button id="jitter-gated" type="button" aria-pressed="true">GATED</button><button id="jitter-mc" type="button" aria-pressed="false">MONTE CARLO</button></span></span>
+        <span class="meter-head"><b>RAY JITTER</b><small id="hysteresis-state">STABLE</small></span>
+        <span class="seg mini jitter-switch" role="group" aria-label="Ray jitter mode"><button id="jitter-gated" type="button" aria-pressed="true">GATED</button><button id="jitter-mc" type="button" aria-pressed="false">MONTE CARLO</button></span>
+        <label class="hysteresis-compact"><b>HYSTERESIS</b><strong id="hysteresis-value">0.60</strong><input id="hysteresis-slider" type="range" min="0.5" max="0.99" step="0.01" value="0.6"></label>
       </div>
       <div class="material-switch">
         <span class="k">SPHERE MATERIAL</span>
@@ -70,6 +70,7 @@
 
 <script type="module">
 import * as THREE from 'three';
+import { Fn, agxToneMapping } from 'three/tsl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
@@ -148,12 +149,20 @@ window.addEventListener('unhandledrejection', onUnhandledRejection);
 
 // ── Renderer ────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('c');
+const SPEEDBALL_AGX_TONE_MAPPING = 0x53424758;
+const speedballAgxToneMapping = Fn(([color, exposure]) => {
+  const mapped = agxToneMapping(color, exposure);
+  // A restrained display-referred contrast lift around middle gray. This stays
+  // inside Three's tone-map/output pass: no post target and no scene-energy change.
+  return mapped.sub(0.18).mul(1.01).add(0.18).clamp(0, 1);
+});
 // At 4K, 4x MSAA multiplies full-resolution scene bandwidth. Keep the demo
 // single-sampled and let AgX own the direct canvas presentation.
 const renderer = new THREE.WebGPURenderer({ canvas, antialias: false });
+renderer.library.addToneMapping(speedballAgxToneMapping, SPEEDBALL_AGX_TONE_MAPPING);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.toneMapping = THREE.AgXToneMapping;
+renderer.toneMapping = SPEEDBALL_AGX_TONE_MAPPING;
 renderer.toneMappingExposure = 0.7;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 await renderer.init();
@@ -472,6 +481,9 @@ gi = installSpeedballGI({
   enabled: params.giEnabled,
   intensity: params.giIntensity,
   divisions: params.giDivisions,
+  rays: params.giRays,
+  cascades: params.giCascades,
+  continuous: params.giContinuous,
   hysteresis: params.giHysteresis,
   jitterMode: params.giJitterMode,
   // Balanced local reflections: 8x8 glossy texels, interleaved half-rate resolve,
@@ -514,8 +526,8 @@ addGiPanel(gui, gi, params, {
 const sunBallEl = document.getElementById('sun-ball');
 const sunDotEl = document.getElementById('sun-dot');
 const sunReadoutEl = document.getElementById('sun-readout');
-const intensitySliderEl = document.getElementById('intensity-slider');
-const intensityValueEl = document.getElementById('intensity-value');
+const giIntensitySliderEl = document.getElementById('gi-intensity-slider');
+const giIntensityValueEl = document.getElementById('gi-intensity-value');
 const divisionsSliderEl = document.getElementById('divisions-slider');
 const divisionsValueEl = document.getElementById('divisions-value');
 const raysSliderEl = document.getElementById('rays-slider');
@@ -545,8 +557,8 @@ function syncCoreControls() {
   const y = -Math.sin(el) * orbit;
   sunDotEl.style.transform = `translate(calc(-50% + ${x}px), calc(-50% + ${y}px))`;
   sunReadoutEl.textContent = `${Math.round(params.azimuth)}° / ${params.elevation.toFixed(1)}°`;
-  intensitySliderEl.value = String(params.sunIntensity);
-  intensityValueEl.textContent = Number(params.sunIntensity).toFixed(1).replace(/\.0$/, '');
+  giIntensitySliderEl.value = String(params.giIntensity);
+  giIntensityValueEl.textContent = Number(params.giIntensity).toFixed(1).replace(/\.0$/, '');
   divisionsSliderEl.value = String(params.giDivisions);
   divisionsValueEl.textContent = String(params.giDivisions);
   raysSliderEl.value = String(params.giRays);
@@ -579,9 +591,10 @@ sunBallEl.addEventListener('pointermove', (event) => {
 sunBallEl.addEventListener('pointerup', () => { sunDrag = null; });
 sunBallEl.addEventListener('pointercancel', () => { sunDrag = null; });
 
-intensitySliderEl.addEventListener('input', () => {
-  params.sunIntensity = Number(intensitySliderEl.value);
-  updateSun(); syncCoreControls(); requestGuiDisplayRefresh();
+giIntensitySliderEl.addEventListener('input', () => {
+  params.giIntensity = Number(giIntensitySliderEl.value);
+  gi.setIntensity(params.giIntensity); markGiInteraction();
+  syncCoreControls(); requestGuiDisplayRefresh();
 });
 divisionsSliderEl.addEventListener('input', () => {
   params.giDivisions = Number(divisionsSliderEl.value);

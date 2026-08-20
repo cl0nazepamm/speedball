@@ -5,6 +5,19 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-21
+
+- Replaced the long-form README with a concise install-and-run guide. Detailed
+  tuning, engine integration, reflections, clustered lighting, diagnostics,
+  spectral tracing, and caustics documentation now lives in `docs/ADVANCED.md`.
+- Tightened the one-call installer into an explicit stable facade. Raw probe-node,
+  rebuild, pacing, and GPU diagnostics now live under the intentionally unstable
+  `advanced` namespace instead of leaking through a spread of the core field.
+  Added install-time `rays`, `cascades`, and `continuous` options, enabled/intensity
+  getters, and an `onError` callback for asynchronous update failures.
+- Removed an unconnected virtual-clustered-light registry that claimed an installer
+  method which never existed and was never consumed by the clustered renderer.
+
 - Added a compact render-buffer resolution and smoothed FPS instrument to the
   Sponza transport deck. Telemetry updates at 2 Hz and avoids unchanged DOM writes.
 - Removed PowerShot completely from the Sponza demo, including its CDN import,
@@ -33,8 +46,6 @@ All notable changes to Speedball GI are documented here. This project follows
   now degrades to the valid coarse field instead of retrying every frame.
 - Bounded the Three peer dependency to the tested r185 API surface and replaced the
   platform-specific Python demo command with a dependency-free Node static server.
-  Restored the smoke suite to source control so `npm test` is reproducible from a
-  clean clone.
 - Simplified the public Sponza page to one raster GI instrument: removed its top
   bar and embedded path-tracer runtime, and moved Advanced into the bottom deck.
   The package path-tracer modules and exports are unchanged.
@@ -167,13 +178,15 @@ All notable changes to Speedball GI are documented here. This project follows
 - Fixed a hard glossy ring in `high`: normal bias now affects visibility only,
   while glossy grid/cascade selection uses the unbiased surface position. Removed
   the discontinuous single-dominant-probe shortcut from the high receiver.
+## [0.6.7] — 2026-07-29
+
 - Light reactivity now rides THROUGH motion: the light-signature check and
   `refreshLights()` moved out of the rest-only gate in `tick()`. Lights are
   refresh-class (in-place buffer refill — no BVH, no compile, bounded
   lights-only traverse with deadbands), so light edits and animated lights
-  update the field live during interaction and playback. Explicit host transform
-  and deform packets now have their own continuous lane; fallback xform/deform
-  scans and structural rebuilds remain rest-only.
+  update the field live during interaction and playback. The xform, deform,
+  and structure lanes stay rest-only; the idle-gate contract for heavy work
+  is unchanged.
 - IR illuminator gain: a scalar trim on emitter-class-4 lights in the sensed
   band, on top of the existing on/off gate, uniform-driven (no recompiles).
   Three consumers, one knob per host: `setNirIlluminatorGain` (direct raster
@@ -192,7 +205,7 @@ All notable changes to Speedball GI are documented here. This project follows
 - Frame-paced large deform refits so their 2 ms slices now yield through the
   next animation frame instead of chaining `scheduler.yield()` continuations
   ahead of paint. Normal-only settle packets update packed shading data without
-  refitting BLAS/TLAS bounds. Speedball also resumes from interaction at a conservative
+  refitting BLAS/TLAS bounds. HALO also resumes from interaction at a conservative
   ray budget, can throttle down to 2,048 rays on weak GPUs, and grows gradually
   after frame cadence recovers; stopped timeline scrubs therefore cannot turn
   the deferred catch-up lane into a sustained ~12 fps tail.

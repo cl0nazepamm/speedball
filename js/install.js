@@ -75,6 +75,97 @@ function makeMaterialDirtier(scene) {
 const _now = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 
 /**
+ * Escape hatch for renderer integrations and diagnostics. Everything here is
+ * intentionally outside the stable installer contract and may change between
+ * releases. Prefer the methods on {@link SpeedballGIHandle} in application code.
+ *
+ * @typedef {object} SpeedballGIAdvanced
+ * @property {object} node raw probe node used by the material lights graph
+ * @property {Function} tick raw field tick; normal render loops should call update()
+ * @property {Function} resetFramePacing reset the internal frame-time controller
+ * @property {Function} requestRebuild request a structural field rebuild
+ * @property {Function} setDebugKnobs set diagnostic-only receiver knobs
+ * @property {Function} getDebugKnobs read diagnostic-only receiver knobs
+ * @property {object} debug GPU-resource inspection helpers for test harnesses
+ */
+
+/**
+ * Stable handle returned by {@link installSpeedballGI}.
+ *
+ * @typedef {object} SpeedballGIHandle
+ * @property {(options?: {camera?: THREE.Camera, playing?: boolean}) => (Promise<void>|undefined)} update
+ * @property {() => void} markInteraction
+ * @property {() => void} dispose
+ * @property {(enabled: boolean) => void} setEnabled
+ * @property {() => boolean} getEnabled
+ * @property {(intensity: number) => void} setIntensity
+ * @property {() => number} getIntensity
+ * @property {(divisions: number) => void} setDivisions
+ * @property {() => number} getDivisions
+ * @property {(rays: number) => void} setRays
+ * @property {() => number} getRays
+ * @property {(rays: number) => void} setRayBudget
+ * @property {() => number} getRayBudget
+ * @property {(cascades: number) => void} setCascades
+ * @property {() => number} getCascades
+ * @property {(continuous: boolean) => void} setContinuous
+ * @property {() => boolean} getContinuous
+ * @property {(enabled: boolean) => void} setAutoDetectChanges
+ * @property {() => boolean} getAutoDetectChanges
+ * @property {(mode: 'gated'|'montecarlo') => void} setJitterMode
+ * @property {() => ('gated'|'montecarlo')} getJitterMode
+ * @property {(hysteresis: number) => void} setHysteresis
+ * @property {() => number} getHysteresis
+ * @property {(enabled: boolean) => void} setHysteresisNormalization
+ * @property {() => boolean} getHysteresisNormalization
+ * @property {Function} setReflectionIntensity
+ * @property {Function} getReflectionIntensity
+ * @property {Function} setRoughnessLimit
+ * @property {Function} getRoughnessLimit
+ * @property {Function} setReflectionSkyFallback
+ * @property {Function} getReflectionSkyFallback
+ * @property {Function} hasRoughReflections
+ * @property {Function} hasGlossyReflections
+ * @property {Function} getReflectionQuality
+ * @property {Function} setFilterStrength
+ * @property {Function} setSmoothness
+ * @property {Function} setNormalBias
+ * @property {Function} setRadianceClamp
+ * @property {Function} setDepthSharpness
+ * @property {Function} setChebyStrength
+ * @property {Function} setNormalDetail
+ * @property {Function} setClassifyStrength
+ * @property {Function} setSky
+ * @property {Function} setSkyIntensity
+ * @property {Function} getSkyIntensity
+ * @property {Function} setNirSensing
+ * @property {Function} getNirSensing
+ * @property {Function} setNirGain
+ * @property {Function} getNirGain
+ * @property {Function} setChangeThreshold
+ * @property {Function} getChangeThreshold
+ * @property {Function} setSnapAmount
+ * @property {Function} getSnapAmount
+ * @property {Function} setFireflyClamp
+ * @property {Function} getFireflyClamp
+ * @property {Function} markTransformsDirty
+ * @property {Function} markDeformsDirty
+ * @property {Function} markMaterialValuesDirty
+ * @property {Function} markTopologyDirty
+ * @property {Function} notifySceneChange
+ * @property {Function} forceLightingRefresh
+ * @property {Function} markMaterialsDirty
+ * @property {Function} setBounds
+ * @property {Function} setVolumes
+ * @property {() => boolean} isSupported
+ * @property {() => boolean} hasData
+ * @property {Function} getStats
+ * @property {Function} getResolution
+ * @property {Function} getBounds
+ * @property {SpeedballGIAdvanced} advanced
+ */
+
+/**
  * Install SPEEDBALL GI on a WebGPU renderer + scene in one call.
  *
  * IMPORTANT: call this at SETUP, before the first render / before
@@ -95,6 +186,9 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @param {boolean} [opts.enabled=true]
  * @param {number}  [opts.intensity=10]        canonical demo tuning (Sponza)
  * @param {number}  [opts.divisions=16]        probes along the longest grid axis
+ * @param {number}  [opts.rays=64]             rays traced per probe (32..256, quantized to 16)
+ * @param {1|2}     [opts.cascades=2]           one full field or coarse + fine fields
+ * @param {boolean} [opts.continuous=true]      keep the bounded solve running during interaction
  * @param {'gated'|'montecarlo'} [opts.jitterMode='gated'] stable held basis or fresh basis every solve
  * @param {number}  [opts.hysteresis]          mode default is 0.60 Gated / 0.90 Monte Carlo
  * @param {boolean} [opts.roughReflections=false] legacy reflection switch (`true` = ultra, `false` = off)
@@ -116,11 +210,8 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @param {boolean} [opts.installLightsNode=true]  set false if you install your own GI-aware lights node
  * @param {boolean} [opts.prepareMaterials=false]  run prepareMaterialsForGI(scene) on install
  * @param {boolean} [opts.autoDetectChanges=true]  compatibility scene scans; set false when the host emits dirty events
- * @returns {object} the probe field (including markTransformsDirty(),
- *                   markDeformsDirty(), markMaterialValuesDirty(),
- *                   markTopologyDirty(), and notifySceneChange()) augmented
- *                   with update(), markInteraction(), markMaterialsDirty(),
- *                   and a dispose() that also restores the lights factory.
+ * @param {(error: unknown) => void} [opts.onError] called for asynchronous update failures
+ * @returns {SpeedballGIHandle}
  */
 export function installSpeedballGI({
     renderer,
@@ -129,6 +220,9 @@ export function installSpeedballGI({
     enabled = true,
     intensity = 10,
     divisions = 16,
+    rays = 64,
+    cascades = 2,
+    continuous = true,
     hysteresis = null,
     jitterMode = 'gated',
     roughReflections = false,
@@ -141,8 +235,12 @@ export function installSpeedballGI({
     installLightsNode = true,
     prepareMaterials = false,
     autoDetectChanges = true,
+    onError = null,
 } = {}) {
     if (!renderer || !scene) throw new Error('installSpeedballGI: { renderer, scene } are required.');
+    if (onError !== null && typeof onError !== 'function') {
+        throw new TypeError('installSpeedballGI: onError must be a function when provided.');
+    }
 
     const clustered = clusteredLighting === true
         || (typeof clusteredLighting === 'object' && clusteredLighting !== null);
@@ -181,6 +279,9 @@ export function installSpeedballGI({
             hysteresis,
             jitterMode,
             divisions,
+            rays,
+            cascades,
+            continuous,
             roughReflections,
             reflectionQuality,
             reflectionIntensity,
@@ -231,26 +332,99 @@ export function installSpeedballGI({
     let disposed = false;
     let updateFailureWarned = false;
 
-    return {
-        ...gi,          // createProbeField returns plain closures (no `this`) — safe to spread
-        gi,             // the raw field, if you want the exact object
+    const mutate = (method) => (...args) => {
+        if (disposed) return;
+        return gi[method](...args);
+    };
+    const query = (method) => (...args) => gi[method](...args);
+    const advanced = Object.freeze({
         node: gi.node,
+        tick: mutate('tick'),
+        resetFramePacing: mutate('resetFramePacing'),
+        requestRebuild: mutate('requestRebuild'),
+        setDebugKnobs: mutate('setDebugKnobs'),
+        getDebugKnobs: query('getDebugKnobs'),
+        debug: Object.freeze({
+            upload: mutate('_debugUpload'),
+            atlas: query('_debugAtlas'),
+            roughSpecularAtlas: query('_debugRoughSpecularAtlas'),
+            glossySpecularAtlas: query('_debugGlossySpecularAtlas'),
+            depthAtlas: query('_debugDepthAtlas'),
+            stateAtlas: query('_debugStateAtlas'),
+            stateBuffer: query('_debugStateBuffer'),
+            buffers: query('_debugBuffers'),
+            state: query('_debugState'),
+            read: query('_debugRead'),
+            lightCount: query('_debugLightCount'),
+        }),
+    });
 
+    return {
         /** Call once per frame. Heavy rebuilds stay idle-gated; solve cadence follows setContinuous(). */
         update({ camera: cam = camera, playing = false } = {}) {
             if (disposed) return;
             const now = _now();
             if (cameraMoved(cam)) lastInteraction = now;
             if (presentationSizeChanged()) gi.resetFramePacing();
-            return gi.tick({ idleMs: now - lastInteraction, playing }).catch((error) => {
-                if (updateFailureWarned) return;
+            return gi.tick({ idleMs: now - lastInteraction, playing }).then((result) => {
+                updateFailureWarned = false;
+                return result;
+            }).catch((error) => {
+                if (disposed || updateFailureWarned) return;
                 updateFailureWarned = true;
+                if (onError) {
+                    try {
+                        onError(error);
+                    } catch (callbackError) {
+                        console.warn('SPEEDBALL GI onError callback failed:', callbackError);
+                    }
+                    return;
+                }
                 console.warn('SPEEDBALL GI update failed:', error);
             });
         },
 
         /** Treat "now" as an interaction, deferring the next solve (e.g. after a big edit). */
-        markInteraction() { lastInteraction = _now(); },
+        markInteraction() {
+            if (!disposed) lastInteraction = _now();
+        },
+
+        setEnabled: mutate('setEnabled'),
+        getEnabled: query('getEnabled'),
+        setIntensity: mutate('setIntensity'),
+        getIntensity: query('getIntensity'),
+        setReflectionIntensity: mutate('setReflectionIntensity'),
+        getReflectionIntensity: query('getReflectionIntensity'),
+        setRoughnessLimit: mutate('setRoughnessLimit'),
+        getRoughnessLimit: query('getRoughnessLimit'),
+        setReflectionSkyFallback: mutate('setReflectionSkyFallback'),
+        getReflectionSkyFallback: query('getReflectionSkyFallback'),
+        hasRoughReflections: query('hasRoughReflections'),
+        hasGlossyReflections: query('hasGlossyReflections'),
+        getReflectionQuality: query('getReflectionQuality'),
+        setChebyStrength: mutate('setChebyStrength'),
+        setNormalDetail: mutate('setNormalDetail'),
+        setClassifyStrength: mutate('setClassifyStrength'),
+        setDivisions: mutate('setDivisions'),
+        getDivisions: query('getDivisions'),
+        setRays: mutate('setRays'),
+        getRays: query('getRays'),
+        setRayBudget: mutate('setRayBudget'),
+        getRayBudget: query('getRayBudget'),
+        setFilterStrength: mutate('setFilterStrength'),
+        setSmoothness: mutate('setSmoothness'),
+        setHysteresis: mutate('setHysteresis'),
+        getHysteresis: query('getHysteresis'),
+        setHysteresisNormalization: mutate('setHysteresisNormalization'),
+        getHysteresisNormalization: query('getHysteresisNormalization'),
+        setJitterMode: mutate('setJitterMode'),
+        getJitterMode: query('getJitterMode'),
+        setNormalBias: mutate('setNormalBias'),
+        setRadianceClamp: mutate('setRadianceClamp'),
+        setDepthSharpness: mutate('setDepthSharpness'),
+        setSky: mutate('setSky'),
+        setSkyIntensity: mutate('setSkyIntensity'),
+        getSkyIntensity: query('getSkyIntensity'),
 
         /**
          * NIR band sensing (white-phosphor NV filter on/off). One switch for BOTH terms
@@ -275,8 +449,40 @@ export function installSpeedballGI({
             setNirIlluminatorGain(gain);
         },
 
+        getNirSensing: query('getNirSensing'),
+        getNirGain: query('getNirGain'),
+        setChangeThreshold: mutate('setChangeThreshold'),
+        setSnapAmount: mutate('setSnapAmount'),
+        setFireflyClamp: mutate('setFireflyClamp'),
+        getChangeThreshold: query('getChangeThreshold'),
+        getSnapAmount: query('getSnapAmount'),
+        getFireflyClamp: query('getFireflyClamp'),
+        forceLightingRefresh: mutate('forceLightingRefresh'),
+        setCascades: mutate('setCascades'),
+        getCascades: query('getCascades'),
+        setContinuous: mutate('setContinuous'),
+        getContinuous: query('getContinuous'),
+        setAutoDetectChanges: mutate('setAutoDetectChanges'),
+        getAutoDetectChanges: query('getAutoDetectChanges'),
+        markTransformsDirty: mutate('markTransformsDirty'),
+        markDeformsDirty: mutate('markDeformsDirty'),
+        markMaterialValuesDirty: mutate('markMaterialValuesDirty'),
+        markTopologyDirty: mutate('markTopologyDirty'),
+        notifySceneChange: mutate('notifySceneChange'),
+        setBounds: mutate('setBounds'),
+        setVolumes: mutate('setVolumes'),
+        isSupported: query('isSupported'),
+        hasData: query('hasData'),
+        getStats: query('getStats'),
+        getResolution: query('getResolution'),
+        getBounds: query('getBounds'),
+
         /** Recompile lit materials so GI folds in — call if you add meshes after install. */
-        markMaterialsDirty,
+        markMaterialsDirty() {
+            if (!disposed) markMaterialsDirty();
+        },
+
+        advanced,
 
         /** Full teardown: restore the previous lights factory and free GPU resources. */
         dispose() {

@@ -71,7 +71,6 @@ export function addGiPanel(gui, gi, params, {
     fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi.setDivisions(v); onInteract(); });
     fGI.add(params, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi.setRays(v); onInteract(); });
     fGI.add(params, 'giCascades', { 'single grid': 1, 'cascaded (2)': 2 }).name('cascades').onChange((v) => { gi.setCascades(+v); onInteract(); });
-    fGI.add(params, 'giContinuous').name('continuous (solve while moving)').onChange((v) => { gi.setContinuous(v); onInteract(); });
     // Quality. Reflection tier is structural; the remaining controls are uniform-backed.
     const fQ = fGI.addFolder('Quality');
     // Reflection tier is deliberately a page-owned reload callback: off/rough/high/

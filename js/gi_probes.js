@@ -950,6 +950,9 @@ export function createProbeField({
     jitterMode: initialJitterMode = 'gated',
     onRebuilt = null,
     divisions = TARGET_PROBES_LONG_AXIS,
+    rays: initialRays = RAYS_PER_PROBE_DEFAULT,
+    cascades: initialCascades = 2,
+    continuous: initialContinuous = true,
     roughReflections = false,
     reflectionQuality = null,
     reflectionIntensity = 1.0,
@@ -982,7 +985,11 @@ export function createProbeField({
     // Live ray budget per probe (structural — changing it re-sizes the ray scratch buffer and
     // rebuilds the trace/blend kernels, so setRays() requests an idle-gated rebuild). Default
     // 64 keeps the locked 624-probe baseline visually-equivalent.
-    let raysPerProbe = RAYS_PER_PROBE_DEFAULT;
+    let raysPerProbe = THREE.MathUtils.clamp(
+        Math.round(Number(initialRays) / 16) * 16 || RAYS_PER_PROBE_DEFAULT,
+        RAYS_MIN,
+        RAYS_MAX,
+    );
     // Normal-bias scale (×) over the auto-computed minCell·SURFACE_NORMAL_BIAS_CELL offset, and the
     // most-recent minCell, so setNormalBias() can rewrite the node uniform INSTANTLY (no rebuild)
     // and the scale survives the next rebuild's auto-bias recompute.
@@ -992,7 +999,7 @@ export function createProbeField({
     // Active cascade count. 1 = byte-identical single-grid fallback (C1 never allocated);
     // 2 = coarse + fine detail cascade. cascadeCountNode defaults to 1 and is set to
     // `cascades` after the first full build so the first fold is the single-grid shader.
-    let cascades = 2;
+    let cascades = Math.round(Number(initialCascades)) === 1 ? 1 : 2;
     let solveTurn = 0;        // round-robin cascade index across ticks (C0 even, C1 odd)
     let buildStage = 0;       // staggered build phase machine (0 = build C0, 1 = build C1, 2 = done)
     let fieldEverReady = false; // first bring-up completed once — REbuilds are rest-gated, bring-up is not
@@ -1039,9 +1046,9 @@ export function createProbeField({
     const casc = [makeCascade(), makeCascade()];
     const c0LightCellCount = () => Math.max(1, casc[0].res.x - 1) * Math.max(1, casc[0].res.y - 1) * Math.max(1, casc[0].res.z - 1);
 
-    let continuous = true;    // DEFAULT ON: keep the bounded GPU solve running while the camera
-                              // moves — heavy build steps still wait for rest, so the no-hitch
-                              // guarantee holds. false opts into strict idle-gating (solve too).
+    let continuous = initialContinuous === true; // DEFAULT ON: keep the bounded GPU solve running
+                              // while the camera moves — heavy build steps still wait for rest, so
+                              // the no-hitch guarantee holds. false opts into strict idle-gating.
     let detectSceneChanges = autoDetectChanges !== false;
     let dirty = true;
     // Cached CPU build (BVH soup + material textures). The BVH depends ONLY on geometry,
@@ -4543,7 +4550,9 @@ export function createProbeField({
         tick,
         resetFramePacing,
         setEnabled,
+        getEnabled: () => node._enabled,
         setIntensity: (v) => node.setIntensity(v),
+        getIntensity: () => node.intensityNode.value,
         // Uniform/live. The structural atlas allocation is chosen once with
         // createProbeField({ reflectionQuality }) to keep the disabled path zero-cost.
         setReflectionIntensity: (v) => node.setReflectionIntensity(v),

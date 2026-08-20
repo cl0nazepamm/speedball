@@ -11,7 +11,8 @@
 // One-call setup + scene helpers.
 export { installSpeedballGI, excludeFromGI, prepareMaterialsForGI } from './install.js';
 
-// Core BVH-traced DDGI probe field (octahedral, infinite-bounce, idle-gated).
+// Core BVH-traced DDGI probe field (octahedral, infinite-bounce, continuous solve;
+// structural rebuilds remain idle-gated).
 export {
     createProbeField, getGiProbeNode, GiProbeNode,
     REFLECTION_QUALITY_TIERS, resolveReflectionQuality,

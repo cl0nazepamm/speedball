@@ -2,7 +2,7 @@
 .codex-*
 
 # Docs / working notes — keep untracked. README.md, the Sponza scene README,
-# and docs/CHANGELOG.md stay tracked; everything else *.md is ignored. The
+# docs/ADVANCED.md, and docs/CHANGELOG.md stay tracked; everything else *.md is ignored. The
 # 4-line /docs/ dance is required: un-ignore the dir, re-ignore its contents,
 # then whitelist the file — a bare negation can't reach inside an ignored
 # directory.
@@ -12,6 +12,7 @@
 /docs/
 !/docs/
 /docs/*
+!/docs/ADVANCED.md
 !/docs/CHANGELOG.md
 
 # Local debug/WIP pages — the public repo and GitHub Pages ship only the
@@ -19,6 +20,8 @@
 /debug/
 
 node_modules/
+
+/scripts/*-smoke.mjs
 
 *.log
 *.tmp

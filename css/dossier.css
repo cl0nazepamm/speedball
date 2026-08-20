@@ -213,11 +213,29 @@ input:focus-visible { outline: 1px solid var(--v2-blue); outline-offset: 2px; }
 
 .hysteresis-meter input { background: linear-gradient(90deg, var(--v2-red) 0 var(--danger-stop), #b3b3b3 var(--danger-stop) 100%); }
 .hysteresis-meter input::-webkit-slider-thumb { background: #f5f5f5; }
-.meter-head,
-.meter-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.meter-head strong { color: var(--v2-ink); font: 800 14px/1 var(--mono); letter-spacing: -0.04em; }
-.meter-foot small { color: var(--v2-sub); font: 700 7px/1 var(--mono); letter-spacing: 0.09em; }
-.hysteresis-meter.danger .meter-head strong,
+.meter-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.meter-head small { color: var(--v2-sub); font: 700 7px/1 var(--mono); letter-spacing: 0.09em; }
+.jitter-switch {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    width: 100%;
+    border: 1px solid var(--v2-rule);
+}
+.hysteresis-compact {
+    display: grid;
+    grid-template-columns: max-content 34px minmax(72px, 1fr);
+    align-items: center;
+    gap: 8px;
+    color: var(--v2-sub);
+    font: 700 7.5px/1 var(--mono);
+    letter-spacing: 0.1em;
+}
+.hysteresis-compact strong {
+    color: var(--v2-ink);
+    font: 800 10px/1 var(--mono);
+    letter-spacing: -0.04em;
+}
+.hysteresis-meter.danger .hysteresis-compact strong,
 .hysteresis-meter.danger #hysteresis-state { color: var(--v2-ink); }
 
 .transport .seg.mini button,

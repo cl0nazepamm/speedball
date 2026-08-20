@@ -28,52 +28,10 @@
 // per-probe-ray shadow loop.
 
 import ClusteredLightsNode from 'three/addons/tsl/lighting/ClusteredLightsNode.js';
-import { NodeUtils, Matrix4, Color, warn } from 'three/webgpu';
+import { NodeUtils } from 'three/webgpu';
 import { getGiProbeNode } from './gi_probes.js';
 import { getGiVolumeNode } from './gi_irradiance_volume.js';
 import { isIrEmitter, getOrCreateIrLightNode } from './gi_lights_node.js';
-
-// ── Virtual clustered lights ───────────────────────────────────────
-// The clustered path's remaining per-light cost is the THREE.PointLight OBJECTS:
-// scene-graph traversal, world-matrix updates, and render-list collection scale
-// with light count even though the raster loop doesn't. Virtual lights skip all
-// of it — plain { position, color, intensity, distance, decay } records that ride
-// the cluster texture directly, wrapped in minimal pseudo-lights (matrixWorld +
-// the five fields updateLightsTexture reads). Module-level registry, same pattern
-// as gi_lights_node's nirGate: every GiClusteredLightsNode instance folds the
-// registered records into its clustered partition on the next setLights (which
-// the renderer calls per frame). Pair with the probe field's virtual records
-// (installSpeedballGI handle setVirtualLights drives both) so GI matches.
-const _virtualWrappers = [];
-let _virtualCount = 0;
-let _warnedOverflow = false;
-
-export function setClusteredVirtualLights(list = []) {
-    const n = Array.isArray(list) ? list.length : 0;
-    for (let i = 0; i < n; i++) {
-        let w = _virtualWrappers[i];
-        if (!w) {
-            w = _virtualWrappers[i] = {
-                isPointLight: true, castShadow: false, isVirtualLight: true,
-                matrixWorld: new Matrix4(), color: new Color(1, 1, 1),
-                intensity: 1, distance: 0, decay: 2,
-            };
-        }
-        const v = list[i], p = v.position || {}, c = v.color || {};
-        w.matrixWorld.setPosition(p.x || 0, p.y || 0, p.z || 0);
-        w.color.setRGB(
-            Number.isFinite(c.r) ? c.r : 1,
-            Number.isFinite(c.g) ? c.g : 1,
-            Number.isFinite(c.b) ? c.b : 1,
-        );
-        w.intensity = Number.isFinite(v.intensity) ? v.intensity : 1;
-        w.distance = Math.max(0, Number.isFinite(v.distance) ? v.distance : 0);
-        w.decay = Number.isFinite(v.decay) ? v.decay : 2;
-    }
-    _virtualWrappers.length = n;
-    _virtualCount = n;
-}
-export function getClusteredVirtualLightCount() { return _virtualCount; }
 
 export default class GiClusteredLightsNode extends ClusteredLightsNode {
     static get type() { return 'GiClusteredLightsNode'; }
