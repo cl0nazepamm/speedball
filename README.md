@@ -85,9 +85,6 @@ supports one active probe field per module instance.
   lighting, explicit dirty lanes, diagnostics, spectral tracing, and caustics.
 - [Changelog](docs/CHANGELOG.md)
 
-Repository demo only: clone this repository, run `node scripts/serve.mjs`, then open
-`http://127.0.0.1:8777/`. Demo files are not included in the npm package.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
