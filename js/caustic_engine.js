@@ -304,10 +304,13 @@ export function createCausticEngine({
                 const vv = dot(d, Rv);
                 If(abs(uu).lessThanEqual(float(RhalfW)).and(abs(vv).lessThanEqual(float(RhalfH))), () => {
                     const grazing = float(1).sub(min(float(1), abs(denom)));
-                    const grazeGain = float(0.55).add(grazing.mul(1.5));
+                    // Irradiance on the receiver falls with grazing incidence.
+                    // The old grazeGain did the opposite while also lengthening
+                    // the splat, turning smooth convex casters into giant wedges.
+                    const receiverCos = abs(denom);
                     const roughPenalty = max(float(0.12), float(1).sub(U.metalRoughness.mul(5.5)));
                     const throwAtten = float(1).div(t.mul(t).mul(U.throwSoft).add(1));
-                    const e = energy.mul(grazeGain).mul(roughPenalty).mul(throwAtten);
+                    const e = energy.mul(receiverCos).mul(roughPenalty).mul(throwAtten);
 
                     const cx = uu.div(R.width).add(0.5).mul(float(W));
                     const cy = float(0.5).add(vv.div(R.height)).mul(float(H));
@@ -316,7 +319,9 @@ export function createCausticEngine({
                     const clen = max(sqrt(cdx0.mul(cdx0).add(cdy0.mul(cdy0))), float(1e-6));
                     const cdx = cdx0.div(clen);
                     const cdy = cdy0.div(clen);
-                    const streakPx = min(float(18), float(2).add(grazing.mul(15)).mul(U.causticWidth));
+                    // Keep a compact anisotropic footprint for glossy metals;
+                    // density blur handles roughness without drawing floor beams.
+                    const streakPx = min(float(7), float(1).add(U.causticWidth.mul(2.5)).add(grazing.mul(2)));
                     const steps = uint(max(float(1), ceil(streakPx)));
                     const stepsF = float(steps);
                     const ePer = e.div(stepsF);

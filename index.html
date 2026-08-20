@@ -82,7 +82,7 @@ import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
 // Pin the local caustic module revision: browsers cache ESM modules independently
 // from index.html, and a mixed old-engine/new-demo pair must never break model load.
-import { createCausticEngine, causticReceiverFloor } from './js/caustic_engine.js?v=0.6.7-transform';
+import { createCausticEngine, causticReceiverFloor } from './js/caustic_engine.js?v=0.6.7-caustic-cast';
 
 // ── Scene ──────────────────────────────────────────────────────────────────────
 // 'sun'     — Sponza's sunlit atrium: Preetham sky + directional sun.
@@ -879,7 +879,7 @@ function createBallCaustics(box, size) {
   // invisible proxy so a moving caustic can refresh without rebuilding a 5k-tri
   // CPU BVH every frame.
   causticCaster = new THREE.Mesh(
-    new THREE.SphereGeometry(params.ballRadius, 32, 20),
+    new THREE.SphereGeometry(params.ballRadius, 64, 40),
     new THREE.MeshBasicMaterial(),
   );
   causticCaster.name = 'Centre Sphere Caustic Proxy';
