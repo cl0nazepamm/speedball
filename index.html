@@ -14,8 +14,7 @@
     "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.webgpu.js",
     "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.tsl.js",
     "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.0/examples/jsm/",
-    "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.14/build/index.module.js",
-    "powershot-threejs": "https://cdn.jsdelivr.net/npm/powershot-threejs@0.8.1/src/index.js"
+    "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.14/build/index.module.js"
   },
   "scopes": {
     "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.14/": { "three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.module.js" }
@@ -76,7 +75,6 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { FilmPipeline, FILM_PRESETS, applyFilmPreset } from 'powershot-threejs';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
 
@@ -150,13 +148,14 @@ window.addEventListener('unhandledrejection', onUnhandledRejection);
 
 // ── Renderer ────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('c');
-// At 4K, 4x MSAA multiplies the full-resolution scene-pass bandwidth before
-// PowerShot even develops the frame. Keep the demo single-sampled by default.
+// At 4K, 4x MSAA multiplies full-resolution scene bandwidth. Keep the demo
+// single-sampled and let AgX own the direct canvas presentation.
 const renderer = new THREE.WebGPURenderer({ canvas, antialias: false });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.toneMapping = THREE.AgXToneMapping;
 renderer.toneMappingExposure = 0.7;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
 await renderer.init();
 if (renderer.backend?.isWebGPUBackend !== true) {
   setStatus('WebGPU not available.\nThis demo needs a WebGPU-capable browser\n(Chrome/Edge 121+, or Firefox Nightly).', true);
@@ -217,9 +216,9 @@ sun.shadow.autoUpdate = false;
 
 // ── Parameters & controls ─────────────────────────────────────────────────────
 const params = {
-  // New demo defaults (dialed-in look — film graded, on by default).
+  // New demo defaults (direct AgX presentation).
   azimuth: 119, elevation: 62.5, turbidity: 10, rayleigh: 0.6,
-  sunIntensity: 20, exposure: 1,
+  sunIntensity: 20, exposure: 0.7,
   giEnabled: true, giIntensity: 20, giDivisions: 16, giCascades: 1, giContinuous: true,
   // quality knobs (defaults mirror gi_probes.js). smoothness is pinned to 1 (no slider).
   giRays: 64, giHysteresis: 0.6, giHysteresisNormalize: true, giJitterMode: 'gated', giNormalBias: 1.75,
@@ -236,11 +235,6 @@ const params = {
   ballOrbit: 2.6, ballSpeed: 0.22, ballBob: 0.55,
   // Cluster mode: the point-light grid.
   lightCount: 50, lightIntensity: 8, lightRange: 7, markers: true,
-  // PowerShot film (pinned look — one Film checkbox). Kodak 500T + these overrides.
-  filmEnabled: true, filmStock: 'kodak_500t', filmAmount: 1.0, filmExposure: 1.55, filmGamma: 0.6,
-  filmGrain: 0, filmGrainSize: 2.35, filmGrainSat: 0.8,
-  filmHalation: 0, filmHalThreshold: 0.45, filmHalSoftness: 0.46, filmHalRadius: 1.8, filmHalColor: [1.0, 0.35, 0.08],
-  filmWeave: 0, filmFlicker: 0, filmPrintExposure: -0.16, filmPrintWarmth: -0.17, filmNegative: false,
 };
 // Hosted Sponza always starts from these canonical values. Do not restore or persist
 // GUI tweaks here; a public demo should recover to the intended look on every reload.
@@ -250,7 +244,6 @@ if (CLUSTER) {
   params.camX = 9.5; params.camY = 6.8; params.camZ = -0.2;
   params.targetX = -6; params.targetY = 3.2; params.targetZ = 0.1;
   params.exposure = 1;
-  params.filmEnabled = false;   // the grid's saturated point lights already carry the look
 }
 // Apply the one Sponza hero view.
 if (MODEL.hero) {
@@ -347,7 +340,6 @@ function flushResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
-  resizeFilmTarget();
 }
 window.addEventListener('resize', onResize);
 
@@ -626,73 +618,12 @@ window.gi = gi; // console handle for poking
 window.gui = gui;
 window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = gi.markMaterialsDirty; // diagnostics
 
-// ── PowerShot film emulation (motion-picture negative→print chain) ──────────────
-// The film is the IMAGER: it's fed SCENE-LINEAR radiance from one half-float scene
-// target (with NO display transform) and owns the
-// ENTIRE transfer curve — H&D negative → print → display sRGB. Tone-mapping first would
-// stack two response curves (a camera doesn't photograph a tone-mapped JPEG of the world).
-// LinearSRGBColorSpace presents the film's own display-encoded sRGB verbatim.
-// This mirrors how max.js drives the same physically-correct film.
-const film = new FilmPipeline(renderer);
-film.setInputEncoding('linear');
-applyFilmPreset(film.ctx, FILM_PRESETS[params.filmStock]);
-const P = film.ctx.P;
-// Tuned baseline overrides. Apply after the stock preset so the look is deterministic.
-film.ctx.power.value = params.filmAmount;        // 1.0 = full film, no blend with source
-P.exposure.value = params.filmExposure;          // photographic stops on the LINEAR input; −0.5 ≈ the scene's display exposure (0.7 = −0.5 stops) so mid-gray lands on the film's 0.18 reference
-P.inputGamma.value = params.filmGamma;           // pre-H&D exposure-domain shaping (film default 0.65), NOT an sRGB decode
-P.grainStrength.value = params.filmGrain;
-P.grainSize.value = params.filmGrainSize;
-P.grainSaturation.value = params.filmGrainSat;
-P.halStrength.value = params.filmHalation;
-P.halThreshold.value = params.filmHalThreshold;
-P.halSoftness.value = params.filmHalSoftness;
-P.halRadius.value = params.filmHalRadius;
-P.halColor.value.fromArray(params.filmHalColor);
-// A zero-strength halo still costs three quarter-resolution passes unless the
-// stage itself is disabled. Keep the pinned no-halation look genuinely cheap.
-film.setEnabled('halation', params.filmHalation > 0);
-P.weave.value = params.filmWeave;
-P.flicker.value = params.filmFlicker;
-P.printExposure.value = params.filmPrintExposure * 0.301;   // stops → log10 density (matches max.js)
-P.printWarmth.value = params.filmPrintWarmth;
-P.negativeView.value = params.filmNegative ? 1 : 0;
-const filmSceneTarget = new THREE.RenderTarget(1, 1, {
-  type: THREE.HalfFloatType,
-  minFilter: THREE.LinearFilter,
-  magFilter: THREE.LinearFilter,
-  depthBuffer: true,
-  colorSpace: THREE.NoColorSpace,
-});
-const filmTargetSize = new THREE.Vector2();
-let filmFrame = 0;
-function resizeFilmTarget() {
-  renderer.getDrawingBufferSize(filmTargetSize);
-  const width = Math.max(1, Math.round(filmTargetSize.x));
-  const height = Math.max(1, Math.round(filmTargetSize.y));
-  filmSceneTarget.setSize(width, height);
-  film.setSize(width, height);
-}
-resizeFilmTarget();
-window.film = film;
-
-let displayExposure = params.exposure;
-params.exposure = params.filmEnabled ? params.filmExposure : displayExposure;
-if (!params.filmEnabled) renderer.toneMappingExposure = displayExposure;
-const exposureCtrl = gui.add(params, 'exposure').min(0).step(0.01).name('exposure').onChange((v) => {
-  if (params.filmEnabled) {
-    params.filmExposure = v;
-    P.exposure.value = v;
-  } else {
-    displayExposure = v;
-    renderer.toneMappingExposure = v;
-  }
-});
-gui.add(params, 'filmEnabled').name('Film').onChange((on) => {
-  params.exposure = on ? params.filmExposure : displayExposure;
-  if (on) P.exposure.value = params.filmExposure;
-  else renderer.toneMappingExposure = displayExposure;
-  exposureCtrl.updateDisplay();
+// ── AgX presentation ─────────────────────────────────────────────────────────
+// Three owns the complete display transform. There is no intermediate scene
+// target or post chain: Sponza renders once, directly to the canvas.
+renderer.toneMappingExposure = params.exposure;
+gui.add(params, 'exposure').min(0).step(0.01).name('AgX exposure').onChange((value) => {
+  renderer.toneMappingExposure = value;
 });
 
 // ── Centre sphere ─────────────────────────────────────────────────────────────
@@ -1002,15 +933,13 @@ function disposeDemo({ waitForDevice = true } = {}) {
     gui.destroy();
 
     gi?.dispose?.();
-    filmSceneTarget.dispose();
-    film.dispose();
     sun.shadow.dispose?.();
     disposeObjectResources(scene);
     controls.dispose();
 
     const deviceLost = renderer.backend?.device?.lost;
     renderer.dispose();
-    window.gi = window.gui = window.scene = window.renderer = window.film = null;
+    window.gi = window.gui = window.scene = window.renderer = null;
     window.controls = window.camera = window.dumpCamera = window.markGiMaterialsDirty = null;
 
     // WebGPURenderer.dispose() is synchronous in r185, while D3D12 retires the
@@ -1079,18 +1008,7 @@ renderer.setAnimationLoop((nowMs) => {
   // continuous for live light feedback, and `playing` identifies real scene motion
   // so transform packets and post-playback budget recovery follow the public API.
   gi?.update({ playing });
-  if (params.filmEnabled) {
-    renderer.toneMapping = THREE.NoToneMapping;       // imager: the film owns the whole transfer curve (scene-linear in)
-    renderer.outputColorSpace = THREE.LinearSRGBColorSpace; // film already emits display-encoded sRGB
-    renderer.setRenderTarget(filmSceneTarget);
-    renderer.render(scene, camera);
-    renderer.setRenderTarget(null);
-    film.renderTexture(filmSceneTarget.texture, filmFrame++); // fused Kodak develop directly to the canvas
-  } else {
-    renderer.toneMapping = THREE.NeutralToneMapping;  // film off → switch back to the display tone-map (sRGB)
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.render(scene, camera);
-  }
+  renderer.render(scene, camera);
   updateRuntimeTelemetry(nowMs);
 });
 </script>
