@@ -39,13 +39,13 @@
       <label class="core-slider intensity-control"><span>INTENSITY <b id="intensity-value">20</b></span><input id="intensity-slider" type="range" min="0" max="40" step="0.1" value="20"></label>
       <label class="core-slider compact-core"><span>DIVISIONS <b id="divisions-value">16</b></span><input id="divisions-slider" type="range" min="2" max="32" step="1" value="16"></label>
       <label class="core-slider compact-core"><span>RAYS / PROBE <b id="rays-value">64</b></span><input id="rays-slider" type="range" min="32" max="256" step="16" value="64"></label>
+    </div>
+    <div class="transport-row">
       <div class="hysteresis-meter" id="hysteresis-meter">
         <span class="meter-head"><b>HYSTERESIS</b><strong id="hysteresis-value">0.60</strong></span>
         <input id="hysteresis-slider" type="range" min="0.5" max="0.99" step="0.01" value="0.6">
         <span class="meter-foot"><small id="hysteresis-state">GATED · STABLE</small><span class="seg mini" role="group" aria-label="Ray jitter mode"><button id="jitter-gated" type="button" aria-pressed="true">GATED</button><button id="jitter-mc" type="button" aria-pressed="false">MONTE CARLO</button></span></span>
       </div>
-    </div>
-    <div class="transport-row">
       <div class="material-switch">
         <span class="k">SPHERE MATERIAL</span>
         <div class="seg" role="group" aria-label="Centre sphere material">
@@ -54,12 +54,12 @@
           <button id="ball-glass" type="button" aria-pressed="false" title="Refractive glass with ground caustics">GLASS</button>
         </div>
       </div>
-      <i class="rule"></i>
-      <button id="play" type="button" aria-pressed="false" title="Play the sphere animation">
-        <i class="glyph" aria-hidden="true"></i><span class="label">ANIMATE</span>
-      </button>
-      <i class="rule"></i>
-      <button id="gui-toggle" type="button" aria-pressed="false"><span class="num">[ ]</span><span>ADVANCED</span></button>
+      <div class="deck-actions">
+        <button id="play" type="button" aria-pressed="false" title="Play the sphere animation">
+          <i class="glyph" aria-hidden="true"></i><span class="label">ANIMATE</span>
+        </button>
+        <button id="gui-toggle" type="button" aria-pressed="false"><span class="num">[ ]</span><span>ADVANCED</span></button>
+      </div>
       <i class="rule transport-stat"></i>
       <div class="readout transport-stat"><span class="k">Effect</span><span class="v accent" id="t-effect">METAL · CAUSTIC</span></div>
       <i class="rule transport-stat"></i>
