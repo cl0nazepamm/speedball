@@ -148,7 +148,7 @@ export function createCausticEngine({
         resolveInterval: Math.max(1, Math.floor(Number.isFinite(resolveInterval)
             ? resolveInterval
             : (isGlass ? DEFAULT_GLASS_RESOLVE_INTERVAL : 1))),
-        strength: isGlass ? 4.2 : 2.2,         // overlay additive opacity
+        strength: isGlass ? 4.2 : 2.2,         // additive radiance gain
         softness: isGlass ? 1.15 : 0.9,         // streak footprint + density-estimate bandwidth
         bloom: isGlass ? 0.25 : 0.7,
         roughness: isGlass ? 0.02 : 0.035,
@@ -201,6 +201,9 @@ export function createCausticEngine({
         lightColor: uniform(new THREE.Vector3(...params.lightColor)),
         receiverAlbedo: uniform(new THREE.Vector3(...params.receiverAlbedo)),
         casterAreaScale: uniform(1),
+        casterMatrix: uniform(new THREE.Matrix4()),
+        casterMatrixInv: uniform(new THREE.Matrix4()),
+        casterNormalMatrix: uniform(new THREE.Matrix4()),
         causticWidth: uniform(params.softness),
         sharpSigma: uniform(1.0),
         bloomSigma: uniform(12.0),
@@ -216,11 +219,13 @@ export function createCausticEngine({
         ior: uniform(params.ior),
         dispersion: uniform(params.dispersion),
         thickness: uniform(params.thickness),
+        overlayStrength: uniform(params.strength),
     };
 
     // Caster-mesh emission state (populated by setCasterMesh; when 'mesh',
     // photons are emitted off a real triangle mesh instead of the analytic
-    // door/wheels). Geometry is baked to WORLD space on upload.
+    // door/wheels). Geometry/BVH stay in local space; transform uniforms carry
+    // rigid animation without storage-buffer rebuilds.
     let emitMode = 'analytic';
     let meshPos = null, meshNrm = null, meshIdx = null, meshAccel = null;
     let meshTriCount = 0, meshSearchIters = 1;
@@ -463,6 +468,13 @@ export function createCausticEngine({
         const meshIntersect = (ro, rd, tMin, tMaxOut, hitP, hitN) => {
             const bestT = float(tMaxOut).toVar();
             const found = float(0).toVar();
+            // Geometry and its BVH stay in caster-local space. Transforming the
+            // ray keeps rigid animation on uniforms instead of rebuilding and
+            // disposing four storage buffers every time the caster moves.
+            // Do not normalize localRd: preserving its scale keeps `t` in world
+            // ray units, so the existing world-space tMin/tMax limits stay valid.
+            const localRo = U.casterMatrixInv.mul(vec4(ro, 1)).xyz;
+            const localRd = U.casterMatrixInv.mul(vec4(rd, 0)).xyz;
             // Avoid 0 * infinity at slab boundaries for axis-aligned rays.
             const safeDir = (d) => select(
                 abs(d).greaterThan(float(1e-8)),
@@ -470,9 +482,9 @@ export function createCausticEngine({
                 select(d.lessThan(float(0)), float(-1e-8), float(1e-8)),
             );
             const invD = vec3(
-                float(1).div(safeDir(rd.x)),
-                float(1).div(safeDir(rd.y)),
-                float(1).div(safeDir(rd.z)),
+                float(1).div(safeDir(localRd.x)),
+                float(1).div(safeDir(localRd.y)),
+                float(1).div(safeDir(localRd.z)),
             );
             const cursor = uint(0).toVar();
             Loop({ start: uint(0), end: uint(bvhNodeCount), type: 'uint', condition: '<' }, () => {
@@ -491,8 +503,8 @@ export function createCausticEngine({
                 const miss = uint(meshAccel.element(node.add(uint(6))));
                 const triOffset = uint(meshAccel.element(node.add(uint(7))));
                 const leafTriCount = uint(meshAccel.element(node.add(uint(8))));
-                const t0 = bmin.sub(ro).mul(invD);
-                const t1 = bmax.sub(ro).mul(invD);
+                const t0 = bmin.sub(localRo).mul(invD);
+                const t1 = bmax.sub(localRo).mul(invD);
                 const tsmall = min(t0, t1);
                 const tbig = max(t0, t1);
                 const tNear = max(max(tsmall.x, tsmall.y), tsmall.z);
@@ -510,16 +522,16 @@ export function createCausticEngine({
                             const c = fetchP(meshIdx.element(base.add(uint(2))));
                             const e1 = b.sub(a);
                             const e2 = c.sub(a);
-                            const pvec = cross(rd, e2);
+                            const pvec = cross(localRd, e2);
                             const det = dot(e1, pvec);
                             // Skip near-parallel; allow either winding (glass is double-sided).
                             If(abs(det).greaterThan(float(1e-6)), () => {
                                 const invDet = float(1).div(det);
-                                const tvec = ro.sub(a);
+                                const tvec = localRo.sub(a);
                                 const u = dot(tvec, pvec).mul(invDet);
                                 If(u.greaterThanEqual(float(0)).and(u.lessThanEqual(float(1))), () => {
                                     const qvec = cross(tvec, e1);
-                                    const v = dot(rd, qvec).mul(invDet);
+                                    const v = dot(localRd, qvec).mul(invDet);
                                     If(v.greaterThanEqual(float(0)).and(u.add(v).lessThanEqual(float(1))), () => {
                                         const tt = dot(e2, qvec).mul(invDet);
                                         If(tt.greaterThan(tMin).and(tt.lessThan(bestT)), () => {
@@ -529,8 +541,9 @@ export function createCausticEngine({
                                             const nb = fetchN(meshIdx.element(base.add(uint(1))));
                                             const nc = fetchN(meshIdx.element(base.add(uint(2))));
                                             const w0 = float(1).sub(u).sub(v);
+                                            const localN = normalize(na.mul(w0).add(nb.mul(u)).add(nc.mul(v)));
                                             hitP.assign(ro.add(rd.mul(tt)));
-                                            hitN.assign(normalize(na.mul(w0).add(nb.mul(u)).add(nc.mul(v))));
+                                            hitN.assign(normalize(U.casterNormalMatrix.mul(vec4(localN, 0)).xyz));
                                         });
                                     });
                                 });
@@ -570,8 +583,10 @@ export function createCausticEngine({
             const b0 = float(1).sub(su);
             const b1 = su.mul(float(1).sub(r2));
             const b2 = su.mul(r2);
-            const wp = fetchP(i0).mul(b0).add(fetchP(i1).mul(b1)).add(fetchP(i2).mul(b2)).toVar();
-            const wn = normalize(fetchN(i0).mul(b0).add(fetchN(i1).mul(b1)).add(fetchN(i2).mul(b2))).toVar();
+            const localP = fetchP(i0).mul(b0).add(fetchP(i1).mul(b1)).add(fetchP(i2).mul(b2));
+            const localN = normalize(fetchN(i0).mul(b0).add(fetchN(i1).mul(b1)).add(fetchN(i2).mul(b2)));
+            const wp = U.casterMatrix.mul(vec4(localP, 1)).xyz.toVar();
+            const wn = normalize(U.casterNormalMatrix.mul(vec4(localN, 0)).xyz).toVar();
 
             if (!isGlass) {
                 emitTrace(wp, wn, U.casterAreaScale);
@@ -748,13 +763,16 @@ export function createCausticEngine({
 
     // ── overlay plane (caller adds this to a scene) ──────────────────
     const overlayMat = new THREE.MeshBasicNodeMaterial();
-    overlayMat.colorNode = texture(causticTex, uv());
+    // Strength belongs in radiance, not transparent alpha. Additive blending
+    // clamps source alpha, so the previous opacity=2.2/4.2 path silently reduced
+    // every authored strength above one to the same barely-visible result.
+    overlayMat.colorNode = texture(causticTex, uv()).rgb.mul(U.overlayStrength);
     overlayMat.transparent = true;
     overlayMat.blending = THREE.AdditiveBlending;
     overlayMat.depthTest = true;
     overlayMat.depthWrite = false;
     overlayMat.toneMapped = false;
-    overlayMat.opacity = params.strength;
+    overlayMat.opacity = 1;
     overlayMat.side = THREE.DoubleSide;
     const overlayGeo = new THREE.PlaneGeometry(R.width, R.height);
     const overlayMesh = new THREE.Mesh(overlayGeo, overlayMat);
@@ -779,7 +797,7 @@ export function createCausticEngine({
         U.bloomSigma.value = 9 + params.softness * 12;
         U.bloomGain.value = params.bloom * 2.0;
         U.tint.value.set(params.tint[0], params.tint[1], params.tint[2]);
-        overlayMat.opacity = params.strength;
+        U.overlayStrength.value = params.strength;
     }
     syncUniforms();
 
@@ -886,9 +904,27 @@ export function createCausticEngine({
         params.tint = p.rgb.slice(); params.roughness = p.roughness;
         syncUniforms(); markTraceDirty();
     }
-    // Switch to MESH emission: bake `mesh` (a THREE.Mesh) to world space, build a
-    // per-triangle area CDF, upload geometry to storage, and emit photons off it.
-    // Re-call to update after the mesh moves or its geometry changes.
+    function writeCasterTransform(matrix) {
+        if (!matrix?.isMatrix4) throw new Error('setCasterTransform: expected an Object3D or Matrix4');
+        if (Math.abs(matrix.determinant()) < 1e-12) throw new Error('setCasterTransform: caster matrix is singular');
+        U.casterMatrix.value.copy(matrix);
+        U.casterMatrixInv.value.copy(matrix).invert();
+        U.casterNormalMatrix.value.copy(matrix).invert().transpose();
+    }
+    // Fast path for rigid caster motion. Geometry/BVH stay resident in local
+    // space; only three small matrices change. Re-call setCasterMesh for vertex
+    // deformation or any scale change (those alter CDF surface areas).
+    function setCasterTransform(source) {
+        if (source?.isObject3D) source.updateMatrixWorld(true);
+        const matrix = source?.isObject3D ? source.matrixWorld : source;
+        if (!matrix?.isMatrix4) throw new Error('setCasterTransform: expected an Object3D or Matrix4');
+        if (U.casterMatrix.value.equals(matrix)) return;
+        writeCasterTransform(matrix);
+        markTraceDirty();
+    }
+    // Switch to MESH emission: keep `mesh` in local space, build a local-space
+    // BVH, upload geometry once, and emit photons through its transform uniforms.
+    // Re-call only when geometry deforms; use setCasterTransform() for rigid motion.
     // `shaper` (optional) bakes a LOCAL-space vertex displacement that the render
     // material only applies procedurally (e.g. a TSL height-field), so the photon
     // emitter sees the same surface the camera does:
@@ -901,21 +937,19 @@ export function createCausticEngine({
         if (!posAttr) throw new Error('setCasterMesh: geometry has no position attribute');
         mesh.updateMatrixWorld(true);
         const m = mesh.matrixWorld;
-        const nm = new THREE.Matrix3().getNormalMatrix(m);
         const nAttr = geo.getAttribute('normal');
         const vCount = posAttr.count;
-        const wpos = new Float32Array(vCount * 3);
-        const wnrm = new Float32Array(vCount * 3);
+        const lpos = new Float32Array(vCount * 3);
+        const lnrm = new Float32Array(vCount * 3);
         const _v = new THREE.Vector3(), _n = new THREE.Vector3();
         for (let i = 0; i < vCount; i++) {
             _v.fromBufferAttribute(posAttr, i);
             shaper?.position?.(_v, i);
-            _v.applyMatrix4(m);
-            wpos[i * 3] = _v.x; wpos[i * 3 + 1] = _v.y; wpos[i * 3 + 2] = _v.z;
-            if (shaper?.normal?.(_n, i)) _n.applyMatrix3(nm).normalize();
-            else if (nAttr) _n.fromBufferAttribute(nAttr, i).applyMatrix3(nm).normalize();
+            lpos[i * 3] = _v.x; lpos[i * 3 + 1] = _v.y; lpos[i * 3 + 2] = _v.z;
+            if (shaper?.normal?.(_n, i)) _n.normalize();
+            else if (nAttr) _n.fromBufferAttribute(nAttr, i).normalize();
             else _n.set(0, 1, 0);
-            wnrm[i * 3] = _n.x; wnrm[i * 3 + 1] = _n.y; wnrm[i * 3 + 2] = _n.z;
+            lnrm[i * 3] = _n.x; lnrm[i * 3 + 1] = _n.y; lnrm[i * 3 + 2] = _n.z;
         }
         const idxArr = geo.index
             ? new Uint32Array(geo.index.array)
@@ -929,9 +963,9 @@ export function createCausticEngine({
         let acc = 0;
         for (let t = 0; t < triCount; t++) {
             const i0 = idxArr[t * 3], i1 = idxArr[t * 3 + 1], i2 = idxArr[t * 3 + 2];
-            a.set(wpos[i0 * 3], wpos[i0 * 3 + 1], wpos[i0 * 3 + 2]);
-            b.set(wpos[i1 * 3], wpos[i1 * 3 + 1], wpos[i1 * 3 + 2]);
-            c.set(wpos[i2 * 3], wpos[i2 * 3 + 1], wpos[i2 * 3 + 2]);
+            a.set(lpos[i0 * 3], lpos[i0 * 3 + 1], lpos[i0 * 3 + 2]).applyMatrix4(m);
+            b.set(lpos[i1 * 3], lpos[i1 * 3 + 1], lpos[i1 * 3 + 2]).applyMatrix4(m);
+            c.set(lpos[i2 * 3], lpos[i2 * 3 + 1], lpos[i2 * 3 + 2]).applyMatrix4(m);
             acc += 0.5 * e1.subVectors(b, a).cross(e2.subVectors(c, a)).length();
             cdf[t] = acc;
         }
@@ -943,7 +977,7 @@ export function createCausticEngine({
         // Pack CDF + threaded BVH + leaf triangle order into one float storage
         // buffer. Keeping these tables together leaves the glass emitter at
         // seven storage bindings, below WebGPU's portable per-stage minimum.
-        const bvh = buildCausticBvh(wpos, idxArr);
+        const bvh = buildCausticBvh(lpos, idxArr);
         if (triCount > 0x00FFFFFF || bvh.nodeCount > 0x00FFFFFF) {
             throw new Error('setCasterMesh: caustic BVH exceeds exact float-index range');
         }
@@ -956,10 +990,10 @@ export function createCausticEngine({
 
         for (const at of meshAttrs) at?.dispose?.();
         meshAttrs.length = 0;
-        const posA = makeStorage(wpos), nrmA = makeStorage(wnrm), idxA = makeStorage(idxArr), accelA = makeStorage(accel);
+        const posA = makeStorage(lpos), nrmA = makeStorage(lnrm), idxA = makeStorage(idxArr), accelA = makeStorage(accel);
         meshAttrs.push(posA, nrmA, idxA, accelA);
-        meshPos = storage(posA, 'float', wpos.length);
-        meshNrm = storage(nrmA, 'float', wnrm.length);
+        meshPos = storage(posA, 'float', lpos.length);
+        meshNrm = storage(nrmA, 'float', lnrm.length);
         meshIdx = storage(idxA, 'uint', idxArr.length);
         meshAccel = storage(accelA, 'float', accel.length);
         meshTriCount = triCount;
@@ -969,6 +1003,7 @@ export function createCausticEngine({
         meshBvhTriBase = triBase;
         meshSurfaceArea = acc;
         U.casterAreaScale.value = acc / REFERENCE_CASTER_AREA;
+        writeCasterTransform(m);
         emitMode = 'mesh';
         emitCount = -1; // force ensureEmit to rebuild with the mesh emitter
         markTraceDirty();
@@ -1007,7 +1042,7 @@ export function createCausticEngine({
         const next = Math.max(0, Number.isFinite(v) ? v : params.strength);
         if (Math.abs(params.strength - next) < 1e-6) return;
         params.strength = next;
-        overlayMat.opacity = next;
+        U.overlayStrength.value = next;
     }
     function setPhotonBudget(n) { params.photonBudget = cleanPhotonCount(n, params.photonBudget); }
     function setResolveInterval(n) {
@@ -1126,7 +1161,7 @@ export function createCausticEngine({
         uniforms: U,
         mode: isGlass ? 'refract' : 'reflect',
         update,
-        setLight, setCasterMatrices, setCasterMesh, setMetal, setMetalTint,
+        setLight, setCasterMatrices, setCasterMesh, setCasterTransform, setMetal, setMetalTint,
         setRoughness, setSoftness, setBloom, setStrength, setPhotonBudget, setResolveInterval, setTargetPhotons,
         setLightIntensity, setLightColor, setReceiverAlbedo, setLightCone,
         setThrowFalloff, setIor, setDispersion, setThickness,

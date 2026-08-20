@@ -207,12 +207,14 @@ vendoring files:
   presets: pure-WebGPU compute photon caustics with analytic and mesh-emission
   casters, soft t-cull (`setThrowFalloff`), and a `setCasterMesh(mesh,
   { shaper })` hook for baking procedural vertex displacement into photon
-  emission. Pass `mode: 'refract'` (plus `ior` / `dispersion` / `thickness`)
-  for glass caustics — same splat pipeline, BVH-accelerated through-mesh Snell
-  refraction, Cauchy-style chromatic R/G/B grids, high-photon convergence
-  controls (`photonBudget`, `resolveInterval`, `setTargetPhotons`), light/floor
-  response controls (`setLightIntensity`, `setLightColor`,
-  `setReceiverAlbedo`), and optional
+  emission. Rigid animation uses `setCasterTransform(meshOrMatrix)` so geometry
+  and the BVH stay resident; call `setCasterMesh` again only for deformation or
+  a scale change. Pass `mode: 'refract'` (plus `ior` / `dispersion` /
+  `thickness`) for glass caustics — same splat pipeline, BVH-accelerated
+  through-mesh Snell refraction, Cauchy-style chromatic R/G/B grids, high-photon
+  convergence controls (`photonBudget`, `resolveInterval`, `setTargetPhotons`),
+  light/floor response controls (`setLightIntensity`, `setLightColor`,
+  `setReceiverAlbedo`), radiance gain (`setStrength`), and optional
   spotlight-cone matching via `setLightCone(direction, angleRadians, penumbra)`.
 - **`speedball-gi/spectral-scene`** / **`speedball-gi/spectral-traverse`** —
   the shared scene foundation (scene → flat BVH/material/light buffers; TSL

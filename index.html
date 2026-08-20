@@ -602,7 +602,6 @@ const ballHome = new THREE.Vector3();
 let metalCaustics = null;
 let glassCaustics = null;
 let causticCaster = null;
-let causticLastSyncMs = 0;
 let playing = false;
 let animClock = 0;          // seconds of animation played, paused-time excluded
 let lastAnimMs = 0;
@@ -634,14 +633,12 @@ function syncCausticLight(engineHandle) {
   engineHandle.setLightCone(direction, causticKey.angle, causticKey.penumbra);
 }
 
-function syncActiveCaustic(nowMs = performance.now(), force = false) {
+function syncActiveCaustic() {
   const active = activeCaustics();
   if (!active || !ball || !causticCaster) return;
-  // A moving glossy caster invalidates accumulation. Refit the lightweight
-  // 1.2k-triangle proxy at 12 Hz; the final pause/switch always forces an exact
-  // sync so the converged caustic and rendered sphere cannot disagree.
-  if (!force && nowMs - causticLastSyncMs < 80) return;
-  causticLastSyncMs = nowMs;
+  // The proxy geometry/BVH is uploaded once. Rigid motion now changes only the
+  // engine's transform uniforms, so the caustic follows every animation frame
+  // without the old 12 Hz buffer-disposal jumps.
   causticCaster.position.copy(ball.position);
   causticCaster.quaternion.copy(ball.quaternion);
   causticCaster.scale.copy(ball.scale);
@@ -649,7 +646,7 @@ function syncActiveCaustic(nowMs = performance.now(), force = false) {
   causticKey.target.position.copy(ball.position);
   causticKey.target.updateMatrixWorld(true);
   syncCausticLight(active);
-  active.setCasterMesh(causticCaster);
+  active.setCasterTransform(causticCaster);
 }
 
 function applyBallMaterialMode() {
@@ -701,7 +698,7 @@ function setBallMode(next, { initial = false } = {}) {
   causticKey.shadow.needsUpdate = true;
   if (metalCaustics) metalCaustics.overlayMesh.visible = next === 'metal';
   if (glassCaustics) glassCaustics.overlayMesh.visible = next === 'glass';
-  if (next !== 'emissive') syncActiveCaustic(performance.now(), true);
+  if (next !== 'emissive') syncActiveCaustic();
 
   if (ball) {
     // The mesh is permanently opted into emitter discovery. Emissive black means
@@ -778,7 +775,7 @@ function updateBallAnimation(nowMs) {
   ball.rotation.y = t * 0.5;
   ball.updateMatrixWorld(true);
   gi?.markTransformsDirty?.(ball);
-  syncActiveCaustic(nowMs);
+  syncActiveCaustic();
 }
 
 const playEl = document.getElementById('play');
@@ -790,7 +787,7 @@ function setPlaying(on) {
   lastAnimMs = 0;
   playEl.setAttribute('aria-pressed', String(playing));
   playEl.querySelector('.label').textContent = playing ? 'PAUSE' : 'ANIMATE';
-  if (!playing) syncActiveCaustic(performance.now(), true);
+  if (!playing) syncActiveCaustic();
   markInteraction();
 }
 playEl.addEventListener('click', () => setPlaying(!playing));
