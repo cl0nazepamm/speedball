@@ -9,7 +9,7 @@ const KEY = 'speedball-gi-settings-v2';
 // Canonical defaults (= Sponza's tuning).
 export const GI_DEFAULTS = {
     giEnabled: true, giIntensity: 10, giDivisions: 16, giRays: 64,
-    giCascades: 1, giContinuous: true, showProbes: false,
+    giCascades: 1, giContinuous: true,
     giHysteresis: 0.6, giHysteresisNormalize: true, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 7,
     giLeak: 0.85, giSolid: 0, giSky: 1, giNormalDetail: 1,
     giReflectionQuality: 'high', giReflectionIntensity: 1, giRoughnessLimit: 1,
@@ -52,11 +52,9 @@ export function saveGiSettings(params) {
 
 // One GI panel for EVERY demo page — identical controls everywhere, built from the
 // same shared params (Sponza = canonical). Trimming a slider here trims it on all
-// pages at once. onInteract = the page's markInteraction; onStructure fires for
-// knobs that re-place probes so pages can refresh their probe helpers.
+// pages at once. onInteract = the page's markInteraction.
 export function addGiPanel(gui, gi, params, {
     onInteract = () => {},
-    onStructure = () => {},
     onReflectionQuality = null,
 } = {}) {
     // Demos may opt out of loadGiSettings() so hosted pages always start clean.
@@ -70,11 +68,10 @@ export function addGiPanel(gui, gi, params, {
     fGI.add(params, 'giHysteresis', 0.5, 0.99, 0.01).name('hysteresis').onChange((v) => { gi.setHysteresis(v); onInteract(); });
     fGI.add(params, 'giHysteresisNormalize').name('normalize hysteresis').onChange((v) => { gi.setHysteresisNormalization?.(v); onInteract(); });
     // STRUCTURAL knobs (idle-gated rebuild — never a per-tick recompile).
-    fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi.setDivisions(v); onStructure(); onInteract(); });
+    fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi.setDivisions(v); onInteract(); });
     fGI.add(params, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi.setRays(v); onInteract(); });
-    fGI.add(params, 'giCascades', { 'single grid': 1, 'cascaded (2)': 2 }).name('cascades').onChange((v) => { gi.setCascades(+v); onStructure(); onInteract(); });
+    fGI.add(params, 'giCascades', { 'single grid': 1, 'cascaded (2)': 2 }).name('cascades').onChange((v) => { gi.setCascades(+v); onInteract(); });
     fGI.add(params, 'giContinuous').name('continuous (solve while moving)').onChange((v) => { gi.setContinuous(v); onInteract(); });
-    fGI.add(params, 'showProbes').name('show probes').onChange(() => onStructure());
     // Quality. Reflection tier is structural; the remaining controls are uniform-backed.
     const fQ = fGI.addFolder('Quality');
     // Reflection tier is deliberately a page-owned reload callback: off/rough/high/

@@ -52,6 +52,12 @@ const gi = installSpeedballGI({
 
 // In your render loop, once per frame:
 gi.update();
+
+function disposeScene() {
+  // Dispose GI before the renderer and scene resources.
+  gi.dispose();
+  renderer.dispose();
+}
 ```
 
 **Install before the first render / `setAnimationLoop()`.** Speedball folds a
@@ -85,6 +91,11 @@ gi.notifySceneChange({ type: 'transform', object: mesh });
 gi.notifySceneChange({ type: 'deform', object: streamedMesh });
 gi.notifySceneChange({ type: 'topology' }); // add/remove/new geometry
 ```
+
+Event-complete hosts can pass `autoDetectChanges: false` to
+`installSpeedballGI()`. Explicit dirty packets still run during motion, while the
+compatibility transform/deform/topology/light signature traversals are skipped.
+Leave it at the default `true` if any scene mutation can happen without a packet.
 
 Transform packets are coalesced and consumed during continuous motion. A dirty
 object rewrites only its stable instance record(s) and the unique TLAS ancestor
@@ -177,6 +188,12 @@ rebuild-free count changes.
 ## Limitations
 
 - **WebGPU-only**
+- **Three r185** — the current release is bounded to `>=0.185.0 <0.186.0`
+  because its WebGPU/TSL integration and storage cleanup touch revision-specific
+  renderer APIs.
+- **One active probe field per module instance** — dispose the current field
+  before creating another. A second live field throws instead of silently sharing
+  atlas state across scenes or renderers.
 - **Install timing is sharp** — install before the first render / animation loop. Late install may need an explicit material recompile pass.
 - **Material support is approximate(WIP)** — the trace path uses a flattened scene
   representation. Standard PBR-ish materials are the target; exotic node graphs,
@@ -222,7 +239,7 @@ vendoring files:
   traversal + spectral shading emitters).
 
 All of these work from a plain CDN import map too (e.g. jsDelivr:
-`https://cdn.jsdelivr.net/npm/speedball-gi@0.5.0/js/index.js`)
+`https://cdn.jsdelivr.net/npm/speedball-gi@0.6.7/js/index.js`)
 
 Light records are stride 17 floats (slot [16] = emitter class) and material
 records stride 28 (slot [25] = NIR albedo, slot [26] = traversal flags).

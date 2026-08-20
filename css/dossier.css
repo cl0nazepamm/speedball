@@ -14,7 +14,7 @@
     --v2-red: #e60000;
     --v2-chrome: linear-gradient(to bottom, #f4f4f4, #d4d4d4);
     --v2-chrome-soft: linear-gradient(to bottom, #f2f2f2, #c8c8c8);
-    --v2-float: rgba(239, 239, 239, 0.96);
+    --v2-float: #efefef;
     --display: "Arial Nova", "Segoe UI Variable Display", "Helvetica Neue", Arial, sans-serif;
     --mono: "Cascadia Mono", "Segoe UI Mono", Consolas, monospace;
     --fast: 90ms;
@@ -87,8 +87,6 @@ input:focus-visible { outline: 1px solid var(--v2-blue); outline-offset: 2px; }
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.88), 0 4px 20px rgba(0, 0, 0, 0.32);
     transform: translateX(-50%);
     pointer-events: auto;
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
 }
 
 .transport::before {
@@ -247,13 +245,11 @@ input:focus-visible { outline: 1px solid var(--v2-blue); outline-offset: 2px; }
     gap: 14px;
     min-width: 0;
     padding: 10px 14px 11px;
-    background: rgba(239, 239, 239, 0.96);
+    background: var(--v2-float);
 }
 
 .transport .material-switch { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 .transport .deck-actions { display: flex; align-items: center; gap: 8px; }
-.transport .rule { width: 1px; height: 18px; background: var(--v2-rule); }
-.transport .transport-stat { display: none !important; }
 
 .transport #play,
 .transport #gui-toggle {
@@ -375,8 +371,6 @@ input:focus-visible { outline: 1px solid var(--v2-blue); outline-offset: 2px; }
     box-shadow: inset 0 1px 0 white, 0 4px 20px rgba(0, 0, 0, 0.28);
     overscroll-behavior: contain;
     transition: opacity var(--move) ease, transform var(--move) cubic-bezier(.2, .8, .2, 1);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
 }
 
 .lil-gui.root.gui-hidden { opacity: 0; transform: translateX(10px); pointer-events: none; }

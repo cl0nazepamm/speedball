@@ -251,6 +251,7 @@ export function hysteresisExponentForInterval(updateDtMs, normalize = true) {
 }
 
 let _node = null;
+let _activeProbeFieldOwner = null;
 
 const _nowMs = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 
@@ -955,7 +956,12 @@ export function createProbeField({
     roughnessLimit = null,
     reflectionSkyFallback = false,
     clusteredLighting = false,
+    autoDetectChanges = true,
 } = {}) {
+    if (_activeProbeFieldOwner !== null) {
+        throw new Error('createProbeField: only one active field is supported per module instance; dispose the existing field first.');
+    }
+    const fieldOwner = {};
     const node = getGiProbeNode();
     const reflectionConfig = resolveReflectionQuality(reflectionQuality, roughReflections);
     const roughReflectionsEnabled = reflectionConfig.rough;
@@ -1036,6 +1042,7 @@ export function createProbeField({
     let continuous = true;    // DEFAULT ON: keep the bounded GPU solve running while the camera
                               // moves — heavy build steps still wait for rest, so the no-hitch
                               // guarantee holds. false opts into strict idle-gating (solve too).
+    let detectSceneChanges = autoDetectChanges !== false;
     let dirty = true;
     // Cached CPU build (BVH soup + material textures). The BVH depends ONLY on geometry,
     // so a divisions/rays change must NOT rebuild it — that ~200ms synchronous MeshBVH +
@@ -3264,7 +3271,7 @@ export function createProbeField({
             // async texture extraction are validated below.
             scene.updateMatrixWorld(true);
             const startedGeneration = buildGeneration;
-            const startedGeoSig = geoSignature();
+            const startedGeoSig = detectSceneChanges ? geoSignature() : null;
             if (!blasCache && _createBlasCache) blasCache = _createBlasCache();
             if (mapsArena) {
                 mapsArena.maxLayers = Number(renderer?.backend?.device?.limits?.maxTextureArrayLayers)
@@ -3288,7 +3295,7 @@ export function createProbeField({
             }
 
             scene.updateMatrixWorld(true);
-            if (geoSignature() !== startedGeoSig) return retryFreshBuild(built);
+            if (detectSceneChanges && geoSignature() !== startedGeoSig) return retryFreshBuild(built);
 
             // Vertex buffers and transforms may advance while material images
             // are decoded. Catch the fresh build up in place before publishing
@@ -3317,10 +3324,10 @@ export function createProbeField({
             // Establish all signature baselines from the exact scene state that
             // was installed. The first idle checks can now detect—not silently
             // baseline—an edit that arrives immediately after this point.
-            lastGeoSig = geoSignature();
-            lastDeformSig = deformSignature();
-            lastXformSig = xformSignature();
-            lastLightSig = lightSignature();
+            lastGeoSig = detectSceneChanges ? geoSignature() : null;
+            lastDeformSig = detectSceneChanges ? deformSignature() : null;
+            lastXformSig = detectSceneChanges ? xformSignature() : null;
+            lastLightSig = detectSceneChanges ? lightSignature() : null;
             geoStable = -1;
         }
 
@@ -3514,7 +3521,18 @@ export function createProbeField({
             resetFramePacing();
             if (rebuildBackoff > 0) return;
             inFlight = true; let ok = false;
-            try { ok = await rebuild(); } finally { inFlight = false; }
+            try {
+                ok = await rebuild();
+            } catch (e) {
+                if (disposed) return;
+                console.warn('SPEEDBALL GI rebuild failed:', e);
+                dirty = false;
+                rebuildBackoff = REBUILD_BACKOFF_TICKS;
+                return;
+            } finally {
+                inFlight = false;
+            }
+            if (disposed) return;
             if (ok === 'retry') return; // newer scene state stays armed; retry at the next idle tick
             if (!ok) { dirty = false; rebuildBackoff = REBUILD_BACKOFF_TICKS; return; }
             return;   // stage 0 done this tick; the solve waits for the next tick
@@ -3526,7 +3544,25 @@ export function createProbeField({
         if (buildStage < 2 && !buildHeld) {
             resetFramePacing();
             inFlight = true;
-            try { await advanceBuildStageC1(); } finally { inFlight = false; }
+            const genBefore = node._structGen;
+            try {
+                await advanceBuildStageC1();
+            } catch (error) {
+                if (!disposed) {
+                    console.warn('SPEEDBALL GI fine cascade build failed; continuing with the coarse cascade:', error);
+                    disposeCascadeGPU(1);
+                    node.setCascadeCount(1);
+                    buildCascadeCount = 1;
+                    buildStage = 2;
+                    fieldEverReady = true;
+                    if (node._structGen !== genBefore && typeof onRebuilt === 'function') {
+                        try { onRebuilt(); } catch (e) { /* non-fatal */ }
+                    }
+                }
+            } finally {
+                inFlight = false;
+            }
+            if (disposed) return;
             return;
         }
 
@@ -3589,7 +3625,7 @@ export function createProbeField({
         // deadbands, so this lane rides THROUGH motion. Rest-gating it made
         // every host light edit read as "GI stopped solving" while the
         // interactive raster light updated live (maxjs 2026-07-24).
-        if (checkCounter % LIGHT_CHECK_INTERVAL === 0) {
+        if (detectSceneChanges && checkCounter % LIGHT_CHECK_INTERVAL === 0) {
             const ls = lightSignature();
             if (lastLightSig !== null && ls !== lastLightSig) refreshLights();
             lastLightSig = ls;
@@ -3631,7 +3667,7 @@ export function createProbeField({
             if (disposed || (dirty && !dirtyBefore)) return;
             lastDeformSig = null;
         }
-        if (restOnly) {
+        if (restOnly && detectSceneChanges) {
             if (checkCounter % XFORM_CHECK_INTERVAL === 0) {
                 const xs = xformSignature();
                 if (lastXformSig !== null && xs !== lastXformSig) refreshTransforms();
@@ -3767,6 +3803,7 @@ export function createProbeField({
                     // computeAsync calls only created extra encoders/submissions;
                     // they were never GPU-parallel.
                     if (prep.length > 0) await renderer.computeAsync(prep);
+                    if (disposed) return;
                 }
                 // Match the dispatch envelope to the LIVE auto-throttled batch.
                 // Count sizes each live dispatch without recompiling. Barrier
@@ -3790,12 +3827,15 @@ export function createProbeField({
                     C.glossyPhase = (C.glossyPhase + 1) % glossyUpdateInterval;
                 }
                 await renderer.computeAsync(gpu.solveKernels);
+                if (disposed) return;
                 C.lastSolveAt = tNow;
                 C.solveDtEma = nextSolveDtEma;
             }
         } catch (e) {
-            console.warn('max.js SPEEDBALL GI probe tick failed:', e);
-            dirty = true;
+            if (!disposed) {
+                console.warn('SPEEDBALL GI probe tick failed:', e);
+                dirty = true;
+            }
         } finally {
             inFlight = false;
         }
@@ -4354,7 +4394,7 @@ export function createProbeField({
     function forceLightingRefresh() {
         scene.updateMatrixWorld?.(true);
         refreshLights();
-        lastLightSig = lightSignature();
+        lastLightSig = detectSceneChanges ? lightSignature() : null;
         touchGiUniforms();
     }
 
@@ -4468,7 +4508,9 @@ export function createProbeField({
     }
 
     function dispose() {
+        if (disposed) return;
         disposed = true;
+        if (_activeProbeFieldOwner === fieldOwner) _activeProbeFieldOwner = null;
         // Invalidates any build currently awaiting material texture extraction.
         // Its continuation observes disposed before publishing cachedBuilt or
         // allocating cascade resources and disposes its uninstalled maps.
@@ -4491,9 +4533,12 @@ export function createProbeField({
         pendingAllMaterialValues = false;
         buildDirty = true;
         node.setEnabled(false);
+        // Old handles retain this node reference, so detach the module singleton.
+        // A later field receives a fresh node that a disposed handle cannot mutate.
+        if (_node === node) _node = null;
     }
 
-    return {
+    const api = {
         node,
         tick,
         resetFramePacing,
@@ -4657,6 +4702,8 @@ export function createProbeField({
         // heavy rebuilds still wait for rest, so the no-hitch guarantee holds). false = idle-gated.
         setContinuous: (on) => { continuous = on === true; },
         getContinuous: () => continuous,
+        setAutoDetectChanges: (on) => { detectSceneChanges = on !== false; },
+        getAutoDetectChanges: () => detectSceneChanges,
         requestRebuild,
         markTransformsDirty,
         markDeformsDirty,
@@ -4786,6 +4833,8 @@ export function createProbeField({
         _debugLightCount: (ci = 0) => casc[ci]?.gpu?.lightCount,
         dispose,
     };
+    _activeProbeFieldOwner = fieldOwner;
+    return api;
 }
 
 export default createProbeField;

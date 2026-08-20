@@ -5,6 +5,29 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Hardened the Sponza release demo's default frame path: zero-strength halation
+  now disables its three halo passes, PowerShot receives scene-linear input through
+  `RenderPipeline`, the diagnostic sphere no longer invalidates the full 2048²
+  103-caster shadow map while moving, and opaque UI chrome replaces live canvas
+  backdrop blur. Sun/light refreshes, resize allocation, and hidden Advanced GUI
+  synchronization are coalesced to frame boundaries; dead hidden FPS DOM work and
+  the internal-node probe visualizer were removed.
+- Added complete demo teardown for GI, post nodes/targets, film targets, scene
+  geometry/materials/textures, shadows, controls, GUI, listeners, and the renderer,
+  including late-GLTF guards and `pagehide` cleanup. Structural reloads remain
+  device-retirement gated and teardown is idempotent.
+- Added `autoDetectChanges` (default `true`) so event-complete hosts can disable
+  compatibility scene-signature traversals while retaining exact transform,
+  deform, material, light, and topology packets. The demo now exercises that
+  event-driven path. Installer camera gating follows world transforms, teardown
+  invalidates compiled lit materials, restores only its own lights factory, and a
+  second simultaneous probe field fails loudly instead of sharing global atlas state.
+  Sequential fields receive isolated probe nodes, and a failed fine-cascade build
+  now degrades to the valid coarse field instead of retrying every frame.
+- Bounded the Three peer dependency to the tested r185 API surface and replaced the
+  platform-specific Python demo command with a dependency-free Node static server.
+  Restored the smoke suite to source control so `npm test` is reproducible from a
+  clean clone.
 - Simplified the public Sponza page to one raster GI instrument: removed its top
   bar and embedded path-tracer runtime, and moved Advanced into the bottom deck.
   The package path-tracer modules and exports are unchanged.

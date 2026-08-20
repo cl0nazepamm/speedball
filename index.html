@@ -59,10 +59,6 @@
         </button>
         <button id="gui-toggle" type="button" aria-pressed="false"><span class="num">[ ]</span><span>ADVANCED</span></button>
       </div>
-      <i class="rule transport-stat"></i>
-      <div class="readout transport-stat"><span class="k">Effect</span><span class="v accent" id="t-effect">METAL · REFLECTION</span></div>
-      <i class="rule transport-stat"></i>
-      <div class="readout transport-stat"><span class="k" id="t-metric-k">FPS</span><span class="v" id="t-metric">—</span></div>
     </div>
   </div>
 </div>
@@ -75,7 +71,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
-import { positionWorld, normalWorld, pass } from 'three/tsl';
+import { pass } from 'three/tsl';
 import { FilmPipeline, FILM_PRESETS, applyFilmPreset, filmPass } from 'powershot-threejs';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
@@ -103,14 +99,21 @@ const REFLECTION_QUALITY = REFLECTION_QUALITY_VALUES.has(URL_PARAMS.get('reflect
 // Scene mode and reflection quality both choose install-time GPU structure. Preserve
 // the other query keys when either control reloads so the UI never resets its peer.
 let structuralReloadPending = false;
+let demoDisposed = false;
+let disposePromise = null;
 async function reloadWithStructuralSetting(name, value, defaultValue) {
   if (structuralReloadPending) return;
   structuralReloadPending = true;
   const next = new URLSearchParams(location.search);
   if (value === defaultValue) next.delete(name); else next.set(name, value);
   const search = next.toString();
-  await disposeForStructuralReload();
-  location.href = `${location.pathname}${search ? `?${search}` : ''}${location.hash}`;
+  const destination = `${location.pathname}${search ? `?${search}` : ''}${location.hash}`;
+  try {
+    await disposeForStructuralReload();
+  } finally {
+    // A disposer failure must not strand the user on an inert half-torn-down page.
+    location.href = destination;
+  }
 }
 
 const MODEL = {
@@ -128,13 +131,16 @@ const bootWashEl = document.getElementById('bootwash');
 // The plate keeps its registration crosses, so write the copy into the inner span
 // rather than replacing the whole subtree.
 const setStatus = (msg, err = false) => {
+  if (demoDisposed) return;
   statusMsgEl.textContent = msg;
   statusEl.classList.toggle('err', err);
   statusEl.classList.remove('hide');
 };
 const hideStatus = () => { statusEl.classList.add('hide'); bootWashEl.classList.add('hide'); };
-window.addEventListener('error', (e) => setStatus('Error:\n' + (e.error?.stack || e.message), true));
-window.addEventListener('unhandledrejection', (e) => setStatus('Error:\n' + (e.reason?.stack || e.reason), true));
+const onWindowError = (e) => setStatus('Error:\n' + (e.error?.stack || e.message), true);
+const onUnhandledRejection = (e) => setStatus('Error:\n' + (e.reason?.stack || e.reason), true);
+window.addEventListener('error', onWindowError);
+window.addEventListener('unhandledrejection', onUnhandledRejection);
 
 // ── Renderer ────────────────────────────────────────────────────────────────
 const canvas = document.getElementById('c');
@@ -191,10 +197,9 @@ if (CLUSTER) {
 
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-// The sun shadow is re-rendered ON DEMAND. refreshSunConsumers() sets
-// sun.shadow.needsUpdate on every sun change, and the render loop flags it while
-// the transport animates the sphere, so the map is current exactly when it
-// matters and free the rest of the time.
+// The sun shadow is re-rendered ON DEMAND. refreshSunConsumers() flags sun edits;
+// the transport sphere does not cast into this static architectural map, so its
+// animation never turns the 103-caster Sponza shadow pass into per-frame work.
 //
 // It MUST be the light's own flag. three's WebGPU ShadowNode.updateBefore gates on
 // `shadow.needsUpdate || shadow.autoUpdate` and never consults
@@ -207,7 +212,7 @@ const params = {
   // New demo defaults (dialed-in look — film graded, on by default).
   azimuth: 119, elevation: 62.5, turbidity: 10, rayleigh: 0.6,
   sunIntensity: 20, exposure: 1,
-  giEnabled: true, giIntensity: 20, giDivisions: 16, giCascades: 1, giContinuous: true, showProbes: false,
+  giEnabled: true, giIntensity: 20, giDivisions: 16, giCascades: 1, giContinuous: true,
   // quality knobs (defaults mirror gi_probes.js). smoothness is pinned to 1 (no slider).
   giRays: 64, giHysteresis: 0.6, giHysteresisNormalize: true, giJitterMode: 'gated', giNormalBias: 1.75,
   giRadianceClamp: 8, giDepthSharpness: 7, giLeak: 0.85, giSolid: 0, giSky: 2, giNormalDetail: 1,
@@ -310,52 +315,69 @@ function markInteraction() { gi?.markInteraction?.(); }
 function markGiInteraction() { markInteraction(); }
 function markGuiInteraction() { markInteraction(); }
 function flushSunGiRefresh() {
-  if (gi?.forceLightingRefresh) {
-    gi.forceLightingRefresh();
-    sunGiDirty = false;
-  } else {
-    sunGiDirty = true;
-  }
+  if (!sunGiDirty || !gi?.forceLightingRefresh) return;
+  sunGiDirty = false;
+  gi.forceLightingRefresh();
 }
 function refreshSunConsumers() {
   sun.updateMatrixWorld(true);
   sun.target.updateMatrixWorld(true);
   sun.shadow.needsUpdate = true;
-  flushSunGiRefresh();
+  // Pointer input may arrive several times between frames. Repack the light
+  // arena once in the render loop instead of traversing the scene per event.
+  sunGiDirty = true;
 }
 controls.addEventListener('change', markInteraction);
-window.addEventListener('resize', () => {
+let resizePending = false;
+function onResize() {
+  resizePending = true;
+  markInteraction();
+}
+function flushResize() {
+  if (!resizePending) return;
+  resizePending = false;
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
-  markInteraction();
-});
+}
+window.addEventListener('resize', onResize);
 
 const gui = new GUI({ title: 'SPEEDBALL GI · Sky' });
 function installGuiIdleGate(gui) {
   const el = gui?.domElement;
-  if (!el) return;
-  const begin = () => { markGuiInteraction(); };
+  if (!el) return () => {};
+  const removers = [];
+  const listen = (target, type, handler, options = true) => {
+    target.addEventListener(type, handler, options);
+    removers.push(() => target.removeEventListener(type, handler, options));
+  };
+  let active = false;
+  const begin = () => { active = true; markGuiInteraction(); };
+  const move = () => { if (active) markGuiInteraction(); };
   const touch = () => { markGuiInteraction(); };
-  const end = () => { markGuiInteraction(); };
-  for (const type of ['pointerdown', 'mousedown', 'touchstart']) el.addEventListener(type, begin, true);
-  for (const type of ['pointermove', 'mousemove', 'touchmove', 'wheel', 'input', 'change', 'keydown']) el.addEventListener(type, touch, true);
-  for (const type of ['pointerup', 'mouseup', 'touchend', 'touchcancel', 'blur']) window.addEventListener(type, end, true);
+  const end = () => { if (active) { active = false; markGuiInteraction(); } };
+  listen(el, 'pointerdown', begin);
+  listen(el, 'pointermove', move);
+  for (const type of ['wheel', 'input', 'change', 'keydown']) listen(el, type, touch);
+  for (const type of ['pointerup', 'pointercancel', 'blur']) listen(window, type, end);
+  return () => removers.splice(0).forEach((remove) => remove());
 }
-installGuiIdleGate(gui);
+const disposeGuiIdleGate = installGuiIdleGate(gui);
 // Advanced lives with the other bottom-deck controls and parks the panel off-screen.
 const guiToggleEl = document.getElementById('gui-toggle');
 gui.domElement.classList.add('gui-hidden');
 guiToggleEl.addEventListener('click', () => {
   const hidden = gui.domElement.classList.toggle('gui-hidden');
   guiToggleEl.setAttribute('aria-pressed', String(!hidden));
+  if (!hidden) flushGuiDisplayRefresh();
 });
 const compactControls = window.matchMedia('(max-width: 700px), (max-height: 560px)');
 const fSky = gui.addFolder('Sky / Sun');
-fSky.add(params, 'azimuth', 0, 360, 1).name('azimuth°').onChange(updateSun);
-fSky.add(params, 'elevation', -3, 88, 0.5).name('elevation°').onChange(updateSun);
+const updateSunFromGui = () => { updateSun(); syncCoreControls(); };
+fSky.add(params, 'azimuth', 0, 360, 1).name('azimuth°').onChange(updateSunFromGui);
+fSky.add(params, 'elevation', -3, 88, 0.5).name('elevation°').onChange(updateSunFromGui);
 // turbidity pinned to 10, rayleigh pinned to 0.6 (no sliders)
-fSky.add(params, 'sunIntensity').min(0).step(0.05).name('sun intensity').onChange(updateSun);   // uncapped
+fSky.add(params, 'sunIntensity').min(0).step(0.05).name('sun intensity').onChange(updateSunFromGui);   // uncapped
 // (the SPEEDBALL GI panel is added after gi is installed below — see addGiPanel)
 
 updateSun();
@@ -385,7 +407,7 @@ function prepareSponzaMaterialForGi(material) {
 // The lights factory MUST be in place before any lit material compiles. Installing
 // it after the render loop has started leaves a cached non-GI lights node, and GI
 // never folds in (even a later recompile can't swap it). The probe field auto-fits
-// and builds once Sponza is in the scene (idle-gated); requestRebuild() nudges it.
+// and builds once Sponza is in the scene (idle-gated); markTopologyDirty() nudges it.
 gi = installSpeedballGI({
   renderer, scene, camera,
   enabled: params.giEnabled,
@@ -402,6 +424,9 @@ gi = installSpeedballGI({
   // rays provide its explicit distant-specular layer; SSR can still composite later.
   // In cluster mode there is no sky at all, so the fallback would only add a lie.
   reflectionSkyFallback: !CLUSTER,
+  // The demo emits exact transform/material/light/topology notifications, so it
+  // does not need the compatibility scene-signature traversals.
+  autoDetectChanges: false,
   // clusteredLighting swaps the batched DynamicLightsNode for the Forward+
   // GiClusteredLightsNode (no 16-point batch cap) and switches the GI lane to its
   // fixed importance-budgeted arena. Install-time only — see SCENE_MODE.
@@ -418,8 +443,7 @@ refreshSunConsumers();
 // The GI panel is shared helper code, but Sponza itself is intentionally not persisted:
 // visitors can experiment, then reload back to the release tuning.
 addGiPanel(gui, gi, params, {
-  onInteract: markGiInteraction,
-  onStructure: () => updateProbeHelpers(),
+  onInteract: () => { markGiInteraction(); syncCoreControls(); },
   onReflectionQuality: (quality) => {
     if (quality !== REFLECTION_QUALITY) reloadWithStructuralSetting('reflections', quality, 'high');
   },
@@ -444,7 +468,13 @@ const hysteresisStateEl = document.getElementById('hysteresis-state');
 const jitterGatedEl = document.getElementById('jitter-gated');
 const jitterMcEl = document.getElementById('jitter-mc');
 
-function refreshGuiDisplays() {
+let guiDisplayRefreshPending = false;
+function requestGuiDisplayRefresh() {
+  guiDisplayRefreshPending = true;
+}
+function flushGuiDisplayRefresh() {
+  if (!guiDisplayRefreshPending || gui.domElement.classList.contains('gui-hidden')) return;
+  guiDisplayRefreshPending = false;
   gui.controllersRecursive?.().forEach((controller) => controller.updateDisplay());
 }
 
@@ -485,25 +515,25 @@ sunBallEl.addEventListener('pointermove', (event) => {
   params.elevation = THREE.MathUtils.clamp(sunDrag.elevation - (event.clientY - sunDrag.y) * 0.9, -3, 88);
   updateSun();
   syncCoreControls();
-  refreshGuiDisplays();
+  requestGuiDisplayRefresh();
 });
 sunBallEl.addEventListener('pointerup', () => { sunDrag = null; });
 sunBallEl.addEventListener('pointercancel', () => { sunDrag = null; });
 
 intensitySliderEl.addEventListener('input', () => {
   params.sunIntensity = Number(intensitySliderEl.value);
-  updateSun(); syncCoreControls(); refreshGuiDisplays();
+  updateSun(); syncCoreControls(); requestGuiDisplayRefresh();
 });
 divisionsSliderEl.addEventListener('input', () => {
   params.giDivisions = Number(divisionsSliderEl.value);
-  syncCoreControls(); refreshGuiDisplays();
+  syncCoreControls(); requestGuiDisplayRefresh();
 });
 divisionsSliderEl.addEventListener('change', () => {
-  gi.setDivisions(params.giDivisions); updateProbeHelpers(); markGiInteraction();
+  gi.setDivisions(params.giDivisions); markGiInteraction();
 });
 raysSliderEl.addEventListener('input', () => {
   params.giRays = Number(raysSliderEl.value);
-  syncCoreControls(); refreshGuiDisplays();
+  syncCoreControls(); requestGuiDisplayRefresh();
 });
 raysSliderEl.addEventListener('change', () => {
   gi.setRays(params.giRays); markGiInteraction();
@@ -511,14 +541,14 @@ raysSliderEl.addEventListener('change', () => {
 hysteresisSliderEl.addEventListener('input', () => {
   params.giHysteresis = Number(hysteresisSliderEl.value);
   gi.setHysteresis(params.giHysteresis); markGiInteraction();
-  syncCoreControls(); refreshGuiDisplays();
+  syncCoreControls(); requestGuiDisplayRefresh();
 });
 function setJitterMode(mode) {
   gi.setJitterMode?.(mode);
   params.giJitterMode = gi.getJitterMode?.() ?? mode;
   params.giHysteresis = gi.getHysteresis?.() ?? params.giHysteresis;
   markGiInteraction();
-  syncCoreControls(); refreshGuiDisplays();
+  syncCoreControls(); requestGuiDisplayRefresh();
 }
 jitterGatedEl.addEventListener('click', () => setJitterMode('gated'));
 jitterMcEl.addEventListener('click', () => setJitterMode('montecarlo'));
@@ -537,6 +567,7 @@ window.scene = scene; window.renderer = renderer; window.markGiMaterialsDirty = 
 // outputColorTransform=false so the film's own display-encoded sRGB is presented verbatim.
 // This mirrors how max.js drives the same physically-correct film.
 const film = new FilmPipeline(renderer);
+film.setInputEncoding('linear');
 applyFilmPreset(film.ctx, FILM_PRESETS[params.filmStock]);
 const P = film.ctx.P;
 // Tuned baseline overrides. Apply after the stock preset so the look is deterministic.
@@ -551,14 +582,19 @@ P.halThreshold.value = params.filmHalThreshold;
 P.halSoftness.value = params.filmHalSoftness;
 P.halRadius.value = params.filmHalRadius;
 P.halColor.value.fromArray(params.filmHalColor);
+// A zero-strength halo still costs three quarter-resolution passes unless the
+// stage itself is disabled. Keep the pinned no-halation look genuinely cheap.
+film.setEnabled('halation', params.filmHalation > 0);
 P.weave.value = params.filmWeave;
 P.flicker.value = params.filmFlicker;
 P.printExposure.value = params.filmPrintExposure * 0.301;   // stops → log10 density (matches max.js)
 P.printWarmth.value = params.filmPrintWarmth;
 P.negativeView.value = params.filmNegative ? 1 : 0;
-const post = new THREE.PostProcessing(renderer);
+const scenePassNode = pass(scene, camera);
+const filmPassNode = filmPass(scenePassNode, film);
+const post = new THREE.RenderPipeline(renderer);
 post.outputColorTransform = false;               // film already emits display-encoded sRGB
-post.outputNode = filmPass(pass(scene, camera), film);   // SCENE-LINEAR in (no renderOutput) — the film owns the transfer
+post.outputNode = filmPassNode;                         // SCENE-LINEAR in — the film owns the transfer
 window.film = film;
 
 let displayExposure = params.exposure;
@@ -583,18 +619,16 @@ gui.add(params, 'filmEnabled').name('Film').onChange((on) => {
 // ── Centre sphere ─────────────────────────────────────────────────────────────
 let ball = null;
 let sponzaBounds = null;
+let sceneReady = false;
 const ballHome = new THREE.Vector3();
 let playing = false;
 let animClock = 0;          // seconds of animation played, paused-time excluded
 let lastAnimMs = 0;
 
-const BALL_MODE_COPY = {
-  emissive: 'MESH EMITTER · NEE · INFINITE BOUNCE',
-  metal: 'METAL · LOCAL DDGI REFLECTION',
-};
+const BALL_MODES = ['emissive', 'metal'];
 
 function syncBallModeButtons() {
-  for (const mode of Object.keys(BALL_MODE_COPY)) {
+  for (const mode of BALL_MODES) {
     document.getElementById(`ball-${mode}`).setAttribute('aria-pressed', String(params.ballMode === mode));
   }
 }
@@ -619,12 +653,12 @@ function applyBallMaterialMode() {
 }
 
 function setBallMode(next, { initial = false } = {}) {
-  if (!BALL_MODE_COPY[next]) return;
+  if (!BALL_MODES.includes(next)) return;
   params.ballMode = next;
   syncBallModeButtons();
   applyBallMaterialMode();
 
-  if (ball) {
+  if (ball && !initial) {
     // The mesh is permanently opted into emitter discovery. Emissive black means
     // zero records in metal mode; turning emission on adds the same sphere as a
     // type-3 NEE source without rebuilding its geometry.
@@ -634,7 +668,7 @@ function setBallMode(next, { initial = false } = {}) {
   if (!initial) markGiInteraction();
 }
 
-for (const mode of Object.keys(BALL_MODE_COPY)) {
+for (const mode of BALL_MODES) {
   document.getElementById(`ball-${mode}`).addEventListener('click', () => setBallMode(mode));
 }
 syncBallModeButtons();
@@ -679,9 +713,6 @@ if (compactControls.matches) gui.close();
 function updateBallAnimation(nowMs) {
   if (!ball) return;
   if (!playing) { lastAnimMs = nowMs; return; }
-  // The sphere is the only thing moving, and shadows are on-demand — so a playing
-  // transport is the one case that has to pay for the shadow pass per frame.
-  sun.shadow.needsUpdate = true;
   const dt = lastAnimMs ? Math.min(0.1, (nowMs - lastAnimMs) / 1000) : 0;
   lastAnimMs = nowMs;
   animClock += dt;
@@ -700,9 +731,6 @@ function updateBallAnimation(nowMs) {
 }
 
 const playEl = document.getElementById('play');
-const tEffectEl = document.getElementById('t-effect');
-const tMetricEl = document.getElementById('t-metric');
-const tMetricKEl = document.getElementById('t-metric-k');
 function setPlaying(on) {
   playing = on === true;
   lastAnimMs = 0;
@@ -777,6 +805,10 @@ function rebuildLights(count) {
 setStatus(`loading ${MODEL.meta.split(' ')[0]}…`);
 new GLTFLoader().load(MODEL.url, (gltf) => {
   const root = gltf.scene;
+  if (demoDisposed) {
+    disposeObjectResources(root);
+    return;
+  }
   root.traverse((o) => {
     if (!o.isMesh) return;
     o.castShadow = true;
@@ -821,7 +853,9 @@ new GLTFLoader().load(MODEL.url, (gltf) => {
   );
   centreBall.name = 'Centre Sphere';
   centreBall.position.copy(ballHome);
-  centreBall.castShadow = true;
+  // Keep the 103-caster Sponza shadow map static. Re-rendering the entire 2048²
+  // map for this diagnostic mover obscures the GI transform cost being demonstrated.
+  centreBall.castShadow = false;
   centreBall.receiveShadow = true;
   centreBall.userData.giEmitter = true;
   scene.add(centreBall);
@@ -838,115 +872,103 @@ new GLTFLoader().load(MODEL.url, (gltf) => {
   if (CLUSTER) rebuildLights(params.lightCount);
 
   // model is in the scene now → build the probe field over it.
-  gi.requestRebuild();
+  gi.markTopologyDirty();
+  sceneReady = true;
   hideStatus();
   markInteraction();
 }, (xhr) => {
+  if (demoDisposed) return;
   if (xhr.total) setStatus(`loading ${MODEL.meta.split(' ')[0]}… ` + Math.min(100, Math.round(xhr.loaded / xhr.total * 100)) + '%');
 }, (err) => {
+  if (demoDisposed) return;
   setStatus(`Failed to load ${MODEL.url}\n` + (err?.message || err), true);
 });
 
 // ── Render loop ───────────────────────────────────────────────────────────────
-// ── Diagnostics: draw the probe field as a grid of spheres ────────────────────
-let probeHelperMesh = null, probeHelperSig = '';
-const _pgVec = new THREE.Vector3(), _pgMat = new THREE.Matrix4();
-// Probe spheres show their REAL captured color: each fragment samples the GI field
-// at the sphere surface along its own normal, so a probe reads red near a red wall,
-// sky-blue up top, etc. Falls back to a neutral tint until the atlas is bound.
-function makeProbeHelperMaterial(lit) {
-  if (!lit) return new THREE.MeshBasicMaterial({ color: 0x808080, depthWrite: false, transparent: true, opacity: 0.85, toneMapped: false });
-  const n = gi.node;
-  const P = positionWorld.add(normalWorld.mul(n.normalBiasNode[0]));
-  const mat = new THREE.MeshBasicNodeMaterial({ depthWrite: false, transparent: true, opacity: 0.95 });
-  mat.colorNode = n.sampleIrradiance(P, normalWorld, normalWorld).max(0.0);
-  return mat;
-}
-function updateProbeHelpers() {
-  if (!params.showProbes) { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
-  if (!gi || gi.hasData?.() === false || typeof gi.getResolution !== 'function') {
-    if (probeHelperMesh) probeHelperMesh.visible = false; return;
-  }
-  const res = gi.getResolution(); const bounds = gi.getBounds?.();
-  if (!res || !bounds) { if (probeHelperMesh) probeHelperMesh.visible = false; return; }
-  const rx = Math.max(1, Math.round(res.x)), ry = Math.max(1, Math.round(res.y)), rz = Math.max(1, Math.round(res.z));
-  const total = rx * ry * rz;
-  const min = bounds.min, size = _pgVec.subVectors(bounds.max, bounds.min);
-  const sx = size.x, sy = size.y, sz = size.z;
-  const lit = gi.node?.active === true;   // atlas bound → can show each probe's real captured color
-  const sig = `${rx},${ry},${rz}|${min.x.toFixed(2)},${min.y.toFixed(2)},${min.z.toFixed(2)}|${sx.toFixed(2)},${sy.toFixed(2)},${sz.toFixed(2)}|${lit ? 1 : 0}`;
-  if (sig === probeHelperSig && probeHelperMesh) { probeHelperMesh.visible = true; return; }
-  probeHelperSig = sig;
-  if (!probeHelperMesh || probeHelperMesh.count !== total || probeHelperMesh._lit !== lit) {
-    if (probeHelperMesh) { scene.remove(probeHelperMesh); probeHelperMesh.geometry.dispose(); probeHelperMesh.material.dispose(); }
-    const cell = Math.max(sx / Math.max(1, rx - 1), sy / Math.max(1, ry - 1), sz / Math.max(1, rz - 1));
-    const geo = new THREE.SphereGeometry(cell * 0.08 + 1e-3, 8, 6);
-    const mat = makeProbeHelperMaterial(lit);
-    probeHelperMesh = new THREE.InstancedMesh(geo, mat, total);
-    probeHelperMesh._lit = lit;
-    probeHelperMesh.frustumCulled = false;
-    probeHelperMesh.renderOrder = 9999;
-    probeHelperMesh.userData.maxjsVisible = false; // keep probe spheres OUT of the GI BVH
-    scene.add(probeHelperMesh);
-  }
-  let idx = 0;
-  for (let k = 0; k < rz; k++) for (let j = 0; j < ry; j++) for (let i = 0; i < rx; i++) {
-    const fx = rx > 1 ? i / (rx - 1) : 0, fy = ry > 1 ? j / (ry - 1) : 0, fz = rz > 1 ? k / (rz - 1) : 0;
-    _pgMat.makeTranslation(min.x + fx * sx, min.y + fy * sy, min.z + fz * sz);
-    probeHelperMesh.setMatrixAt(idx++, _pgMat);
-  }
-  probeHelperMesh.instanceMatrix.needsUpdate = true;
-  probeHelperMesh.visible = true;
+function disposeObjectResources(root) {
+  if (!root?.traverse) return;
+  const geometries = new Set();
+  const materials = new Set();
+  const textures = new Set();
+  root.traverse((object) => {
+    if (object.geometry) geometries.add(object.geometry);
+    const list = Array.isArray(object.material) ? object.material : (object.material ? [object.material] : []);
+    for (const material of list) {
+      if (!material || materials.has(material)) continue;
+      materials.add(material);
+      for (const value of Object.values(material)) if (value?.isTexture) textures.add(value);
+    }
+  });
+  for (const geometry of geometries) geometry.dispose?.();
+  for (const material of materials) material.dispose?.();
+  for (const texture of textures) texture.dispose?.();
 }
 
-async function disposeForStructuralReload() {
-  // Reflection quality and optional scene query modes rebuild install-time GPU
-  // structure. Retire the old device before the next document allocates one.
+function disposeDemo({ waitForDevice = true } = {}) {
+  if (disposePromise) return disposePromise;
+  demoDisposed = true;
+  sceneReady = false;
   renderer.setAnimationLoop(null);
-  gi?.dispose?.();
-  controls.dispose();
-  const deviceLost = renderer.backend?.device?.lost;
-  renderer.dispose();
-  // WebGPURenderer.dispose() is synchronous in r185, while D3D12 retires the
-  // device and its command queue asynchronously. Wait for that retirement before
-  // the next page asks Dawn for another command queue.
-  if (deviceLost) await deviceLost;
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  document.getElementById('transport').inert = true;
+
+  disposePromise = (async () => {
+    controls.removeEventListener('change', markInteraction);
+    window.removeEventListener('resize', onResize);
+    window.removeEventListener('error', onWindowError);
+    window.removeEventListener('unhandledrejection', onUnhandledRejection);
+    window.removeEventListener('pagehide', onPageHide);
+    disposeGuiIdleGate();
+    gui.destroy();
+
+    gi?.dispose?.();
+    post.dispose();
+    filmPassNode.dispose();
+    scenePassNode.dispose();
+    film.dispose();
+    sun.shadow.dispose?.();
+    disposeObjectResources(scene);
+    controls.dispose();
+
+    const deviceLost = renderer.backend?.device?.lost;
+    renderer.dispose();
+    window.gi = window.gui = window.scene = window.renderer = window.film = null;
+    window.controls = window.camera = window.dumpCamera = window.markGiMaterialsDirty = null;
+
+    // WebGPURenderer.dispose() is synchronous in r185, while D3D12 retires the
+    // command queue asynchronously. Structural reloads wait before allocating
+    // the replacement device; ordinary page teardown does not delay navigation.
+    if (waitForDevice && deviceLost) {
+      await Promise.race([
+        deviceLost,
+        new Promise((resolve) => setTimeout(resolve, 2000)),
+      ]);
+    }
+    if (waitForDevice) await new Promise((resolve) => setTimeout(resolve, 50));
+  })();
+  return disposePromise;
 }
 
-// ── Transport readout ─────────────────────────────────────────────────────────
-let fpsFrames = 0, fpsWindowMs = 0, readoutDueMs = 0;
-function updateTransportReadout(nowMs) {
-  fpsFrames++;
-  if (!fpsWindowMs) fpsWindowMs = nowMs;
-  if (nowMs < readoutDueMs) return;
-  readoutDueMs = nowMs + 250;
-  const span = nowMs - fpsWindowMs;
-  const fps = span > 0 ? Math.round((fpsFrames * 1000) / span) : 0;
-  fpsFrames = 0; fpsWindowMs = nowMs;
-
-  tEffectEl.textContent = params.ballMode === 'emissive' ? 'EMISSIVE · NEE' : 'METAL · REFLECTION';
-  tEffectEl.classList.add('accent');
-
-  tMetricKEl.textContent = 'FPS';
-  tMetricEl.textContent = String(fps).padStart(2, '0');
-  tMetricEl.classList.remove('accent');
+function disposeForStructuralReload() {
+  return disposeDemo({ waitForDevice: true });
 }
+
+function onPageHide(event) {
+  if (!event.persisted) void disposeDemo({ waitForDevice: false });
+}
+window.addEventListener('pagehide', onPageHide);
 
 renderer.setAnimationLoop((nowMs) => {
+  flushResize();
   controls.update();
+  flushGuiDisplayRefresh();
+  if (!sceneReady || demoDisposed) return;
   updateBallAnimation(nowMs);
-  updateTransportReadout(nowMs);
 
   if (sunGiDirty) flushSunGiRefresh();
-  // SPEEDBALL GI self-gates on idle: the BVH build + GPU solve are held while orbiting
-  // or dragging a slider (world-space GI is lossless held static), then converge
-  // once the view rests — so a frame hitch can never land mid-interaction. While the
-  // transport is running the scene is genuinely animating, so playing:true tells the
-  // field to keep solving through the motion instead of waiting for a rest that
-  // never comes.
+  // Heavy BVH/kernel rebuilds remain rest-gated. This demo keeps the bounded solve
+  // continuous for live light feedback, and `playing` identifies real scene motion
+  // so transform packets and post-playback budget recovery follow the public API.
   gi?.update({ playing });
-  updateProbeHelpers();
   if (params.filmEnabled) {
     renderer.toneMapping = THREE.NoToneMapping;       // imager: the film owns the whole transfer curve (scene-linear in)
     post.render();                                    // PowerShot film post-chain → display-encoded sRGB out

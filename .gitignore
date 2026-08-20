@@ -35,6 +35,3 @@ desktop.ini
 /dist/
 /build/
 /.cache/
-
-# Smoke tests stay local-only (npm test runs them from the working copy).
-scripts/*-smoke.mjs
