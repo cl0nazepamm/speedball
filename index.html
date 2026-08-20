@@ -50,8 +50,7 @@
         <span class="k">SPHERE MATERIAL</span>
         <div class="seg" role="group" aria-label="Centre sphere material">
           <button id="ball-emissive" type="button" aria-pressed="false" title="Emissive mesh with NEE">EMISSION</button>
-          <button id="ball-metal" type="button" aria-pressed="true" title="Reflective metal with ground caustics">METAL</button>
-          <button id="ball-glass" type="button" aria-pressed="false" title="Refractive glass with ground caustics">GLASS</button>
+          <button id="ball-metal" type="button" aria-pressed="true" title="Reflective metal">METAL</button>
         </div>
       </div>
       <div class="deck-actions">
@@ -61,7 +60,7 @@
         <button id="gui-toggle" type="button" aria-pressed="false"><span class="num">[ ]</span><span>ADVANCED</span></button>
       </div>
       <i class="rule transport-stat"></i>
-      <div class="readout transport-stat"><span class="k">Effect</span><span class="v accent" id="t-effect">METAL · CAUSTIC</span></div>
+      <div class="readout transport-stat"><span class="k">Effect</span><span class="v accent" id="t-effect">METAL · REFLECTION</span></div>
       <i class="rule transport-stat"></i>
       <div class="readout transport-stat"><span class="k" id="t-metric-k">FPS</span><span class="v" id="t-metric">—</span></div>
     </div>
@@ -80,9 +79,6 @@ import { positionWorld, normalWorld, pass } from 'three/tsl';
 import { FilmPipeline, FILM_PRESETS, applyFilmPreset, filmPass } from 'powershot-threejs';
 import { installSpeedballGI, excludeFromGI } from './js/index.js';
 import { applyGiSettings, addGiPanel } from './js/gi_settings.js';
-// Pin the local caustic module revision: browsers cache ESM modules independently
-// from index.html, and a mixed old-engine/new-demo pair must never break model load.
-import { createCausticEngine, causticReceiverFloor } from './js/caustic_engine.js?v=0.6.7-caustic-cast';
 
 // ── Scene ──────────────────────────────────────────────────────────────────────
 // 'sun'     — Sponza's sunlit atrium: Preetham sky + directional sun.
@@ -184,17 +180,6 @@ sun.shadow.normalBias = 0.05;
 // Tiny pre-convergence safety fill; SPEEDBALL probes carry the real sky ambient.
 const hemi = new THREE.HemisphereLight(0x9fc6ff, 0x4a4036, 0.05);
 
-// A focused, physically present key drives both specular sphere modes and the
-// photon solver. Keeping the real SpotLight and the caustic engine on the same
-// position/color/cone avoids a bright pattern from an invisible light source.
-const CAUSTIC_KEY_INTENSITY = 36;
-const causticKey = new THREE.SpotLight(0xffedcf, 0, 18, 0.48, 0.35, 2);
-causticKey.name = 'Centre Sphere Caustic Key';
-causticKey.castShadow = true;
-causticKey.shadow.mapSize.set(1024, 1024);
-causticKey.shadow.bias = -0.00025;
-causticKey.shadow.normalBias = 0.025;
-
 if (CLUSTER) {
   scene.background = new THREE.Color(0x000000);
 } else {
@@ -203,8 +188,6 @@ if (CLUSTER) {
   scene.add(sun.target);
   scene.add(hemi);
 }
-scene.add(causticKey);
-scene.add(causticKey.target);
 
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -236,7 +219,7 @@ const params = {
   targetX: -3.2952, targetY: 4.4996, targetZ: -3.2815,
   // Centre sphere + its transport animation.
   ballMode: 'metal', ballRadius: 0.55, ballRoughness: 0.06,
-  ballEmissiveIntensity: 10, ballGlassIor: 1.52, ballGlassDispersion: 0.32,
+  ballEmissiveIntensity: 10,
   ballOrbit: 2.6, ballSpeed: 0.22, ballBob: 0.55,
   // Cluster mode: the point-light grid.
   lightCount: 50, lightIntensity: 8, lightRange: 7, markers: true,
@@ -601,62 +584,18 @@ gui.add(params, 'filmEnabled').name('Film').onChange((on) => {
 let ball = null;
 let sponzaBounds = null;
 const ballHome = new THREE.Vector3();
-let metalCaustics = null;
-let glassCaustics = null;
-let causticCaster = null;
-let causticLegacyLastSyncMs = -Infinity;
 let playing = false;
 let animClock = 0;          // seconds of animation played, paused-time excluded
 let lastAnimMs = 0;
 
 const BALL_MODE_COPY = {
   emissive: 'MESH EMITTER · NEE · INFINITE BOUNCE',
-  metal: 'PHOTON CAUSTIC · REFLECTION · DDGI',
-  glass: 'PHOTON CAUSTIC · REFRACTION · DISPERSION',
+  metal: 'METAL · LOCAL DDGI REFLECTION',
 };
-
-function activeCaustics() {
-  if (params.ballMode === 'metal') return metalCaustics;
-  if (params.ballMode === 'glass') return glassCaustics;
-  return null;
-}
 
 function syncBallModeButtons() {
   for (const mode of Object.keys(BALL_MODE_COPY)) {
     document.getElementById(`ball-${mode}`).setAttribute('aria-pressed', String(params.ballMode === mode));
-  }
-}
-
-function syncCausticLight(engineHandle) {
-  if (!engineHandle || !ball) return;
-  const direction = new THREE.Vector3().subVectors(ball.position, causticKey.position).normalize();
-  engineHandle.setLight(causticKey.position.x, causticKey.position.y, causticKey.position.z);
-  engineHandle.setLightColor(causticKey.color.r, causticKey.color.g, causticKey.color.b);
-  engineHandle.setLightIntensity(CAUSTIC_KEY_INTENSITY, CAUSTIC_KEY_INTENSITY);
-  engineHandle.setLightCone(direction, causticKey.angle, causticKey.penumbra);
-}
-
-function syncActiveCaustic(nowMs = performance.now(), force = false) {
-  const active = activeCaustics();
-  if (!active || !ball || !causticCaster) return;
-  // The proxy geometry/BVH is uploaded once. Rigid motion now changes only the
-  // engine's transform uniforms, so the caustic follows every animation frame
-  // without the old 12 Hz buffer-disposal jumps.
-  causticCaster.position.copy(ball.position);
-  causticCaster.quaternion.copy(ball.quaternion);
-  causticCaster.scale.copy(ball.scale);
-  causticCaster.updateMatrixWorld(true);
-  causticKey.target.position.copy(ball.position);
-  causticKey.target.updateMatrixWorld(true);
-  syncCausticLight(active);
-  if (typeof active.setCasterTransform === 'function') {
-    active.setCasterTransform(causticCaster);
-  } else if (force || nowMs - causticLegacyLastSyncMs >= 80) {
-    // Compatibility for a browser tab that retained the pre-transform ESM module.
-    // The versioned import above prevents this after refresh; this guard keeps the
-    // current document alive instead of misreporting the callback error as a GLTF failure.
-    causticLegacyLastSyncMs = nowMs;
-    active.setCasterMesh(causticCaster);
   }
 }
 
@@ -665,10 +604,6 @@ function applyBallMaterialMode() {
   const m = ball.material;
   m.emissive.set(0x000000);
   m.emissiveIntensity = 0;
-  m.transmission = 0;
-  m.thickness = 0;
-  m.attenuationDistance = Infinity;
-  m.clearcoat = 0;
 
   if (params.ballMode === 'emissive') {
     m.color.set(0x321408);
@@ -676,26 +611,11 @@ function applyBallMaterialMode() {
     m.roughness = 0.34;
     m.emissive.set(0xff8a2b);
     m.emissiveIntensity = params.ballEmissiveIntensity;
-  } else if (params.ballMode === 'glass') {
-    m.color.set(0xe9f5ff);
-    m.metalness = 0;
-    m.roughness = Math.min(params.ballRoughness, 0.18);
-    m.transmission = 1;
-    m.ior = params.ballGlassIor;
-    m.thickness = params.ballRadius * 1.8;
-    m.attenuationColor.set(0xb8ddff);
-    m.attenuationDistance = 4;
   } else {
     m.color.set(0xc6d0d8);
     m.metalness = 1;
     m.roughness = params.ballRoughness;
-    m.ior = 1.5;
   }
-
-  // Transmission changes the render graph; dispose the compiled variant so the
-  // WebGPU material recompiles immediately for the selected physical mode.
-  m.dispose();
-  m.needsUpdate = true;
 }
 
 function setBallMode(next, { initial = false } = {}) {
@@ -704,16 +624,9 @@ function setBallMode(next, { initial = false } = {}) {
   syncBallModeButtons();
   applyBallMaterialMode();
 
-  causticKey.intensity = next === 'emissive' ? 0 : CAUSTIC_KEY_INTENSITY;
-  causticKey.updateMatrixWorld(true);
-  causticKey.shadow.needsUpdate = true;
-  if (metalCaustics) metalCaustics.overlayMesh.visible = next === 'metal';
-  if (glassCaustics) glassCaustics.overlayMesh.visible = next === 'glass';
-  if (next !== 'emissive') syncActiveCaustic(performance.now(), true);
-
   if (ball) {
     // The mesh is permanently opted into emitter discovery. Emissive black means
-    // zero records in metal/glass; turning emission on adds the same sphere as a
+    // zero records in metal mode; turning emission on adds the same sphere as a
     // type-3 NEE source without rebuilding its geometry.
     gi?.markMaterialValuesDirty?.(ball);
     gi?.forceLightingRefresh?.();
@@ -730,8 +643,7 @@ const fBall = gui.addFolder('Centre sphere');
 fBall.add(params, 'ballRoughness', 0, 0.6, 0.005).name('roughness').onChange((v) => {
   if (!ball) return;
   if (params.ballMode === 'emissive') return;
-  ball.material.roughness = params.ballMode === 'glass' ? Math.min(v, 0.18) : v;
-  activeCaustics()?.setRoughness(ball.material.roughness);
+  ball.material.roughness = v;
   gi?.markMaterialValuesDirty?.(ball);
   markGiInteraction();
 });
@@ -770,7 +682,6 @@ function updateBallAnimation(nowMs) {
   // The sphere is the only thing moving, and shadows are on-demand — so a playing
   // transport is the one case that has to pay for the shadow pass per frame.
   sun.shadow.needsUpdate = true;
-  causticKey.shadow.needsUpdate = true;
   const dt = lastAnimMs ? Math.min(0.1, (nowMs - lastAnimMs) / 1000) : 0;
   lastAnimMs = nowMs;
   animClock += dt;
@@ -786,7 +697,6 @@ function updateBallAnimation(nowMs) {
   ball.rotation.y = t * 0.5;
   ball.updateMatrixWorld(true);
   gi?.markTransformsDirty?.(ball);
-  syncActiveCaustic(nowMs);
 }
 
 const playEl = document.getElementById('play');
@@ -798,7 +708,6 @@ function setPlaying(on) {
   lastAnimMs = 0;
   playEl.setAttribute('aria-pressed', String(playing));
   playEl.querySelector('.label').textContent = playing ? 'PAUSE' : 'ANIMATE';
-  if (!playing) syncActiveCaustic(performance.now(), true);
   markInteraction();
 }
 playEl.addEventListener('click', () => setPlaying(!playing));
@@ -864,84 +773,6 @@ function rebuildLights(count) {
   scene.add(markerMesh);
 }
 
-function createBallCaustics(box, size) {
-  const receiverWidth = Math.min(size.x * 0.72, Math.max(8, params.ballOrbit * 2 + 3.5));
-  const receiverHeight = Math.min(size.z * 0.88, Math.max(5.5, params.ballOrbit * 0.7 + 4.5));
-  const receiver = causticReceiverFloor({
-    y: box.min.y + 0.008,
-    width: receiverWidth,
-    height: receiverHeight,
-  });
-  receiver.origin[0] = ballHome.x;
-  receiver.origin[2] = ballHome.z;
-
-  // The display sphere stays dense and smooth. Photon emission uses a lower-poly
-  // invisible proxy so a moving caustic can refresh without rebuilding a 5k-tri
-  // CPU BVH every frame.
-  causticCaster = new THREE.Mesh(
-    new THREE.SphereGeometry(params.ballRadius, 64, 40),
-    new THREE.MeshBasicMaterial(),
-  );
-  causticCaster.name = 'Centre Sphere Caustic Proxy';
-  causticCaster.position.copy(ball.position);
-  causticCaster.updateMatrixWorld(true);
-
-  metalCaustics = createCausticEngine({
-    THREE, renderer, receiver,
-    mode: 'reflect', grid: 512,
-    targetPhotons: 1_800_000, photonBudget: 180_000,
-  });
-  glassCaustics = createCausticEngine({
-    THREE, renderer, receiver,
-    mode: 'refract', grid: 512,
-    targetPhotons: 2_700_000, photonBudget: 100_000, resolveInterval: 2,
-    ior: params.ballGlassIor,
-    dispersion: params.ballGlassDispersion,
-    thickness: 0.45,
-  });
-
-  metalCaustics.setMetal('chrome');
-  metalCaustics.setRoughness(params.ballRoughness);
-  metalCaustics.setSoftness(0.62);
-  metalCaustics.setThrowFalloff(1 / 144);
-  glassCaustics.setRoughness(Math.min(params.ballRoughness, 0.18));
-  glassCaustics.setSoftness(0.82);
-  glassCaustics.setThrowFalloff(1 / 144);
-  for (const [mode, engineHandle] of [['metal', metalCaustics], ['glass', glassCaustics]]) {
-    engineHandle.overlayMesh.name = `Centre Sphere ${mode} Caustic`;
-    engineHandle.overlayMesh.visible = false;
-    engineHandle.overlayMesh.frustumCulled = false;
-    excludeFromGI(engineHandle.overlayMesh);
-    scene.add(engineHandle.overlayMesh);
-    engineHandle.setReceiverAlbedo(0.82, 0.78, 0.70);
-    engineHandle.setCasterMesh(causticCaster);
-  }
-
-  causticKey.position.set(ballHome.x - 3.4, ballHome.y + 4.6, ballHome.z - 2.7);
-  causticKey.target.position.copy(ball.position);
-  causticKey.updateMatrixWorld(true);
-  causticKey.target.updateMatrixWorld(true);
-  syncCausticLight(metalCaustics);
-  syncCausticLight(glassCaustics);
-  window.caustics = { metal: metalCaustics, glass: glassCaustics };
-}
-
-function disposeBallCaustics() {
-  for (const engineHandle of [metalCaustics, glassCaustics]) {
-    if (!engineHandle) continue;
-    scene.remove(engineHandle.overlayMesh);
-    engineHandle.dispose();
-  }
-  metalCaustics = null;
-  glassCaustics = null;
-  if (causticCaster) {
-    causticCaster.geometry.dispose();
-    causticCaster.material.dispose();
-    causticCaster = null;
-  }
-  delete window.caustics;
-}
-
 // ── Load Sponza ────────────────────────────────────────────────────────────────
 setStatus(`loading ${MODEL.meta.split(' ')[0]}…`);
 new GLTFLoader().load(MODEL.url, (gltf) => {
@@ -979,15 +810,14 @@ new GLTFLoader().load(MODEL.url, (gltf) => {
   }
 
   // ── Centre sphere ────────────────────────────────────────────────────────
-  // One physical sphere carries all three transport demonstrations. It remains a
-  // real traced scene object in every mode; only its material values, emitter NEE
-  // record, and caustic overlay change.
+  // One physical sphere carries the emission and metal transport demonstrations.
+  // It remains a real traced scene object; only its material/emitter values change.
   sponzaBounds = box.clone();
   const centre = box.getCenter(new THREE.Vector3());
   ballHome.set(centre.x, box.min.y + size.y * (MODEL.ballHeight ?? 0.30), centre.z);
   const centreBall = new THREE.Mesh(
     new THREE.SphereGeometry(params.ballRadius, 64, 40),
-    new THREE.MeshPhysicalMaterial({ color: 0xc6d0d8, metalness: 1, roughness: params.ballRoughness }),
+    new THREE.MeshStandardMaterial({ color: 0xc6d0d8, metalness: 1, roughness: params.ballRoughness }),
   );
   centreBall.name = 'Centre Sphere';
   centreBall.position.copy(ballHome);
@@ -996,7 +826,6 @@ new GLTFLoader().load(MODEL.url, (gltf) => {
   centreBall.userData.giEmitter = true;
   scene.add(centreBall);
   ball = centreBall;
-  createBallCaustics(box, size);
   setBallMode(params.ballMode, { initial: true });
 
   camera.near = radius * 0.01; camera.far = radius * 30; camera.updateProjectionMatrix();
@@ -1074,7 +903,6 @@ async function disposeForStructuralReload() {
   // Reflection quality and optional scene query modes rebuild install-time GPU
   // structure. Retire the old device before the next document allocates one.
   renderer.setAnimationLoop(null);
-  disposeBallCaustics();
   gi?.dispose?.();
   controls.dispose();
   const deviceLost = renderer.backend?.device?.lost;
@@ -1085,7 +913,6 @@ async function disposeForStructuralReload() {
   if (deviceLost) await deviceLost;
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
-window.addEventListener('pagehide', disposeBallCaustics);
 
 // ── Transport readout ─────────────────────────────────────────────────────────
 let fpsFrames = 0, fpsWindowMs = 0, readoutDueMs = 0;
@@ -1098,16 +925,8 @@ function updateTransportReadout(nowMs) {
   const fps = span > 0 ? Math.round((fpsFrames * 1000) / span) : 0;
   fpsFrames = 0; fpsWindowMs = nowMs;
 
-  const caustic = activeCaustics();
-  if (!caustic) {
-    tEffectEl.textContent = 'EMISSIVE · NEE';
-    tEffectEl.classList.add('accent');
-  } else {
-    const mode = params.ballMode.toUpperCase();
-    const progress = Math.min(100, Math.round((caustic.accum / caustic.targetPhotons) * 100));
-    tEffectEl.textContent = caustic.converged ? `${mode} · READY` : `${mode} · ${progress}%`;
-    tEffectEl.classList.toggle('accent', caustic.converged);
-  }
+  tEffectEl.textContent = params.ballMode === 'emissive' ? 'EMISSIVE · NEE' : 'METAL · REFLECTION';
+  tEffectEl.classList.add('accent');
 
   tMetricKEl.textContent = 'FPS';
   tMetricEl.textContent = String(fps).padStart(2, '0');
@@ -1120,7 +939,6 @@ renderer.setAnimationLoop((nowMs) => {
   updateTransportReadout(nowMs);
 
   if (sunGiDirty) flushSunGiRefresh();
-  activeCaustics()?.update();
   // SPEEDBALL GI self-gates on idle: the BVH build + GPU solve are held while orbiting
   // or dragging a slider (world-space GI is lossless held static), then converge
   // once the view rests — so a frame hitch can never land mid-interaction. While the

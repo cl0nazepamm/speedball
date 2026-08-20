@@ -24,9 +24,10 @@ re-jitters every solve and uses 0.90 hysteresis to absorb that sample blast.
 
 **[▶ Unified Sponza light-transport demo](https://cl0nazepamm.github.io/speedball/)**
 
-Locally: `npm start` then open `http://127.0.0.1:8777/`. The centre-sphere
-buttons switch live between emissive-mesh NEE, reflective-metal caustics, and
-refractive glass caustics in one raster GI scene.
+Locally: `npm start` then open `http://127.0.0.1:8777/`. The centre sphere
+switches live between emissive-mesh NEE and reflective metal in one raster GI
+scene. Photon caustics remain available through the library API but are not run
+by the hosted demo while their projection model is being revised.
 
 Requires a WebGPU-capable browser (Chrome/Edge stable; Safari 26+).
 
