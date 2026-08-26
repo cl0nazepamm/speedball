@@ -2913,12 +2913,17 @@ export function createProbeField({
         })().compute(probeTotal);
 
         const solveKernels = [traceKernel, emitterVisKernel, blendKernel];
-        if (glossyKernel) solveKernels.push(glossyKernel);
+        const solveKernelsWithoutEmitterVis = [traceKernel, blendKernel];
+        if (glossyKernel) {
+            solveKernels.push(glossyKernel);
+            solveKernelsWithoutEmitterVis.push(glossyKernel);
+        }
         solveKernels.push(uploadKernel);
+        solveKernelsWithoutEmitterVis.push(uploadKernel);
 
         const gpu = {
             buffers, traceKernel, emitterVisKernel, blendKernel, glossyKernel, uploadKernel,
-            solveKernels,
+            solveKernels, solveKernelsWithoutEmitterVis,
             clearAtlasKernel, clearGlossyAtlasKernel, clearEmitterVisKernel, classifyKernel, uploadStateKernel, lightGridKernel,
             atlas, roughSpecularAtlas, glossySpecularAtlas, depthAtlas, stateAtlas,
             irrBuffer, roughSpecularBuffer, glossySpecularBuffer, glossyWeightBuffer,
@@ -3817,7 +3822,8 @@ export function createProbeField({
                 // kernels cannot use Three's generated early-return guard, so their
                 // exact 64-aligned counts plus activeProbe protect every access.
                 gpu.traceKernel.count = updated * raysPerProbe;
-                gpu.emitterVisKernel.count = U.emitterCount.value > 0
+                const hasEmitterVisibilityWork = U.emitterCount.value > 0;
+                gpu.emitterVisKernel.count = hasEmitterVisibilityWork
                     ? updated * GI_EMITTER_INJECT_CAP
                     : 0;
                 gpu.blendKernel.count = updated * PROBE_WORKGROUP_SIZE;
@@ -3833,7 +3839,13 @@ export function createProbeField({
                     C.U.glossyPhase.value = C.glossyPhase >>> 0;
                     C.glossyPhase = (C.glossyPhase + 1) % glossyUpdateInterval;
                 }
-                await renderer.computeAsync(gpu.solveKernels);
+                // WebGPU permits a zero-sized dispatch, but Chromium reports it
+                // as a validation warning. When the scene has no injectable
+                // emitters, omit that kernel from the ordered pass entirely;
+                // the remaining trace/blend/upload dependency chain is unchanged.
+                await renderer.computeAsync(hasEmitterVisibilityWork
+                    ? gpu.solveKernels
+                    : gpu.solveKernelsWithoutEmitterVis);
                 if (disposed) return;
                 C.lastSolveAt = tNow;
                 C.solveDtEma = nextSolveDtEma;
