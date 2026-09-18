@@ -80,6 +80,7 @@ material and texture bindings.
 - `prepareMaterialsForGI(scene)` can normalize an imported all-metal scene so it
   contributes diffuse bounce. It mutates materials and is opt-in; the installer
   also accepts `prepareMaterials: true`.
+- `autoPadding` / `setAutoPadding(scale)` scales the automatic safety border: `0` fits traced bounds, `1` preserves the default margin (20% per side, at least one cell), and `2` doubles it. Range: 0–4. Changes reuse the cached scene build; explicit bounds/volumes stay exact.
 - `setBounds(box)` overrides automatic field bounds.
 - `setVolumes(volumes)` supplies curated volume data to the low-level field.
 
@@ -90,7 +91,7 @@ no reflection BVH traversal:
 
 - `off` allocates no reflection buffers, atlases, compute, or receiver sampling.
 - `rough` enables the compact stable rough lobe.
-- `high` adds an interleaved 8x8 glossy cache and continuous eight-probe gather.
+- `high` adds an 8x8 glossy cache and continuous eight-probe gather. Complete tiles update together on every probe visit to avoid temporal striping.
 - `ultra` uses the legacy 16x16, full-rate glossy path.
 
 The legacy `roughReflections: false` and `true` values map to `off` and `ultra`.

@@ -61,7 +61,9 @@ const PROBE_WORKGROUP_SIZE = 64;
 export const REFLECTION_QUALITY_TIERS = Object.freeze({
     off: Object.freeze({ name: 'off', rough: false, glossy: false, glossyOct: 0, glossyUpdateInterval: 0, roughnessLimit: 0 }),
     rough: Object.freeze({ name: 'rough', rough: true, glossy: false, glossyOct: 0, glossyUpdateInterval: 0, roughnessLimit: 1 }),
-    high: Object.freeze({ name: 'high', rough: true, glossy: true, glossyOct: 8, glossyUpdateInterval: 2, roughnessLimit: 1 }),
+    // Resolve complete tiles on each visit. Alternating columns combine different
+    // sampling epochs (and can phase-lock to probe batches), producing reflection bands.
+    high: Object.freeze({ name: 'high', rough: true, glossy: true, glossyOct: 8, glossyUpdateInterval: 1, roughnessLimit: 1 }),
     ultra: Object.freeze({ name: 'ultra', rough: true, glossy: true, glossyOct: 16, glossyUpdateInterval: 1, roughnessLimit: 1 }),
 });
 
@@ -938,6 +940,7 @@ export function createProbeField({
     jitterMode: initialJitterMode = 'gated',
     onRebuilt = null,
     divisions = TARGET_PROBES_LONG_AXIS,
+    autoPadding = 1.0,
     rays: initialRays = RAYS_PER_PROBE_DEFAULT,
     cascades: initialCascades = 2,
     continuous: initialContinuous = true,
@@ -970,6 +973,8 @@ export function createProbeField({
     // Live grid density: probes along the longest axis. setDivisions() updates it and
     // requests a (resize) rebuild; per-axis counts derive from it so cells stay ~cubic.
     let targetLongAxis = THREE.MathUtils.clamp(Math.round(divisions) || TARGET_PROBES_LONG_AXIS, 2, MAX_PROBES_PER_AXIS);
+    // Multiplier of the automatic safety border; authored volumes stay exact.
+    let autoPaddingScale = Number.isFinite(autoPadding) ? THREE.MathUtils.clamp(autoPadding, 0, 4) : 1;
     // Live ray budget per probe (structural — changing it re-sizes the ray scratch buffer and
     // rebuilds the trace/blend kernels, so setRays() requests an idle-gated rebuild). Default
     // 64 keeps the locked 624-probe baseline visually-equivalent.
@@ -2544,9 +2549,8 @@ export function createProbeField({
             workgroupBarrier();
 
             let resolvesTexel = activeProbe.and(local.lessThan(uint(glossyTile * glossyTile)));
-            // High quality interleaves directional texels across two solves. Every
-            // probe still receives service on every batch (no round-robin starvation),
-            // while half of the expensive 64-ray lobe loops stay inactive.
+            // Optional directional interleaving. Shipped tiers resolve complete tiles
+            // to keep neighboring texels on the same sampling epoch.
             if (glossyUpdateInterval > 1) {
                 resolvesTexel = resolvesTexel.and(local.mod(uint(glossyUpdateInterval)).equal(U.glossyPhase));
             }
@@ -3343,7 +3347,7 @@ export function createProbeField({
             // Keep auto-fitted receivers inside a safe border: 20% per side,
             // at least one unpadded grid cell even on thin/flat scene bounds.
             const cellMargin = Math.max(1e-4, Math.max(C0.gridSize.x, C0.gridSize.y, C0.gridSize.z) / Math.max(1, targetLongAxis - 1));
-            const pad = C0.gridSize.clone().multiplyScalar(0.20).max(new THREE.Vector3(cellMargin, cellMargin, cellMargin));
+            const pad = C0.gridSize.clone().multiplyScalar(0.20).max(new THREE.Vector3(cellMargin, cellMargin, cellMargin)).multiplyScalar(autoPaddingScale);
             C0.gridMin.sub(pad); C0.gridSize.add(pad.clone().multiplyScalar(2));
         }
         const resOverride = (hasVolumes && manualVolumes.length === 1 && manualVolumes[0].res) ? manualVolumes[0].res : null;
@@ -4558,6 +4562,14 @@ export function createProbeField({
             requestRebuild(false); // grid-only resize → reuse cached BVH+textures (no MeshBVH stall)
         },
         getDivisions: () => targetLongAxis,
+        setAutoPadding: (v) => {
+            if (!Number.isFinite(v)) return;
+            const next = THREE.MathUtils.clamp(v, 0, 4);
+            if (next === autoPaddingScale) return;
+            autoPaddingScale = next;
+            if (!manualVolumes?.length) requestRebuild(false);
+        },
+        getAutoPadding: () => autoPaddingScale,
         // ── STRUCTURAL knob: ray budget per probe. Re-sizes the ray scratch + rebuilds the
         // trace/blend kernels, so it goes through the idle-gated rebuild (never a per-tick recompile).
         setRays: (n) => {
