@@ -92,6 +92,11 @@ const SCENES = {
   cluster: { clustered: true  },
 };
 const URL_PARAMS = new URLSearchParams(location.search);
+// Optional demo cap for comparing GI response at e.g. ?fps=55 or ?fps=30.
+const requestedFps = Number(URL_PARAMS.get('fps'));
+const frameIntervalMs = Number.isFinite(requestedFps) && requestedFps > 0
+  ? 1000 / Math.min(240, Math.max(1, requestedFps))
+  : 0;
 const SCENE_MODE = SCENES[URL_PARAMS.get('scene')] ? URL_PARAMS.get('scene') : 'sun';
 const CLUSTER = SCENES[SCENE_MODE].clustered;
 const REFLECTION_QUALITY_VALUES = new Set(['off', 'rough', 'high', 'ultra']);
@@ -1007,7 +1012,14 @@ function updateRuntimeTelemetry(nowMs) {
   telemetryFrames = 0;
 }
 
+let nextFrameAt = 0;
 renderer.setAnimationLoop((nowMs) => {
+  if (frameIntervalMs > 0) {
+    if (nowMs < nextFrameAt) return;
+    nextFrameAt = nextFrameAt > 0
+      ? nextFrameAt + (Math.floor((nowMs - nextFrameAt) / frameIntervalMs) + 1) * frameIntervalMs
+      : nowMs + frameIntervalMs;
+  }
   flushResize();
   controls.update();
   flushGuiDisplayRefresh();
