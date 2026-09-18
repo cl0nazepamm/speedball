@@ -1983,6 +1983,36 @@ export async function buildSpectralScene({
         cancelDeformUpdates();
     }
 
+    // Density consumers need WORLD-space geometry, including every active instance.
+    // Cache local centroids once per BLAS for this visit; transforms remain live and
+    // no expanded triangle soup is retained or uploaded to the GPU.
+    function forEachWorldTriangleCentroid(visit) {
+        const centersByBlas = new Map();
+        const world = new THREE.Matrix4();
+        const point = new THREE.Vector3();
+        for (const ins of instances) {
+            if (ins.instanceIndex >= 0 && ins.instanceIndex >= ins.object.count) continue;
+            const blas = blasList[ins.blas];
+            let centers = centersByBlas.get(blas);
+            if (!centers) {
+                centers = new Float32Array(blas.triCount * 3);
+                for (let t = 0; t < blas.triCount; t++) {
+                    const tri = (blas.triBase + t) * 3;
+                    for (let k = 0; k < 3; k++) {
+                        const v = triIndex[tri + k] * VERTEX_DATA_STRIDE;
+                        for (let a = 0; a < 3; a++) centers[t * 3 + a] += vertexData[v + a] / 3;
+                    }
+                }
+                centersByBlas.set(blas, centers);
+            }
+            instanceWorldMatrix(ins, world);
+            for (let t = 0; t < centers.length; t += 3) {
+                point.fromArray(centers, t).applyMatrix4(world);
+                visit(point.x, point.y, point.z);
+            }
+        }
+    }
+
     // Lights
     const lightRecords = collectLights(THREE, scene, camera);
     lightRecords.push(...collectEmitterRecords(THREE, scene, camera));
@@ -2017,6 +2047,7 @@ export async function buildSpectralScene({
         triMaterial,
         materials, materialCount: uberList.length,
         instBase, instCount, tlasBase, tlasNodeCount,
+        forEachWorldTriangleCentroid,
         updateTransforms,
         updateMaterialValues,
         updateDeforms,
