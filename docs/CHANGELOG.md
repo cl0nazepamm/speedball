@@ -5,6 +5,10 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Fixed GI response collapsing near 55 FPS: evaluate ray-budget changes over
+  cadence windows and restore probe coverage when a reduction does not improve
+  frame timing. Frame caps no longer drive repeated cuts to the minimum budget.
+
 ## [0.7.0] — 2026-08-21
 
 - Replaced the long-form README with a concise install-and-run guide. Detailed
