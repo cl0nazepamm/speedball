@@ -41,6 +41,7 @@ let _emissiveScaled = null;
 let _LIGHT_STRIDE = 16;
 import { buildTraversal, T_MAX, RAY_EPS, PI } from './spectral_traverse.js';
 import { octEncodeNode, octDecodeNode } from './gi_oct.js';
+import { createProbeBudgetController } from './gi_budget.js';
 import { disposeComputeNodes, disposeStorageAttribute, disposeStorageAttributes } from './webgpu_cleanup.js';
 
 // namespace injected into the octahedral node builders (gi_oct.js).
@@ -111,8 +112,8 @@ const STORAGE_BINDING_FALLBACK = 128 * 1024 * 1024; // WebGPU baseline maxStorag
 const RAYS_PER_TICK = 98_304;       // MAX per-tick trace budget (÷ rays/probe → probes/tick).
                                     // ≈1.5k probes at 64 rays — covers the whole Sponza/city
                                     // union every tick; huge grids fall back to round-robin.
-                                    // AUTO-THROTTLED down when the frame cadence slips (see
-                                    // tick()) so the solve never drags the browser below 60.
+                                    // Adaptive reductions are retained only when they improve
+                                    // presentation cadence; frame caps must not starve GI.
 const RAYS_PER_TICK_MIN = 2_048;    // responsiveness floor (32 probes @64). Weak GPUs must
                                     // be allowed below the old 16k floor instead of pinning
                                     // the viewer near 12 fps forever.
@@ -161,9 +162,7 @@ const DEFORM_CHECK_INTERVAL = 12;  // ticks between DEFORM checks (same-topology
 // during motion is visually lossless; it resumes and converges once the view rests.
 const GI_IDLE_MS = 200;            // ms of camera/sync quiet before GI work resumes
 const REBUILD_BACKOFF_TICKS = 45;  // ticks to wait after a failed/empty rebuild before retrying
-const TICK_OVERLOAD_MS = 100;      // outside the normal EMA window; require repeated misses
 const TICK_PAUSE_MS = 1000;        // tab/debugger/host gaps are pauses, not solve pressure
-const TICK_OVERLOAD_STRIKES = 2;   // ignore one unrelated stall; back off if it repeats
 const PROBE_COMPUTE_KEYS = [
     'traceKernel', 'emitterVisKernel', 'blendKernel', 'glossyKernel', 'uploadKernel', 'lightGridKernel',
     'clearAtlasKernel', 'clearGlossyAtlasKernel', 'clearEmitterVisKernel', 'classifyKernel', 'uploadStateKernel',
@@ -213,23 +212,6 @@ export function probeBudgetAfterInteraction(
     const resume = Math.max(min, Math.floor(Number(resumeBudget) || min));
     const current = Math.max(min, Math.floor(Number(currentBudget) || min));
     return Math.min(current, resume);
-}
-
-// One accepted solve interval represents real pressure from the work submitted by
-// the previous accepted tick. Shrink immediately on a cadence miss instead of
-// waiting for an EMA tail; the controller's cooldown keeps the budget from
-// bouncing straight back up. Kept pure for source-only smoke coverage.
-export function probeBudgetAfterCadenceMiss(
-    currentBudget,
-    minBudget = RAYS_PER_TICK_MIN,
-    shrinkFactor = 0.5,
-) {
-    const min = Math.max(1, Math.floor(Number(minBudget) || 1));
-    const current = Math.max(min, Math.floor(Number(currentBudget) || min));
-    const factor = Number.isFinite(shrinkFactor)
-        ? Math.min(0.95, Math.max(0.05, shrinkFactor))
-        : 0.5;
-    return Math.max(min, Math.floor(current * factor));
 }
 
 export function hysteresisExponentForInterval(updateDtMs, normalize = true) {
@@ -1114,9 +1096,9 @@ export function createProbeField({
     // makeCascade); frameCounter is shared because Monte Carlo advances one basis
     // from C0 and both cascades read the same U.frameJitter.
     let rebuildBackoff = 0;   // ticks remaining before retrying after a failed/empty rebuild (A7)
-    // ── auto-throttle (the hard rule: never lag the browser). The per-tick ray budget
-    // adapts to the observed tick cadence: halve when frames slip, creep back up when
-    // they're comfortably fast. Measures GPU pressure on THIS machine — no tuning knob.
+    // Presentation cadence is not a GPU timer. Test budget changes over windows
+    // and restore coverage when a cut does not improve throughput.
+    const budgetController = createProbeBudgetController();
     let tickBudgetRays = RAYS_PER_TICK;
     // Experimentation knob (setRayBudget): the per-tick trace budget TARGET the
     // auto-throttle recovers toward and the kernel build sizes its scratch from.
@@ -1133,11 +1115,8 @@ export function createProbeField({
     let jitterMode = normalizeJitterMode(initialJitterMode);
     let lastTickAt = 0;
     let tickDtEma = 0;
-    // Temporal cadence must survive auto-throttle's deliberate tickDtEma resets.
-    // Otherwise every budget adjustment injects a one-frame 60 Hz history jump.
+    // Temporal cadence stays independent of budget decisions.
     let hysteresisTickDtEma = 0;
-    let budgetCooldown = 0;   // ticks to hold after a shrink before growing again (damps sawtooth)
-    let cadenceOverloadStreak = 0;
     let inFlight = false;
     let disposed = false;
 
@@ -1147,7 +1126,7 @@ export function createProbeField({
     function resetFramePacing() {
         lastTickAt = 0;
         tickDtEma = 0;
-        cadenceOverloadStreak = 0;
+        budgetController.reset();
     }
     let frameCounter = 0;
     let emitterVisSeedCounter = 0;   // advances with the active ray-sampling epoch
@@ -3502,7 +3481,7 @@ export function createProbeField({
             tickBudgetRays = probeBudgetAfterInteraction(tickBudgetRays);
             tickDtEma = 0;
             lastTickAt = 0;
-            budgetCooldown = Math.max(budgetCooldown, 30);
+            budgetController.reset();
         }
         // Default: fully idle-gated (moving → return). Continuous mode: keep the bounded GPU
         // SOLVE running while moving, but STILL hold every synchronous/compiling step — the
@@ -3586,39 +3565,14 @@ export function createProbeField({
         const tNow = _nowMs();
         if (lastTickAt > 0) {
             const dt = tNow - lastTickAt;
-            if (dt > 0 && dt < TICK_OVERLOAD_MS) {
-                cadenceOverloadStreak = 0;
+            if (dt > 0 && dt < TICK_PAUSE_MS) {
                 hysteresisTickDtEma = hysteresisTickDtEma > 0 ? hysteresisTickDtEma * 0.8 + dt * 0.2 : dt;
                 tickDtEma = tickDtEma > 0 ? tickDtEma * 0.8 + dt * 0.2 : dt;
-                if (budgetCooldown > 0) budgetCooldown--;
-                if (tickDtEma > 18.5 && tickBudgetRays > RAYS_PER_TICK_MIN) {
-                    tickBudgetRays = probeBudgetAfterCadenceMiss(tickBudgetRays);
-                    tickDtEma = 0;        // re-measure only the budget controller at the new cap
-                    budgetCooldown = 120; // hold ~2 s before growing again — a render-bound
-                                          // scene that misses 60 fps at ANY budget otherwise
-                                          // saw-tooths between floor and max
-                } else if (budgetCooldown === 0 && tickDtEma < 17.2 && tickBudgetRays < rayBudgetCeiling) {
-                    tickBudgetRays = Math.min(rayBudgetCeiling, tickBudgetRays + 1024);
-                }
-            } else if (dt >= TICK_OVERLOAD_MS && dt < TICK_PAUSE_MS) {
-                // computeAsync submits without waiting for GPU completion, so this is
-                // presentation cadence rather than a direct solve timer. One long gap
-                // may be unrelated; repeated accepted gaps still mean the browser is
-                // not making progress and must make the bounded GI workload back off.
-                tickDtEma = 0;
-                cadenceOverloadStreak = Math.min(
-                    TICK_OVERLOAD_STRIKES,
-                    cadenceOverloadStreak + 1,
-                );
-                if (cadenceOverloadStreak >= TICK_OVERLOAD_STRIKES && tickBudgetRays > RAYS_PER_TICK_MIN) {
-                    tickBudgetRays = probeBudgetAfterCadenceMiss(tickBudgetRays);
-                    budgetCooldown = 120;
-                }
             } else {
                 tickDtEma = 0;
                 hysteresisTickDtEma = 0;
-                cadenceOverloadStreak = 0;
             }
+            tickBudgetRays = budgetController.update(dt, tickBudgetRays, rayBudgetCeiling, RAYS_PER_TICK_MIN);
         }
         lastTickAt = tNow;
 
@@ -4812,8 +4766,6 @@ export function createProbeField({
             sharedLightBuffer: !!casc[0].gpu && !!casc[1].gpu
                 && casc[0].gpu.buffers.lights === casc[1].gpu.buffers.lights,
             hysteresisTickDtEma,
-            budgetCooldown,
-            cadenceOverloadStreak,
             checkCounter,
             geoStable,
             lastRefitCount,
