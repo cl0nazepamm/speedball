@@ -166,7 +166,7 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  */
 
 /**
- * Install SPEEDBALL GI on a WebGPU renderer + scene in one call.
+ * Install SPEEDBALL GI on a WebGPURenderer (WebGPU or WebGL2) + scene in one call.
  *
  * IMPORTANT: call this at SETUP, before the first render / before
  * renderer.setAnimationLoop(). It installs the lights-node factory, which must be
@@ -261,9 +261,11 @@ export function installSpeedballGI({
                 'or GI may never fold into already-compiled materials.');
         }
         prevCreateNode = renderer.lighting.createNode || null;
-        installedCreateNode = clustered
-            ? (lightList = []) => giClusteredLights(clusteredOpts).setLights(lightList)
-            : (lightList = []) => giLights(lights).setLights(lightList);
+        // Resolve after renderer.init(), including automatic backend fallback.
+        // Forward+ needs compute; WebGL keeps the regular batched direct lights.
+        installedCreateNode = (lightList = []) => (clustered && renderer.backend?.isWebGPUBackend === true
+            ? giClusteredLights(clusteredOpts)
+            : giLights(lights)).setLights(lightList);
         renderer.lighting.createNode = installedCreateNode;
     }
 

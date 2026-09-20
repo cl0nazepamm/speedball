@@ -1,0 +1,77 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>Speedball GI backend verification</title>
+<style>body { margin: 0; background: #15151b; color: #ddd; font: 14px monospace } canvas { display: block } #status { padding: 12px }</style>
+<script type="importmap">
+{"imports": {
+  "three": "/node_modules/three/build/three.webgpu.js",
+  "three/webgpu": "/node_modules/three/build/three.webgpu.js",
+  "three/tsl": "/node_modules/three/build/three.tsl.js",
+  "three/addons/": "/node_modules/three/examples/jsm/",
+  "three-mesh-bvh": "/node_modules/three-mesh-bvh/build/index.module.js"
+}, "scopes": { "/node_modules/three-mesh-bvh/": { "three": "/node_modules/three/build/three.module.js" } }}
+</script>
+<div id="status">Initializing</div>
+<script type="module">
+import * as THREE from 'three/webgpu';
+import { installSpeedballGI } from '../../js/index.js';
+const query = new URLSearchParams(location.search);
+const renderer = new THREE.WebGPURenderer({ forceWebGL: query.get('backend') !== 'webgpu', antialias: false });
+renderer.setSize(640, 480);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.append(renderer.domElement);
+if (!query.has('beforeinit')) await renderer.init();
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(48, 640 / 480, 0.1, 100);
+camera.position.set(5, 4, 7); camera.lookAt(0, 1, 0);
+const white = new THREE.MeshStandardMaterial({ color: 0xcacaca, roughness: 0.8 });
+function box(size, pos, material = white) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), material);
+  mesh.position.set(...pos); scene.add(mesh); return mesh;
+}
+box([6, 0.2, 6], [0, -0.1, 0]);
+box([6, 4, 0.2], [0, 2, -3]);
+box([0.2, 4, 6], [-3, 2, 0], new THREE.MeshStandardMaterial({ color: 0xc52016, roughness: 0.9 }));
+const blocker = box([1.4, 1.8, 1.4], [0, 0.9, 0]);
+// A localized dense mesh gives the automatic fine cascade a distinct region.
+if (Number(query.get('cascades')) === 2) {
+  const detail = new THREE.Mesh(new THREE.SphereGeometry(0.35, 16, 12), white);
+  detail.position.set(1.8, 0.4, -1); scene.add(detail);
+}
+const emitterMaterial = new THREE.MeshStandardMaterial({ color: 0x101010, emissive: 0xff8030, emissiveIntensity: 4 });
+const emitter = box([1.2, 0.15, 1.2], [0, 3.4, -1], emitterMaterial);
+if (query.has('emitter')) emitter.userData.giEmitter = true;
+if (query.has('maps')) {
+  const canvas = document.createElement('canvas'); canvas.width = canvas.height = 8;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#40a0ff'; ctx.fillRect(0, 0, 8, 8);
+  ctx.clearRect(0, 0, 4, 4);
+  const map = new THREE.CanvasTexture(canvas); map.colorSpace = THREE.SRGBColorSpace;
+  blocker.material = new THREE.MeshStandardMaterial({ map, alphaTest: 0.5, side: THREE.DoubleSide });
+}
+const light = new THREE.PointLight(0xffffff, 12, 10); light.position.set(1, 2.8, 1); scene.add(light);
+const options = { renderer, scene, camera, divisions: 4,
+  rays: Number(query.get('rays') || 32), cascades: Number(query.get('cascades') || 1),
+  intensity: 2, reflectionQuality: query.get('reflections') || 'off',
+  clusteredLighting: query.has('clustered'), autoDetectChanges: false };
+const gi = installSpeedballGI(options);
+await renderer.init();
+if (query.has('classify')) gi.setClassifyStrength(1);
+gi.setBounds(new THREE.Box3(new THREE.Vector3(-3.2, -0.2, -3.2), new THREE.Vector3(3.2, 4.2, 3.2)));
+gi.setHysteresisNormalization(false);
+gi.setSky({ zenith: new THREE.Color(0.15, 0.25, 0.5), horizon: new THREE.Color(0.2, 0.2, 0.2), ground: 0 });
+window.testGI = { THREE, renderer, scene, camera, gi, light, emitter, emitterMaterial, blocker, options, installSpeedballGI,
+  async step(n = 1) {
+    for (let i = 0; i < n; i++) {
+      await gi.advanced.tick({ idleMs: 1000, playing: false });
+      renderer.render(scene, camera);
+      await new Promise(resolve => requestAnimationFrame(resolve));
+    }
+    return { supported: gi.isSupported(), data: gi.hasData(), stats: gi.getStats(), state: gi.advanced.debug.state() };
+  },
+};
+await window.testGI.step(Number(query.get('steps') || 3));
+document.querySelector('#status').textContent = `${renderer.backend.isWebGLBackend ? 'WebGL2' : 'WebGPU'} ready`;
+window.ready = true;
+</script>

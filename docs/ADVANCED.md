@@ -4,6 +4,40 @@ This document covers engine-level Speedball GI integration and the package's
 lower-level light-transport surfaces. The normal application path is the concise
 `installSpeedballGI()` example in the project README.
 
+## Renderer backends
+
+DDGI supports Three r185 `WebGPURenderer` with either its WebGPU backend or its
+WebGL2 fallback (`forceWebGL: true`). Call `renderer.init()` before checking
+`gi.isSupported()`. WebGL2 requires `EXT_color_buffer_float`; classic
+`WebGLRenderer` does not provide the required node-material integration.
+
+Both paths share BVH traversal, texture/alpha sampling, direct and emissive
+lighting, multibounce, sky/NIR injection, temporal filtering, probe classification,
+cascades, and all reflection tiers. WebGL uses integer/float data textures and
+fragment passes with separate read/write history. Atlas bindings remain stable
+through solves and compatible rebuilds. It performs no CPU readback during solving.
+It has extra history-copy bandwidth and lacks compute workgroup sharing, so tune
+ray budget and grid density for the target device.
+
+With `clusteredLighting` on WebGL, direct lighting uses the regular batched lights
+node and its configured `lights` caps. The GI light selection still uses the
+importance budget but traverses that list without compute-built cell lists.
+Forward+ raster clustering, spectral path tracing, and photon caustics remain
+WebGPU features.
+
+To verify both backends locally, install the peer dependencies, serve the repo
+with `python -m http.server 8778`, and run:
+
+```sh
+node --test tests/*.test.mjs
+playwright-cli open http://127.0.0.1:8778/tests/fixtures/gi-backends.html
+playwright-cli run-code --filename=tests/gi-backends.playwright.js
+```
+
+The browser checks compare probe values across backends for each reflection
+tier, then exercise textured emitters, live edits, sparse updates, and disposal.
+They require a browser/device supporting both WebGPU and WebGL2 float targets.
+
 ## Installer ownership and lifecycle
 
 Call `installSpeedballGI()` before the first render. It installs the renderer's

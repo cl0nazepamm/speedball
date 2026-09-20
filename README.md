@@ -1,7 +1,7 @@
 # Speedball GI
 
 Real-time BVH-traced dynamic diffuse global illumination for
-[three.js](https://threejs.org/) WebGPU. Speedball keeps solving during motion;
+[three.js](https://threejs.org/) WebGPU and its WebGL2 fallback. Speedball keeps solving during motion;
 structural rebuilds wait for a safe idle window.
 
 **[Launch the Sponza demo](https://cl0nazepamm.github.io/speedball/)**
@@ -55,6 +55,11 @@ function dispose() {
 Continuous solving is enabled by default. `gated` holds a stable sampling basis
 for low-latency, mostly flicker-free lighting. `montecarlo` refreshes the basis
 every solve for maximum discovery and expects more hysteresis.
+
+GI selects the initialized renderer backend automatically. To force WebGL2, use
+`new THREE.WebGPURenderer({ forceWebGL: true })`; the GI API stays the same.
+WebGL2 requires `EXT_color_buffer_float`. The classic `THREE.WebGLRenderer`
+is not supported. Try the demo with `?renderer=webgl`.
 
 ## Dynamic scenes
 

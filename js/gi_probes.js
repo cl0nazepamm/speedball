@@ -2,8 +2,8 @@
 //
 // A world-space grid of octahedral irradiance probes traced against the SAME
 // stackless BVH the spectral path tracer uses (shared byte-identically via
-// spectral_traverse.js — no second acceleration structure). Pure WebGPU/TSL
-// compute; nothing reads back to the CPU.
+// spectral_traverse.js — no second acceleration structure). Shared TSL math runs
+// in WebGPU compute or WebGL2 fragment passes; neither solve reads back to the CPU.
 //
 // MVP (Phase 1): single grid, trace + cosine-gather blend + temporal hysteresis,
 // infinite bounce over frames (trace reads last frame's atlas), miss = SKY
@@ -21,7 +21,7 @@
 import * as THREE from 'three/webgpu';
 import { LightingNode } from 'three/webgpu';
 import {
-    Fn, If, Loop, Return, instanceIndex, invocationLocalIndex, workgroupId, workgroupArray, workgroupBarrier,
+    Fn, If, Loop, Return, Discard, instanceIndex, invocationLocalIndex, workgroupId, workgroupArray, workgroupBarrier,
     storage, uniform, texture, textureLevel, sharedUniformGroup, struct,
     float, int, uint, vec2, vec3, vec4, uvec2,
     max as tslMax, min as tslMin, mix, clamp, floor, normalize, dot, cross, length,
@@ -40,6 +40,7 @@ let _collectLights = null;       // cheap light/emitter re-collect for reactivit
 let _emissiveScaled = null;
 let _LIGHT_STRIDE = 16;
 import { buildTraversal, T_MAX, RAY_EPS, PI } from './spectral_traverse.js';
+import { createWebGLProbeBackend, webglProbeSupport, disposeProbeTexture } from './gi_webgl.js';
 import { octEncodeNode, octDecodeNode } from './gi_oct.js';
 import { createProbeBudgetController } from './gi_budget.js';
 import { disposeComputeNodes, disposeStorageAttribute, disposeStorageAttributes } from './webgpu_cleanup.js';
@@ -166,7 +167,7 @@ const GI_IDLE_MS = 200;            // ms of camera/sync quiet before GI work res
 const REBUILD_BACKOFF_TICKS = 45;  // ticks to wait after a failed/empty rebuild before retrying
 const TICK_PAUSE_MS = 1000;        // tab/debugger/host gaps are pauses, not solve pressure
 const PROBE_COMPUTE_KEYS = [
-    'traceKernel', 'emitterVisKernel', 'blendKernel', 'glossyKernel', 'uploadKernel', 'lightGridKernel',
+    'traceKernel', 'emitterVisKernel', 'blendKernel', 'glossyKernel', 'glossyUploadKernel', 'uploadKernel', 'lightGridKernel',
     'clearAtlasKernel', 'clearGlossyAtlasKernel', 'clearEmitterVisKernel', 'classifyKernel', 'uploadStateKernel',
 ];
 const PROBE_SCENE_BUFFER_KEYS = ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials'];
@@ -955,6 +956,23 @@ export function createProbeField({
     if (_activeProbeFieldOwner !== null) {
         throw new Error('createProbeField: only one active field is supported per module instance; dispose the existing field first.');
     }
+    // Select after renderer.init(): an automatic WebGPU -> WebGL fallback may
+    // happen after the field was installed. The controller and shader math are shared.
+    let webgl = null;
+    function ensureBackend() {
+        if (!webgl && webglProbeSupport(renderer)) webgl = createWebGLProbeBackend(renderer);
+    }
+    function createSceneBuffer(array) {
+        return webgl ? webgl.data(array) : new THREE.StorageBufferAttribute(array, 1);
+    }
+    function bufferNode(buffer, type = 'float', readCurrent = false) {
+        if (buffer.isGITextureBuffer) return readCurrent ? buffer.readNode || buffer.node : buffer.node;
+        const node = storage(buffer, type, buffer.count);
+        return readCurrent ? node.toReadOnly() : node;
+    }
+    function dispatch(kernels) {
+        return webgl ? webgl.dispatch(kernels) : renderer.computeAsync(kernels);
+    }
     const fieldOwner = {};
     const node = getGiProbeNode();
     const reflectionConfig = resolveReflectionQuality(reflectionQuality, roughReflections);
@@ -1314,7 +1332,7 @@ export function createProbeField({
     }
 
     function isSupported() {
-        return renderer?.backend?.isWebGPUBackend === true
+        return webglProbeSupport(renderer) || renderer?.backend?.isWebGPUBackend === true
             && typeof renderer.computeAsync === 'function'
             && typeof THREE.StorageTexture === 'function'
             && typeof THREE.StorageBufferAttribute === 'function';
@@ -1472,6 +1490,7 @@ export function createProbeField({
     }
 
     function createSceneStorage(built, previous = null) {
+        ensureBackend();
         const buffers = {};
         const capacities = {};
         const liveLengths = {};
@@ -1481,16 +1500,16 @@ export function createProbeField({
             const capacity = sceneStorageCapacity(source.length, previous?.capacities?.[key], ArrayType);
             const array = new ArrayType(capacity);
             array.set(source);
-            buffers[key] = new THREE.StorageBufferAttribute(array, 1);
+            buffers[key] = createSceneBuffer(array);
             capacities[key] = capacity;
             liveLengths[key] = source.length;
         }
         const storages = {
-            bvhNodes: storage(buffers.bvhNodes, 'uint', buffers.bvhNodes.count).toReadOnly(),
-            triIndex: storage(buffers.triIndex, 'uint', buffers.triIndex.count).toReadOnly(),
-            vertexData: storage(buffers.vertexData, 'float', buffers.vertexData.count).toReadOnly(),
-            triMaterial: storage(buffers.triMaterial, 'uint', buffers.triMaterial.count).toReadOnly(),
-            materials: storage(buffers.materials, 'float', buffers.materials.count).toReadOnly(),
+            bvhNodes: bufferNode(buffers.bvhNodes, 'uint').toReadOnly(),
+            triIndex: bufferNode(buffers.triIndex, 'uint').toReadOnly(),
+            vertexData: bufferNode(buffers.vertexData, 'float').toReadOnly(),
+            triMaterial: bufferNode(buffers.triMaterial, 'uint').toReadOnly(),
+            materials: bufferNode(buffers.materials, 'float').toReadOnly(),
         };
         const traversalUniforms = {
             nodeCount: uniform(0, 'uint'),
@@ -1566,8 +1585,8 @@ export function createProbeField({
     }
 
     function createLightResource(array) {
-        const buffer = new THREE.StorageBufferAttribute(array, 1);
-        const storageNode = storage(buffer, 'float', buffer.count);
+        const buffer = createSceneBuffer(array);
+        const storageNode = bufferNode(buffer);
         if (!clusteredGi) storageNode.toReadOnly();
         return {
             array,
@@ -1660,11 +1679,11 @@ export function createProbeField({
             disposeStorageAttribute(renderer, g.stateBuffer);
             disposeStorageAttribute(renderer, g.emitterVisBuffer);
             disposeStorageAttribute(renderer, g.rayBuffer);
-            g.atlas?.dispose?.();
-            g.roughSpecularAtlas?.dispose?.();
-            g.glossySpecularAtlas?.dispose?.();
-            g.depthAtlas?.dispose?.();
-            g.stateAtlas?.dispose?.();
+            disposeProbeTexture(g.atlas);
+            disposeProbeTexture(g.roughSpecularAtlas);
+            disposeProbeTexture(g.glossySpecularAtlas);
+            disposeProbeTexture(g.depthAtlas);
+            disposeProbeTexture(g.stateAtlas);
             releaseLightResource(g.lightResource);
             releaseSceneResource(g.sceneResource);
         }
@@ -1721,6 +1740,10 @@ export function createProbeField({
     // same-dim rebuild. Returns the gpu object; the caller stores it in C.gpu.
     function buildKernels(built, C, reuse = null) {
         const U = C.U;                       // per-cascade + shared uniforms (folded by reference)
+        // A runtime bound keeps WebGL drivers from unrolling the nested BVH
+        // traversal or ray gathers into enormous fragment shaders.
+        const rayLoopEnd = webgl ? uniform(raysPerProbe, 'uint') : uint(raysPerProbe);
+        const classifyLoopEnd = webgl ? uniform(CLASSIFY_RAYS, 'uint') : uint(CLASSIFY_RAYS);
         const isC0 = C === casc[0];
         const probeTotal = C.probeTotal;     // shadow the old flat name → per-cascade
         const atlasW = C.atlasW, atlasH = C.atlasH;
@@ -1767,101 +1790,133 @@ export function createProbeField({
         // ray scratch: 4 floats per (probe,ray) = rgb + hitT. itemSize-1 'float'
         // scalar storage — the proven in-repo pattern (gi_irradiance_volume), not
         // the unproven vec4 binding.
-        const rayBuffer = new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, updatedCap() * raysPerProbe * 4)), 1);
-        const rayData = storage(rayBuffer, 'float', rayBuffer.count);
+        const resources = webgl ? (() => {
+            const history = reuse?.irrBuffer.owner || webgl.group(atlasW, atlasH,
+                roughReflectionsEnabled ? ['irradiance', 'depth', 'rough'] : ['irradiance', 'depth'], { history: true });
+            const atlasGroup = reuse ? null : webgl.group(atlasW, atlasH,
+                roughReflectionsEnabled ? ['irradiance', 'depth', 'rough'] : ['irradiance', 'depth'], { half: true, linear: true });
+            const rayGroup = webgl.group(raysPerProbe, updatedCap(), ['ray']);
+            const stateGroup = reuse?.stateBuffer.owner || webgl.group(res.x, res.y * res.z, ['state']);
+            const emitterGroup = reuse?.emitterVisBuffer.owner || webgl.group(res.x * GI_EMITTER_INJECT_CAP, res.y * res.z, ['visibility'], { history: true });
+            const glossyGroup = glossyReflectionsEnabled
+                ? (reuse?.glossySpecularBuffer.owner || webgl.group(C.glossyAtlasW, C.glossyAtlasH, ['numerator', 'support'], { history: true })) : null;
+            const glossyAtlasGroup = glossyReflectionsEnabled && !reuse
+                ? webgl.group(C.glossyAtlasW, C.glossyAtlasH, ['glossy'], { half: true, linear: true }) : null;
+            return {
+                rayBuffer: webgl.buffer(rayGroup, 0, updatedCap() * raysPerProbe * 4, 4),
+                irrBuffer: reuse?.irrBuffer || webgl.buffer(history, 0, probeTotal * TILE * TILE * 4, 4, TILE, res.x),
+                depthBuffer: reuse?.depthBuffer || webgl.buffer(history, 1, probeTotal * TILE * TILE * 2, 2, TILE, res.x),
+                roughSpecularBuffer: roughReflectionsEnabled ? (reuse?.roughSpecularBuffer || webgl.buffer(history, 2, probeTotal * TILE * TILE * 4, 4, TILE, res.x)) : null,
+                stateBuffer: reuse?.stateBuffer || webgl.buffer(stateGroup, 0, probeTotal * 4, 4),
+                emitterVisBuffer: reuse?.emitterVisBuffer || webgl.buffer(emitterGroup, 0, probeTotal * GI_EMITTER_INJECT_CAP, 1),
+                glossySpecularBuffer: glossyGroup ? (reuse?.glossySpecularBuffer || webgl.buffer(glossyGroup, 0, probeTotal * glossyTile * glossyTile * 4, 4, glossyTile, C.glossyTilesX)) : null,
+                glossyWeightBuffer: glossyGroup ? (reuse?.glossyWeightBuffer || webgl.buffer(glossyGroup, 1, probeTotal * glossyTile * glossyTile, 1, glossyTile, C.glossyTilesX)) : null,
+                atlas: reuse?.atlas || atlasGroup.target.textures[0],
+                depthAtlas: reuse?.depthAtlas || atlasGroup.target.textures[1],
+                roughSpecularAtlas: roughReflectionsEnabled ? (reuse?.roughSpecularAtlas || atlasGroup.target.textures[2]) : null,
+                stateAtlas: stateGroup.target.texture,
+                glossySpecularAtlas: glossyReflectionsEnabled ? (reuse?.glossySpecularAtlas || glossyAtlasGroup.target.texture) : null,
+            };
+        })() : (() => {
+            const rayBuffer = new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, updatedCap() * raysPerProbe * 4)), 1);
 
-        // irradiance STATE buffer (read_write): 4 floats per probe texel. Reused on a
-        // same-dim rebuild so the field keeps converging from its live history (no black flash).
-        const irrBuffer = reuse?.irrBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * TILE * TILE * 4)), 1);
-        const irr = storage(irrBuffer, 'float', irrBuffer.count);
-        const irrRead = storage(irrBuffer, 'float', irrBuffer.count).toReadOnly();
+            // irradiance STATE buffer (read_write): 4 floats per probe texel. Reused on a
+            // same-dim rebuild so the field keeps converging from its live history (no black flash).
+            const irrBuffer = reuse?.irrBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * TILE * TILE * 4)), 1);
 
-        // Optional rough local-radiance history: RGB is premultiplied by directional
-        // coverage, A is coverage. The low-resolution lobe stays in the SAME blend
-        // dispatch; the high-resolution glossy companion below adds one resolve
-        // dispatch, but neither path adds tracing, BVH traversal, NEE, or rays.
-        const roughSpecularBuffer = roughReflectionsEnabled
-            ? (reuse?.roughSpecularBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * TILE * TILE * 4)), 1))
-            : null;
-        const roughSpecular = roughSpecularBuffer ? storage(roughSpecularBuffer, 'float', roughSpecularBuffer.count) : null;
-        const roughSpecularRead = roughSpecularBuffer ? storage(roughSpecularBuffer, 'float', roughSpecularBuffer.count).toReadOnly() : null;
-        // High-resolution companion lobe for smooth/glossy receivers. Store its
-        // unnormalized RGBA numerator and scalar angular support separately; weak
-        // rotating ray sets must not receive the same history weight as strong ones.
-        const glossySpecularBuffer = glossyReflectionsEnabled
-            ? (reuse?.glossySpecularBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * glossyTile * glossyTile * 4)), 1))
-            : null;
-        const glossySpecular = glossySpecularBuffer ? storage(glossySpecularBuffer, 'float', glossySpecularBuffer.count) : null;
-        const glossyWeightBuffer = glossyReflectionsEnabled
-            ? (reuse?.glossyWeightBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(1, probeTotal * glossyTile * glossyTile)), 1))
-            : null;
-        const glossyWeight = glossyWeightBuffer ? storage(glossyWeightBuffer, 'float', glossyWeightBuffer.count) : null;
+            // Optional rough local-radiance history: RGB is premultiplied by directional
+            // coverage, A is coverage. The low-resolution lobe stays in the SAME blend
+            // dispatch; the high-resolution glossy companion below adds one resolve
+            // dispatch, but neither path adds tracing, BVH traversal, NEE, or rays.
+            const roughSpecularBuffer = roughReflectionsEnabled
+                ? (reuse?.roughSpecularBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * TILE * TILE * 4)), 1))
+                : null;
+            // High-resolution companion lobe for smooth/glossy receivers. Store its
+            // unnormalized RGBA numerator and scalar angular support separately; weak
+            // rotating ray sets must not receive the same history weight as strong ones.
+            const glossySpecularBuffer = glossyReflectionsEnabled
+                ? (reuse?.glossySpecularBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * glossyTile * glossyTile * 4)), 1))
+                : null;
+            const glossyWeightBuffer = glossyReflectionsEnabled
+                ? (reuse?.glossyWeightBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(1, probeTotal * glossyTile * glossyTile)), 1))
+                : null;
 
-        // write-only sampled atlas (HW bilinear) — uploaded from irrBuffer. Reused
-        // verbatim on a same-dim rebuild so the material's binding stays stable
-        // (churn-free) and the live irradiance history survives the geometry edit.
-        const atlas = reuse?.atlas || (() => {
-            const t = new THREE.StorageTexture(atlasW, atlasH);
-            t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
-            t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
-            t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
-            t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
-            return t;
+            // write-only sampled atlas (HW bilinear) — uploaded from irrBuffer. Reused
+            // verbatim on a same-dim rebuild so the material's binding stays stable
+            // (churn-free) and the live irradiance history survives the geometry edit.
+            const atlas = reuse?.atlas || (() => {
+                const t = new THREE.StorageTexture(atlasW, atlasH);
+                t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
+                t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
+                t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
+                t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
+                return t;
+            })();
+
+            // Same tile packing as irradiance so receiver placement/cascade math stays
+            // identical. No mips: the power-8 gather is already the roughness filter.
+            const roughSpecularAtlas = roughReflectionsEnabled ? (reuse?.roughSpecularAtlas || (() => {
+                const t = new THREE.StorageTexture(atlasW, atlasH);
+                t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
+                t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
+                t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
+                t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
+                return t;
+            })()) : null;
+            const glossySpecularAtlas = glossyReflectionsEnabled ? (reuse?.glossySpecularAtlas || (() => {
+                const t = new THREE.StorageTexture(C.glossyAtlasW, C.glossyAtlasH);
+                t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
+                t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
+                t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
+                t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
+                return t;
+            })()) : null;
+
+            // depth-moment STATE (read_write): 2 floats per probe texel (meanR, meanR²),
+            // + a sampled depth atlas for the Chebyshev visibility test (leak-free).
+            const depthBuffer = reuse?.depthBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(2, probeTotal * TILE * TILE * 2)), 1);
+            const depthAtlas = reuse?.depthAtlas || (() => {
+                const t = new THREE.StorageTexture(atlasW, atlasH);
+                t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
+                t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
+                t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
+                t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
+                return t;
+            })();
+
+            // probe META: 4 floats/probe = [state(1=active/0=buried), offset.xyz(relocation)].
+            // Sampled (NEAREST, per-probe) by the node; atlas packs R=state, GBA=offset.
+            const stateBuffer = reuse?.stateBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * 4)), 1);
+            const stateAtlas = reuse?.stateAtlas || (() => {
+                const t = new THREE.StorageTexture(Math.max(1, res.x), Math.max(1, res.y * res.z));
+                t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
+                t.minFilter = THREE.NearestFilter; t.magFilter = THREE.NearestFilter;
+                t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+                t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
+                return t;
+            })();
+
+            const emitterVisBuffer = reuse?.emitterVisBuffer || new THREE.StorageBufferAttribute(
+                new Float32Array(Math.max(1, probeTotal * GI_EMITTER_INJECT_CAP)),
+                1,
+            );
+
+            return { rayBuffer, irrBuffer, roughSpecularBuffer, glossySpecularBuffer, glossyWeightBuffer, depthBuffer, stateBuffer, emitterVisBuffer, atlas, roughSpecularAtlas, glossySpecularAtlas, depthAtlas, stateAtlas };
         })();
-
-        // Same tile packing as irradiance so receiver placement/cascade math stays
-        // identical. No mips: the power-8 gather is already the roughness filter.
-        const roughSpecularAtlas = roughReflectionsEnabled ? (reuse?.roughSpecularAtlas || (() => {
-            const t = new THREE.StorageTexture(atlasW, atlasH);
-            t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
-            t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
-            t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
-            t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
-            return t;
-        })()) : null;
-        const glossySpecularAtlas = glossyReflectionsEnabled ? (reuse?.glossySpecularAtlas || (() => {
-            const t = new THREE.StorageTexture(C.glossyAtlasW, C.glossyAtlasH);
-            t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
-            t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
-            t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
-            t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
-            return t;
-        })()) : null;
-
-        // depth-moment STATE (read_write): 2 floats per probe texel (meanR, meanR²),
-        // + a sampled depth atlas for the Chebyshev visibility test (leak-free).
-        const depthBuffer = reuse?.depthBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(2, probeTotal * TILE * TILE * 2)), 1);
-        const depthS = storage(depthBuffer, 'float', depthBuffer.count);
-        const depthRead = storage(depthBuffer, 'float', depthBuffer.count).toReadOnly();
-        const depthAtlas = reuse?.depthAtlas || (() => {
-            const t = new THREE.StorageTexture(atlasW, atlasH);
-            t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
-            t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
-            t.wrapS = THREE.ClampToEdgeWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
-            t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
-            return t;
-        })();
-
-        // probe META: 4 floats/probe = [state(1=active/0=buried), offset.xyz(relocation)].
-        // Sampled (NEAREST, per-probe) by the node; atlas packs R=state, GBA=offset.
-        const stateBuffer = reuse?.stateBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * 4)), 1);
-        const stateS = storage(stateBuffer, 'float', stateBuffer.count);
-        const stateRead = storage(stateBuffer, 'float', stateBuffer.count).toReadOnly();
-        const stateAtlas = reuse?.stateAtlas || (() => {
-            const t = new THREE.StorageTexture(Math.max(1, res.x), Math.max(1, res.y * res.z));
-            t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
-            t.minFilter = THREE.NearestFilter; t.magFilter = THREE.NearestFilter;
-            t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
-            t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
-            return t;
-        })();
-
-        const emitterVisBuffer = reuse?.emitterVisBuffer || new THREE.StorageBufferAttribute(
-            new Float32Array(Math.max(1, probeTotal * GI_EMITTER_INJECT_CAP)),
-            1,
-        );
-        const emitterVis = storage(emitterVisBuffer, 'float', emitterVisBuffer.count);
-        const emitterVisRead = storage(emitterVisBuffer, 'float', emitterVisBuffer.count).toReadOnly();
+        const { rayBuffer, irrBuffer, roughSpecularBuffer, glossySpecularBuffer, glossyWeightBuffer, depthBuffer, stateBuffer, emitterVisBuffer, atlas, roughSpecularAtlas, glossySpecularAtlas, depthAtlas, stateAtlas } = resources;
+        const rayData = rayBuffer ? bufferNode(rayBuffer, 'float', false) : null;
+        const irr = irrBuffer ? bufferNode(irrBuffer, 'float', false) : null;
+        const irrRead = irrBuffer ? bufferNode(irrBuffer, 'float', true) : null;
+        const roughSpecular = roughSpecularBuffer ? bufferNode(roughSpecularBuffer, 'float', false) : null;
+        const roughSpecularRead = roughSpecularBuffer ? bufferNode(roughSpecularBuffer, 'float', true) : null;
+        const glossySpecular = glossySpecularBuffer ? bufferNode(glossySpecularBuffer, 'float', false) : null;
+        const glossyWeight = glossyWeightBuffer ? bufferNode(glossyWeightBuffer, 'float', false) : null;
+        const depthS = depthBuffer ? bufferNode(depthBuffer, 'float', false) : null;
+        const depthRead = depthBuffer ? bufferNode(depthBuffer, 'float', true) : null;
+        const stateS = stateBuffer ? bufferNode(stateBuffer, 'float', false) : null;
+        const stateRead = stateBuffer ? bufferNode(stateBuffer, 'float', true) : null;
+        const emitterVis = emitterVisBuffer ? bufferNode(emitterVisBuffer, 'float', false) : null;
+        const emitterVisRead = emitterVisBuffer ? bufferNode(emitterVisBuffer, 'float', true) : null;
 
         const probeTraceOrigin = (probeIndex) => {
             const ro = probeWorldPos(probeIndex, U).toVar();
@@ -1878,7 +1933,7 @@ export function createProbeField({
         let lightGridKernel = null;
         // The cell list is derived exclusively from C0 and lives in the shared
         // light buffer. Building the identical list from C1 was duplicate work.
-        if (clusteredGi && isC0) {
+        if (clusteredGi && !webgl && isC0) {
             const gridU = casc[0].U;
             lightGridKernel = Fn(() => {
                 const cellIndex = instanceIndex.toVar();
@@ -1964,10 +2019,8 @@ export function createProbeField({
         };
 
         // ── TRACE: one thread per (updated probe, ray). RGB shade; miss=BLACK ──
-        const traceKernel = Fn(() => {
-            const gid = instanceIndex.toVar();
+        const traceRay = (gid) => {
             const slot = gid.div(uint(raysPerProbe)).toVar();
-            If(slot.greaterThanEqual(U.updatedCount), () => { Return(); });
             const k = gid.mod(uint(raysPerProbe)).toVar();
             const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
             const ro = probeTraceOrigin(probeIndex);
@@ -2051,7 +2104,7 @@ export function createProbeField({
                     });
                 }
 
-                if (clusteredGi) {
+                if (clusteredGi && !webgl) {
                     const shadeLight = (li) => {
                         const lb = li.mul(uint(_LIGHT_STRIDE)).toVar();
                         const ltype = lights.element(lb);
@@ -2196,19 +2249,20 @@ export function createProbeField({
                 outRgb.assign(sky.max(vec3(0.0)).mul(U.skyIntensity)); // SH ringing can dip negative → clamp
             });
 
-            const rb = slot.mul(uint(raysPerProbe)).add(k).mul(uint(4)).toVar();
-            rayData.element(rb).assign(outRgb.x);
-            rayData.element(rb.add(uint(1))).assign(outRgb.y);
-            rayData.element(rb.add(uint(2))).assign(outRgb.z);
-            rayData.element(rb.add(uint(3))).assign(hitT);
+            return vec4(outRgb, hitT);
+        };
+        const traceKernel = webgl ? webgl.pass(rayBuffer.owner, pixel => {
+            If(pixel.y.greaterThanEqual(U.updatedCount), () => { Discard(); });
+            return { ray: traceRay(pixel.y.mul(uint(raysPerProbe)).add(pixel.x)) };
+        }) : Fn(() => {
+            const gid = instanceIndex.toVar();
+            If(gid.div(uint(raysPerProbe)).greaterThanEqual(U.updatedCount), () => { Return(); });
+            const value = traceRay(gid);
+            const rb = gid.mul(uint(4));
+            for (let i = 0; i < 4; i++) rayData.element(rb.add(uint(i))).assign(value.element(i));
         })().compute(updatedCap() * raysPerProbe);
 
-        const emitterVisKernel = Fn(() => {
-            const gid = instanceIndex.toVar();
-            const slot = gid.div(uint(GI_EMITTER_INJECT_CAP)).toVar();
-            const emitterIndex = gid.mod(uint(GI_EMITTER_INJECT_CAP)).toVar();
-            If(slot.greaterThanEqual(U.updatedCount).or(emitterIndex.greaterThanEqual(U.emitterCount)), () => { Return(); });
-            const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
+        const resolveEmitterVisibility = (probeIndex, emitterIndex) => {
             const ro = probeTraceOrigin(probeIndex);
             const lb = U.emitterBase.add(emitterIndex).mul(uint(_LIGHT_STRIDE)).toVar();
             const center = loadLightVec3(lb, 1);
@@ -2246,7 +2300,22 @@ export function createProbeField({
             });
             const visIndex = probeIndex.mul(uint(GI_EMITTER_INJECT_CAP)).add(emitterIndex);
             const vis = emitterVis.element(visIndex);
-            emitterVis.element(visIndex).assign(mix(sample, vis, float(GI_EMITTER_VIS_RETENTION)));
+            return mix(sample, vis, float(GI_EMITTER_VIS_RETENTION));
+        };
+        const emitterVisKernel = webgl ? webgl.pass(emitterVisBuffer.owner, pixel => {
+            const gid = pixel.y.mul(uint(res.x * GI_EMITTER_INJECT_CAP)).add(pixel.x);
+            const probe = gid.div(uint(GI_EMITTER_INJECT_CAP));
+            const emitter = gid.mod(uint(GI_EMITTER_INJECT_CAP));
+            const slot = probe.add(U.probeTotal).sub(U.probeOffset).mod(U.probeTotal);
+            If(slot.greaterThanEqual(U.updatedCount).or(emitter.greaterThanEqual(U.emitterCount)), () => { Discard(); });
+            return { visibility: vec4(resolveEmitterVisibility(probe, emitter), 0, 0, 0) };
+        }, { history: true }) : Fn(() => {
+            const gid = instanceIndex.toVar();
+            const slot = gid.div(uint(GI_EMITTER_INJECT_CAP));
+            const emitter = gid.mod(uint(GI_EMITTER_INJECT_CAP));
+            If(slot.greaterThanEqual(U.updatedCount).or(emitter.greaterThanEqual(U.emitterCount)), () => { Return(); });
+            const probe = U.probeOffset.add(slot).mod(U.probeTotal);
+            emitterVis.element(probe.mul(uint(GI_EMITTER_INJECT_CAP)).add(emitter)).assign(resolveEmitterVisibility(probe, emitter));
         })().compute(updatedCap() * GI_EMITTER_INJECT_CAP);
 
         const injectEmitterVirtualRays = ({
@@ -2304,34 +2373,18 @@ export function createProbeField({
         // cosine-gather the unique 6×6 oct texels. Upload mirrors those texels into
         // the 28 gutter positions, so evaluating gutters here was pure duplicate
         // work (and repeated every ray load + trig operation 28 extra times).
-        const blendKernel = Fn(() => {
-            const rayCache = workgroupArray('vec4', raysPerProbe);
-            const dirCache = workgroupArray('vec4', raysPerProbe);
-            const slot = workgroupId.x;
-            const lane = invocationLocalIndex;
-            const activeProbe = slot.lessThan(U.updatedCount);
-            const loadK = lane.toVar();
-            Loop(loadK.lessThan(uint(raysPerProbe)), () => {
-                If(activeProbe, () => {
-                    const rb = slot.mul(uint(raysPerProbe)).add(loadK).mul(uint(4));
-                    rayCache.element(loadK).assign(vec4(
-                        rayData.element(rb), rayData.element(rb.add(uint(1))),
-                        rayData.element(rb.add(uint(2))), rayData.element(rb.add(uint(3))),
-                    ));
-                    dirCache.element(loadK).assign(vec4(normalize(rayDir(loadK, U.frameJitter)), 0.0));
-                });
-                loadK.addAssign(uint(PROBE_WORKGROUP_SIZE));
-            });
-            workgroupBarrier();
-
-            // A barrier forbids invocation-local early returns. Guard all output
-            // work after every lane has reached it.
-            If(activeProbe.and(lane.lessThan(uint(OCT_RES * OCT_RES))), () => {
-            const lx = lane.mod(uint(OCT_RES)).add(uint(BORDER)).toVar();
-            const ly = lane.div(uint(OCT_RES)).add(uint(BORDER)).toVar();
-            const local = ly.mul(uint(TILE)).add(lx).toVar();
-            const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
-
+        const atlasInvocation = (pixel, tile, tilesX) => {
+            const lx = pixel.x.mod(uint(tile)).toVar(), ly = pixel.y.mod(uint(tile)).toVar();
+            const probeIndex = pixel.y.div(uint(tile)).mul(uint(tilesX)).add(pixel.x.div(uint(tile))).toVar();
+            const local = ly.mul(uint(tile)).add(lx).toVar();
+            const slot = probeIndex.add(U.probeTotal).sub(U.probeOffset).mod(U.probeTotal).toVar();
+            return { probeIndex, local, slot, lx, ly };
+        };
+        const readRay = (slot, k) => {
+            const rb = slot.mul(uint(raysPerProbe)).add(k).mul(uint(4));
+            return vec4(rayData.element(rb), rayData.element(rb.add(uint(1))), rayData.element(rb.add(uint(2))), rayData.element(rb.add(uint(3))));
+        };
+        const blendProbe = (probeIndex, local, lx, ly, readRay, readDirection) => {
             // Interior texel direction; upload builds the canonical mirrored
             // gutter from these unique samples.
             const u = float(lx).sub(float(BORDER)).add(0.5).div(float(OCT_RES));
@@ -2355,11 +2408,11 @@ export function createProbeField({
             const skyValid = roughReflectionsEnabled
                 ? U.reflectionSkyFallback.mul(U.skyConfigured).mul(skyEnabled)
                 : null;
-            Loop({ start: uint(0), end: uint(raysPerProbe), type: 'uint', condition: '<' }, ({ i: k }) => {
-                const cachedRay = rayCache.element(k).toVar();
+            Loop({ start: uint(0), end: rayLoopEnd, type: 'uint', condition: '<' }, ({ i: k }) => {
+                const cachedRay = readRay(k).toVar();
                 const rrgb = cachedRay.xyz;
                 const hitT = cachedRay.w;
-                const rdir = dirCache.element(k).xyz;
+                const rdir = readDirection(k);
                 const cd = tslMax(dot(dir, rdir), float(0.0));
                 const cw = pow(cd, U.debugCosinePower.max(float(1e-4)));
                 acc.addAssign(rrgb.mul(cw));
@@ -2473,14 +2526,11 @@ export function createProbeField({
             const clipped = prev.add(meanRad.sub(prev).mul(clampScale));
             const candidate = select(wasBlack, meanRad, clipped);
             const blended = mix(candidate, prev, h);
-            irr.element(ib).assign(blended.x);
-            irr.element(ib.add(uint(1))).assign(blended.y);
-            irr.element(ib.add(uint(2))).assign(blended.z);
             // luminance 2nd moment E[L²] in the FREE 4th slot (buffer-only; the upload
             // keeps atlas.w=1.0 so the fragment sampler never sees it). luma is linear
             // → E[luma]=luma(E[rgb]), so variance = max(0, M2 − luma(rgb)²) anywhere.
             const m2 = mix(curM2, prevM2, h);
-            irr.element(ib.add(uint(3))).assign(m2);
+            const result = { irradiance: vec4(blended, m2).toVar() };
 
             // Depth is written for every solved probe texel and is strictly positive
             // after its first update (a miss stores maxDist). It is therefore the
@@ -2501,14 +2551,8 @@ export function createProbeField({
                 );
                 const sDen = sWsum.max(float(1e-4));
                 const sCur = vec4(sAcc.div(sDen), sHit.div(sDen).clamp(0.0, 1.0));
-                // Never infer initialization from sPrev energy. Transparent black is
-                // a valid reflection sample and must retain history across sparse hits.
                 const sh = select(dWasZero, float(0.0), steadyReflectionH);
-                const sBlended = mix(sCur, sPrev, sh);
-                roughSpecular.element(sb).assign(sBlended.x);
-                roughSpecular.element(sb.add(uint(1))).assign(sBlended.y);
-                roughSpecular.element(sb.add(uint(2))).assign(sBlended.z);
-                roughSpecular.element(sb.add(uint(3))).assign(sBlended.w);
+                result.rough = mix(sCur, sPrev, sh).toVar();
             }
 
             // depth moments: same hysteresis; fill instantly when unseeded.
@@ -2516,24 +2560,21 @@ export function createProbeField({
             const depthH = pow(rawDepthH.max(float(1e-6)), U.hysteresisExponent);
             const dh = select(dWasZero, float(0.0), depthH);
             const dblended = mix(vec2(meanR, meanR2), dprev, dh);
-            depthS.element(db).assign(dblended.x);
-            depthS.element(db.add(uint(1))).assign(dblended.y);
-            });
-        })().compute(updatedCap() * PROBE_WORKGROUP_SIZE, [PROBE_WORKGROUP_SIZE]);
-
-        // ── GLOSSY: high-angular-resolution resolve from the SAME ray scratch.
-        // It is a fourth dispatch but performs no BVH traversal and traces no rays.
-        // Numerator/support history is accumulated before division so sparse power-64
-        // ray sets converge without giving one weak sample a full frame of authority.
-        const glossyKernel = glossyReflectionsEnabled ? Fn(() => {
+            result.depth = vec4(dblended, 0, 1).toVar();
+            return result;
+        };
+        const blendKernel = webgl ? webgl.pass(irrBuffer.owner, pixel => {
+            const { probeIndex, local, slot, lx, ly } = atlasInvocation(pixel, TILE, res.x);
+            If(slot.greaterThanEqual(U.updatedCount).or(lx.lessThan(uint(BORDER))).or(lx.greaterThan(uint(OCT_RES))).or(ly.lessThan(uint(BORDER))).or(ly.greaterThan(uint(OCT_RES))), () => { Discard(); });
+            return blendProbe(probeIndex, local, lx, ly, k => readRay(slot, k), k => normalize(rayDir(k, U.frameJitter)));
+        }, { history: true }) : Fn(() => {
             const rayCache = workgroupArray('vec4', raysPerProbe);
             const dirCache = workgroupArray('vec4', raysPerProbe);
-            const group = workgroupId.x;
+            const slot = workgroupId.x;
             const lane = invocationLocalIndex;
-            const slot = group.div(uint(glossyGroupsPerProbe)).toVar();
-            const local = group.mod(uint(glossyGroupsPerProbe))
-                .mul(uint(PROBE_WORKGROUP_SIZE)).add(lane).toVar();
-            const activeProbe = slot.lessThan(U.updatedCount);
+            // Materialize outside the load loop: lanes >= raysPerProbe skip it
+            // but still resolve texels after the barrier (notably with 32 rays).
+            const activeProbe = slot.lessThan(U.updatedCount).toVar();
             const loadK = lane.toVar();
             Loop(loadK.lessThan(uint(raysPerProbe)), () => {
                 If(activeProbe, () => {
@@ -2548,17 +2589,31 @@ export function createProbeField({
             });
             workgroupBarrier();
 
-            let resolvesTexel = activeProbe.and(local.lessThan(uint(glossyTile * glossyTile)));
-            // Optional directional interleaving. Shipped tiers resolve complete tiles
-            // to keep neighboring texels on the same sampling epoch.
-            if (glossyUpdateInterval > 1) {
-                resolvesTexel = resolvesTexel.and(local.mod(uint(glossyUpdateInterval)).equal(U.glossyPhase));
-            }
-            If(resolvesTexel, () => {
-            const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
-            const lx = local.mod(uint(glossyTile)).toVar();
-            const ly = local.div(uint(glossyTile)).toVar();
+            // A barrier forbids invocation-local early returns. Guard all output
+            // work after every lane has reached it.
+            If(activeProbe.and(lane.lessThan(uint(OCT_RES * OCT_RES))), () => {
+                const lx = lane.mod(uint(OCT_RES)).add(uint(BORDER)).toVar();
+                const ly = lane.div(uint(OCT_RES)).add(uint(BORDER)).toVar();
+                const local = ly.mul(uint(TILE)).add(lx).toVar();
+                const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
 
+                const result = blendProbe(probeIndex, local, lx, ly, k => rayCache.element(k), k => dirCache.element(k).xyz);
+                const ib = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(4));
+                for (let i = 0; i < 4; i++) irr.element(ib.add(uint(i))).assign(result.irradiance.element(i));
+                const db = probeIndex.mul(uint(TILE * TILE)).add(local).mul(uint(2));
+                depthS.element(db).assign(result.depth.x);
+                depthS.element(db.add(uint(1))).assign(result.depth.y);
+                if (roughReflectionsEnabled) {
+                    for (let i = 0; i < 4; i++) roughSpecular.element(ib.add(uint(i))).assign(result.rough.element(i));
+                }
+            });
+        })().compute(updatedCap() * PROBE_WORKGROUP_SIZE, [PROBE_WORKGROUP_SIZE]);
+
+        // ── GLOSSY: high-angular-resolution resolve from the SAME ray scratch.
+        // It is a fourth dispatch but performs no BVH traversal and traces no rays.
+        // Numerator/support history is accumulated before division so sparse power-64
+        // ray sets converge without giving one weak sample a full frame of authority.
+        const resolveGlossy = (probeIndex, local, lx, ly, readRay, readDirection) => {
             // Canonical mirrored oct gutter, resolved before evaluating direction.
             const edge = uint(glossyTile - 1);
             const lo = uint(BORDER);
@@ -2589,11 +2644,11 @@ export function createProbeField({
             const gWsum = float(0.0).toVar();
             const skyEnabled = select(U.skyIntensity.greaterThan(float(0.0)), float(1.0), float(0.0));
             const skyValid = U.reflectionSkyFallback.mul(U.skyConfigured).mul(skyEnabled);
-            Loop({ start: uint(0), end: uint(raysPerProbe), type: 'uint', condition: '<' }, ({ i: k }) => {
-                const cachedRay = rayCache.element(k).toVar();
+            Loop({ start: uint(0), end: rayLoopEnd, type: 'uint', condition: '<' }, ({ i: k }) => {
+                const cachedRay = readRay(k).toVar();
                 const rrgb = cachedRay.xyz;
                 const hitT = cachedRay.w;
-                const rdir = dirCache.element(k).xyz;
+                const rdir = readDirection(k);
                 const cd = tslMax(dot(dir, rdir), float(0.0));
                 const cd2 = cd.mul(cd);
                 const cd4 = cd2.mul(cd2);
@@ -2656,27 +2711,71 @@ export function createProbeField({
             const gh = select(empty, float(0.0), glossyH);
             const num = mix(curNum, prevNum, gh).toVar();
             const den = mix(curDen, prevDen, gh).max(float(1e-6)).toVar();
-            glossySpecular.element(gb).assign(num.x);
-            glossySpecular.element(gb.add(uint(1))).assign(num.y);
-            glossySpecular.element(gb.add(uint(2))).assign(num.z);
-            glossySpecular.element(gb.add(uint(3))).assign(num.w);
-            glossyWeight.element(gt).assign(den);
+            return { numerator: num, support: vec4(den, 0, 0, 0) };
+        };
+        const glossyKernel = glossyReflectionsEnabled ? (webgl ? webgl.pass(glossySpecularBuffer.owner, pixel => {
+            const { probeIndex, local, slot, lx, ly } = atlasInvocation(pixel, glossyTile, C.glossyTilesX);
+            If(probeIndex.greaterThanEqual(U.probeTotal).or(slot.greaterThanEqual(U.updatedCount)), () => { Discard(); });
+            return resolveGlossy(probeIndex, local, lx, ly, k => readRay(slot, k), k => normalize(rayDir(k, U.frameJitter)));
+        }, { history: true }) : Fn(() => {
+            const rayCache = workgroupArray('vec4', raysPerProbe);
+            const dirCache = workgroupArray('vec4', raysPerProbe);
+            const group = workgroupId.x;
+            const lane = invocationLocalIndex;
+            const slot = group.div(uint(glossyGroupsPerProbe)).toVar();
+            const local = group.mod(uint(glossyGroupsPerProbe))
+                .mul(uint(PROBE_WORKGROUP_SIZE)).add(lane).toVar();
+            const activeProbe = slot.lessThan(U.updatedCount).toVar();
+            const loadK = lane.toVar();
+            Loop(loadK.lessThan(uint(raysPerProbe)), () => {
+                If(activeProbe, () => {
+                    const rb = slot.mul(uint(raysPerProbe)).add(loadK).mul(uint(4));
+                    rayCache.element(loadK).assign(vec4(
+                        rayData.element(rb), rayData.element(rb.add(uint(1))),
+                        rayData.element(rb.add(uint(2))), rayData.element(rb.add(uint(3))),
+                    ));
+                    dirCache.element(loadK).assign(vec4(normalize(rayDir(loadK, U.frameJitter)), 0.0));
+                });
+                loadK.addAssign(uint(PROBE_WORKGROUP_SIZE));
+            });
+            workgroupBarrier();
 
-            const col = probeIndex.mod(uint(C.glossyTilesX));
-            const row = probeIndex.div(uint(C.glossyTilesX));
-            const tx = col.mul(uint(glossyTile)).add(lx);
-            const ty = row.mul(uint(glossyTile)).add(ly);
-            const resolved = vec4(num.xyz.div(den), num.w.div(den).clamp(0.0, 1.0));
-            textureStore(glossySpecularAtlas, uvec2(tx, ty), resolved).toWriteOnly();
+            let resolvesTexel = activeProbe.and(local.lessThan(uint(glossyTile * glossyTile)));
+            // Optional directional interleaving. Shipped tiers resolve complete tiles
+            // to keep neighboring texels on the same sampling epoch.
+            if (glossyUpdateInterval > 1) {
+                resolvesTexel = resolvesTexel.and(local.mod(uint(glossyUpdateInterval)).equal(U.glossyPhase));
+            }
+            If(resolvesTexel, () => {
+                const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
+                const lx = local.mod(uint(glossyTile)).toVar();
+                const ly = local.div(uint(glossyTile)).toVar();
+
+                const result = resolveGlossy(probeIndex, local, lx, ly, k => rayCache.element(k), k => dirCache.element(k).xyz);
+                const num = result.numerator, den = result.support.x;
+                const gt = probeIndex.mul(uint(glossyTile * glossyTile)).add(local);
+                const gb = gt.mul(uint(4));
+                glossySpecular.element(gb).assign(num.x);
+                glossySpecular.element(gb.add(uint(1))).assign(num.y);
+                glossySpecular.element(gb.add(uint(2))).assign(num.z);
+                glossySpecular.element(gb.add(uint(3))).assign(num.w);
+                glossyWeight.element(gt).assign(den);
+
+                const col = probeIndex.mod(uint(C.glossyTilesX));
+                const row = probeIndex.div(uint(C.glossyTilesX));
+                const tx = col.mul(uint(glossyTile)).add(lx);
+                const ty = row.mul(uint(glossyTile)).add(ly);
+                const resolved = vec4(num.xyz.div(den), num.w.div(den).clamp(0.0, 1.0));
+                textureStore(glossySpecularAtlas, uvec2(tx, ty), resolved).toWriteOnly();
             });
         })().compute(
             updatedCap() * glossyGroupsPerProbe * PROBE_WORKGROUP_SIZE,
             [PROBE_WORKGROUP_SIZE],
-        ) : null;
+        )) : null;
 
         // ── CLEAR: new StorageTextures are not assumed zeroed. Do this once per
         // rebuild before the round-robin batch uploads start populating live probes.
-        const clearAtlasKernel = Fn(() => {
+        const clearAtlasKernel = webgl ? webgl.clear(irrBuffer.owner, webgl.owner(atlas)) : Fn(() => {
             const gid = instanceIndex.toVar();
             const total = uint(probeTotal * TILE * TILE);
             If(gid.greaterThanEqual(total), () => { Return(); });
@@ -2695,7 +2794,7 @@ export function createProbeField({
             textureStore(depthAtlas, uvec2(tx, ty), vec4(0.0, 0.0, 0.0, 1.0)).toWriteOnly();
         })().compute(probeTotal * TILE * TILE);
 
-        const clearGlossyAtlasKernel = glossyReflectionsEnabled ? Fn(() => {
+        const clearGlossyAtlasKernel = glossyReflectionsEnabled ? (webgl ? webgl.clear(glossySpecularBuffer.owner, webgl.owner(glossySpecularAtlas)) : Fn(() => {
             const gid = instanceIndex.toVar();
             const total = uint(probeTotal * glossyTile * glossyTile);
             If(gid.greaterThanEqual(total), () => { Return(); });
@@ -2710,9 +2809,9 @@ export function createProbeField({
                 uvec2(col.mul(uint(glossyTile)).add(lx), row.mul(uint(glossyTile)).add(ly)),
                 vec4(0.0),
             ).toWriteOnly();
-        })().compute(probeTotal * glossyTile * glossyTile) : null;
+        })().compute(probeTotal * glossyTile * glossyTile)) : null;
 
-        const clearEmitterVisKernel = Fn(() => {
+        const clearEmitterVisKernel = webgl ? webgl.clear(emitterVisBuffer.owner) : Fn(() => {
             const gid = instanceIndex.toVar();
             const total = uint(probeTotal * GI_EMITTER_INJECT_CAP);
             If(gid.greaterThanEqual(total), () => { Return(); });
@@ -2723,7 +2822,89 @@ export function createProbeField({
         // the expensive 3×3 bilateral filter once, cache the final values, then all
         // 64 lanes write the canonical interior/gutter destinations. Previously the
         // 28 gutter lanes repeated an identical filter for their mirrored source.
-        const uploadKernel = Fn(() => {
+        const mirrorOctBorder = (lx, ly, tile, octRes) => {
+            const edge = uint(tile - 1);
+            const lo = uint(BORDER);
+            const hi = uint(BORDER + octRes - 1);
+            const onLeft = lx.equal(uint(0));
+            const onRight = lx.equal(edge);
+            const onTop = ly.equal(uint(0));
+            const onBottom = ly.equal(edge);
+            const onColumnBorder = onLeft.or(onRight);
+            const onRowBorder = onTop.or(onBottom);
+            const onCorner = onColumnBorder.and(onRowBorder);
+            const sx = select(
+                onCorner,
+                select(onLeft, hi, lo),
+                select(onRowBorder, edge.sub(lx), select(onColumnBorder, select(onLeft, lo, hi), lx)),
+            ).toVar();
+            const sy = select(
+                onCorner,
+                select(onTop, hi, lo),
+                select(onRowBorder, select(onTop, lo, hi), select(onColumnBorder, edge.sub(ly), ly)),
+            ).toVar();
+            return { sx, sy };
+        };
+        const filterProbe = (probeBase, sx, sy) => {
+            const probeTexel = probeBase.add(sy.mul(uint(TILE))).add(sx).toVar();
+            // Reads the read-only history and writes only workgroup memory, so
+            // denoising never feeds back into temporal accumulation.
+            const LUMA = vec3(0.2126, 0.7152, 0.0722);
+            const ib = probeTexel.mul(uint(4));
+            const eC = vec3(
+                irrRead.element(ib), irrRead.element(ib.add(uint(1))), irrRead.element(ib.add(uint(2))),
+            ).toVar();
+            const lumaC = dot(eC, LUMA);
+            const varC = tslMax(irrRead.element(ib.add(uint(3))).sub(lumaC.mul(lumaC)), float(0.0));
+            const sxI = int(sx); const syI = int(sy);
+            const facc = vec3(0.0).toVar();
+            const fwsum = float(0.0).toVar();
+            const smW = float(1.0).add(U.filterSmooth.mul(float(6.0)));
+            const kEff = float(GI_FILTER_K).mul(smW).mul(U.debugFilterKScale);
+            const relEff = float(GI_FILTER_REL).mul(smW).mul(U.debugFilterRelScale);
+            for (let jy = -1; jy <= 1; jy++) {
+                for (let jx = -1; jx <= 1; jx++) {
+                    const gw = Math.exp(-(jx * jx + jy * jy) * 0.5);
+                    const nx = sxI.add(int(jx)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
+                    const ny = syI.add(int(jy)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
+                    const nIb = probeBase.add(ny.mul(uint(TILE))).add(nx).mul(uint(4));
+                    const en = vec3(
+                        irrRead.element(nIb), irrRead.element(nIb.add(uint(1))), irrRead.element(nIb.add(uint(2))),
+                    );
+                    const dLum = dot(en, LUMA).sub(lumaC);
+                    const es = exp(dLum.mul(dLum).div(
+                        varC.mul(kEff).add(tslMax(
+                            float(GI_FILTER_EPS).mul(U.debugFilterEpsScale),
+                            lumaC.mul(lumaC).mul(relEff),
+                        )).max(float(1e-8)),
+                    ).mul(-1.0));
+                    const w = float(gw).mul(es);
+                    facc.addAssign(en.mul(w));
+                    fwsum.addAssign(w);
+                }
+            }
+            const filtered = facc.div(fwsum.max(float(1e-4)));
+            const result = { irradiance: vec4(mix(eC, filtered, U.filterStrength), 1.0) };
+
+            if (roughReflectionsEnabled) {
+                const sb = probeTexel.mul(uint(4));
+                result.rough = vec4(
+                    roughSpecularRead.element(sb), roughSpecularRead.element(sb.add(uint(1))),
+                    roughSpecularRead.element(sb.add(uint(2))), roughSpecularRead.element(sb.add(uint(3))),
+                );
+            }
+            const db = probeTexel.mul(uint(2));
+            result.depth = vec4(
+                depthRead.element(db), depthRead.element(db.add(uint(1))), 0.0, 1.0,
+            );
+            return result;
+        };
+        const uploadKernel = webgl ? webgl.pass(webgl.owner(atlas), pixel => {
+            const { probeIndex, slot, lx, ly } = atlasInvocation(pixel, TILE, res.x);
+            If(slot.greaterThanEqual(U.updatedCount), () => { Discard(); });
+            const { sx, sy } = mirrorOctBorder(lx, ly, TILE, OCT_RES);
+            return filterProbe(probeIndex.mul(uint(TILE * TILE)), sx, sy);
+        }) : Fn(() => {
             const irradianceCache = workgroupArray('vec4', OCT_RES * OCT_RES);
             const roughCache = roughReflectionsEnabled
                 ? workgroupArray('vec4', OCT_RES * OCT_RES)
@@ -2731,64 +2912,17 @@ export function createProbeField({
             const depthCache = workgroupArray('vec4', OCT_RES * OCT_RES);
             const slot = workgroupId.x;
             const lane = invocationLocalIndex;
-            const activeProbe = slot.lessThan(U.updatedCount);
+            const activeProbe = slot.lessThan(U.updatedCount).toVar();
             const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
             const probeBase = probeIndex.mul(uint(TILE * TILE)).toVar();
 
             If(activeProbe.and(lane.lessThan(uint(OCT_RES * OCT_RES))), () => {
                 const sx = lane.mod(uint(OCT_RES)).add(uint(BORDER)).toVar();
                 const sy = lane.div(uint(OCT_RES)).add(uint(BORDER)).toVar();
-                const probeTexel = probeBase.add(sy.mul(uint(TILE))).add(sx).toVar();
-                // Reads the read-only history and writes only workgroup memory, so
-                // denoising never feeds back into temporal accumulation.
-                const LUMA = vec3(0.2126, 0.7152, 0.0722);
-                const ib = probeTexel.mul(uint(4));
-                const eC = vec3(
-                    irrRead.element(ib), irrRead.element(ib.add(uint(1))), irrRead.element(ib.add(uint(2))),
-                ).toVar();
-                const lumaC = dot(eC, LUMA);
-                const varC = tslMax(irrRead.element(ib.add(uint(3))).sub(lumaC.mul(lumaC)), float(0.0));
-                const sxI = int(sx); const syI = int(sy);
-                const facc = vec3(0.0).toVar();
-                const fwsum = float(0.0).toVar();
-                const smW = float(1.0).add(U.filterSmooth.mul(float(6.0)));
-                const kEff = float(GI_FILTER_K).mul(smW).mul(U.debugFilterKScale);
-                const relEff = float(GI_FILTER_REL).mul(smW).mul(U.debugFilterRelScale);
-                for (let jy = -1; jy <= 1; jy++) {
-                    for (let jx = -1; jx <= 1; jx++) {
-                        const gw = Math.exp(-(jx * jx + jy * jy) * 0.5);
-                        const nx = sxI.add(int(jx)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
-                        const ny = syI.add(int(jy)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
-                        const nIb = probeBase.add(ny.mul(uint(TILE))).add(nx).mul(uint(4));
-                        const en = vec3(
-                            irrRead.element(nIb), irrRead.element(nIb.add(uint(1))), irrRead.element(nIb.add(uint(2))),
-                        );
-                        const dLum = dot(en, LUMA).sub(lumaC);
-                        const es = exp(dLum.mul(dLum).div(
-                            varC.mul(kEff).add(tslMax(
-                                float(GI_FILTER_EPS).mul(U.debugFilterEpsScale),
-                                lumaC.mul(lumaC).mul(relEff),
-                            )).max(float(1e-8)),
-                        ).mul(-1.0));
-                        const w = float(gw).mul(es);
-                        facc.addAssign(en.mul(w));
-                        fwsum.addAssign(w);
-                    }
-                }
-                const filtered = facc.div(fwsum.max(float(1e-4)));
-                irradianceCache.element(lane).assign(vec4(mix(eC, filtered, U.filterStrength), 1.0));
-
-                if (roughReflectionsEnabled) {
-                    const sb = probeTexel.mul(uint(4));
-                    roughCache.element(lane).assign(vec4(
-                        roughSpecularRead.element(sb), roughSpecularRead.element(sb.add(uint(1))),
-                        roughSpecularRead.element(sb.add(uint(2))), roughSpecularRead.element(sb.add(uint(3))),
-                    ));
-                }
-                const db = probeTexel.mul(uint(2));
-                depthCache.element(lane).assign(vec4(
-                    depthRead.element(db), depthRead.element(db.add(uint(1))), 0.0, 1.0,
-                ));
+                const result = filterProbe(probeBase, sx, sy);
+                irradianceCache.element(lane).assign(result.irradiance);
+                depthCache.element(lane).assign(result.depth);
+                if (roughCache) roughCache.element(lane).assign(result.rough);
             });
             workgroupBarrier();
 
@@ -2836,16 +2970,14 @@ export function createProbeField({
 
         // ── CLASSIFY: one thread per probe. Fixed full-sphere rays; if too many
         // hit BACKFACES the probe is buried in geometry → mark INACTIVE. ──
-        const classifyKernel = Fn(() => {
-            const p = instanceIndex.toVar();
-            If(p.greaterThanEqual(U.probeTotal), () => { Return(); });
+        const classifyProbe = (p) => {
             const ro = probeWorldPos(p, U).toVar();
             const back = float(0.0).toVar();
             const hits = float(0.0).toVar();
             const closeBackDist = float(1e30).toVar();
             const closeBackDir = vec3(0.0).toVar();
             const closeFrontDist = float(1e30).toVar();
-            Loop({ start: uint(0), end: uint(CLASSIFY_RAYS), type: 'uint', condition: '<' }, ({ i: k }) => {
+            Loop({ start: uint(0), end: classifyLoopEnd, type: 'uint', condition: '<' }, ({ i: k }) => {
                 const rd = normalize(classifyRayDir(k)).toVar();
                 const bestT = float(T_MAX).toVar();
                 const bestTri = int(-1).toVar();
@@ -2881,15 +3013,20 @@ export function createProbeField({
                 off.assign(raw.mul(tslMin(len, U.relocClamp).div(tslMax(len, float(1e-6)))));
             });
 
-            const mb = p.mul(uint(4)).toVar();
-            stateS.element(mb).assign(state);
-            stateS.element(mb.add(uint(1))).assign(off.x);
-            stateS.element(mb.add(uint(2))).assign(off.y);
-            stateS.element(mb.add(uint(3))).assign(off.z);
+            return vec4(state, off);
+        };
+        const classifyKernel = webgl ? webgl.pass(stateBuffer.owner, pixel => ({
+            state: classifyProbe(pixel.y.mul(uint(res.x)).add(pixel.x)),
+        })) : Fn(() => {
+            const p = instanceIndex.toVar();
+            If(p.greaterThanEqual(U.probeTotal), () => { Return(); });
+            const value = classifyProbe(p);
+            const mb = p.mul(uint(4));
+            for (let i = 0; i < 4; i++) stateS.element(mb.add(uint(i))).assign(value.element(i));
         })().compute(probeTotal);
 
         // upload per-probe meta → atlas (1 texel/probe): R=state, GBA=relocation offset.
-        const uploadStateKernel = Fn(() => {
+        const uploadStateKernel = webgl ? { run() { webgl.initialize(stateBuffer.owner); }, dispose() {} } : Fn(() => {
             const p = instanceIndex.toVar();
             If(p.greaterThanEqual(uint(probeTotal)), () => { Return(); });
             const col = p.mod(U.resX);
@@ -2901,17 +3038,32 @@ export function createProbeField({
             )).toWriteOnly();
         })().compute(probeTotal);
 
+        const glossyUploadKernel = webgl && glossyReflectionsEnabled ? webgl.pass(webgl.owner(glossySpecularAtlas), pixel => {
+            const { probeIndex, local, slot } = atlasInvocation(pixel, glossyTile, C.glossyTilesX);
+            If(probeIndex.greaterThanEqual(U.probeTotal).or(slot.greaterThanEqual(U.updatedCount)), () => { Discard(); });
+            const gt = probeIndex.mul(uint(glossyTile * glossyTile)).add(local);
+            const gb = gt.mul(uint(4));
+            const nums = bufferNode(glossySpecularBuffer, 'float', true);
+            const weights = bufferNode(glossyWeightBuffer, 'float', true);
+            const den = weights.element(gt).max(float(1e-6));
+            return { glossy: vec4(vec3(nums.element(gb), nums.element(gb.add(uint(1))), nums.element(gb.add(uint(2)))).div(den), nums.element(gb.add(uint(3))).div(den).clamp(0, 1)) };
+        }) : null;
+
         const solveKernels = [traceKernel, emitterVisKernel, blendKernel];
         const solveKernelsWithoutEmitterVis = [traceKernel, blendKernel];
         if (glossyKernel) {
             solveKernels.push(glossyKernel);
             solveKernelsWithoutEmitterVis.push(glossyKernel);
         }
+        if (glossyUploadKernel) {
+            solveKernels.push(glossyUploadKernel);
+            solveKernelsWithoutEmitterVis.push(glossyUploadKernel);
+        }
         solveKernels.push(uploadKernel);
         solveKernelsWithoutEmitterVis.push(uploadKernel);
 
         const gpu = {
-            buffers, traceKernel, emitterVisKernel, blendKernel, glossyKernel, uploadKernel,
+            buffers, traceKernel, emitterVisKernel, blendKernel, glossyKernel, glossyUploadKernel, uploadKernel,
             solveKernels, solveKernelsWithoutEmitterVis,
             clearAtlasKernel, clearGlossyAtlasKernel, clearEmitterVisKernel, classifyKernel, uploadStateKernel, lightGridKernel,
             atlas, roughSpecularAtlas, glossySpecularAtlas, depthAtlas, stateAtlas,
@@ -3069,7 +3221,7 @@ export function createProbeField({
     // Fit atlas dimensions and the largest optional history binding by uniformly
     // shrinking res. WebGPU's common storage-binding baseline is 128 MiB: a 32³
     // glossy numerator would be ~162 MiB even though its near-square texture fits.
-    const _maxDim = () => (renderer?.backend?.device?.limits?.maxTextureDimension2D || ATLAS_DIM_FALLBACK);
+    const _maxDim = () => (webgl?.maxSize || renderer?.backend?.device?.limits?.maxTextureDimension2D || ATLAS_DIM_FALLBACK);
     const _maxGlossyHistoryBytes = () => {
         const limits = renderer?.backend?.device?.limits;
         const binding = Number(limits?.maxStorageBufferBindingSize) || STORAGE_BINDING_FALLBACK;
@@ -3221,12 +3373,13 @@ export function createProbeField({
     }
 
     async function flushGiLightGrid() {
+        if (webgl) { giLightGridDirty = false; return; }
         if (!clusteredGi) return;
         const kernel = casc[0]?.gpu?.lightGridKernel;
         if (!kernel) return;
         // Clear before submission so a concurrent light refill cannot be lost.
         giLightGridDirty = false;
-        await renderer.computeAsync(kernel);
+        await dispatch(kernel);
     }
 
     // STAGE 0 of the staggered build: (re)compute BOTH cascades' dims off the SHARED soup
@@ -3467,6 +3620,7 @@ export function createProbeField({
 
     async function tick(opts = {}) {
         if (disposed || inFlight || !node._enabled || !isSupported()) return;
+        ensureBackend();
 
         // (A2) Idle gate — the ONE hard rule. The synchronous CPU BVH rebuild AND the
         // GPU solve are held while the user orbits, the timeline plays, or a delta-sync
@@ -3780,7 +3934,7 @@ export function createProbeField({
                     // uploadState consumes it later in the same pass. Separate
                     // computeAsync calls only created extra encoders/submissions;
                     // they were never GPU-parallel.
-                    if (prep.length > 0) await renderer.computeAsync(prep);
+                    if (prep.length > 0) await dispatch(prep);
                     if (disposed) return;
                 }
                 // Match the dispatch envelope to the LIVE auto-throttled batch.
@@ -3809,7 +3963,7 @@ export function createProbeField({
                 // as a validation warning. When the scene has no injectable
                 // emitters, omit that kernel from the ordered pass entirely;
                 // the remaining trace/blend/upload dependency chain is unchanged.
-                await renderer.computeAsync(hasEmitterVisibilityWork
+                await dispatch(hasEmitterVisibilityWork
                     ? gpu.solveKernels
                     : gpu.solveKernelsWithoutEmitterVis);
                 if (disposed) return;
@@ -4728,7 +4882,7 @@ export function createProbeField({
         }; },
         getResolution: (ci = 0) => (casc[ci] || casc[0]).res.clone(),
         getBounds: (ci = 0) => { const C = casc[ci] || casc[0]; return new THREE.Box3(C.gridMin.clone(), C.gridMin.clone().add(C.gridSize)); },
-        _debugUpload: async (ci = 0) => { const g = casc[ci]?.gpu; if (g && !disposed) { try { await renderer.computeAsync(g.uploadKernel); } catch (e) { /* harness-only */ } } },
+        _debugUpload: async (ci = 0) => { const g = casc[ci]?.gpu; if (g && !disposed) { try { await dispatch(g.uploadKernel); } catch (e) { /* harness-only */ } } },
         _debugAtlas: (ci = 0) => casc[ci]?.gpu?.atlas || null,
         _debugRoughSpecularAtlas: (ci = 0) => casc[ci]?.gpu?.roughSpecularAtlas || null,
         _debugGlossySpecularAtlas: (ci = 0) => casc[ci]?.gpu?.glossySpecularAtlas || null,
@@ -4817,9 +4971,12 @@ export function createProbeField({
                 : which === 'spec' ? g?.roughSpecularBuffer
                 : which === 'gloss' ? g?.glossySpecularBuffer
                 : which === 'glossWeight' ? g?.glossyWeightBuffer
+                : which === 'rays' ? g?.rayBuffer
+                : which === 'depth' ? g?.depthBuffer
                 : which === 'mat' ? g?.buffers?.materials
                 : which === 'lights' ? g?.buffers?.lights
                 : which === 'state' ? g?.stateBuffer : null;
+            if (buf?.isGITextureBuffer) return buf.read();
             if (!buf || typeof renderer.getArrayBufferAsync !== 'function') return null;
             try { return new Float32Array(await renderer.getArrayBufferAsync(buf)); } catch (e) { return { error: String(e) }; }
         },

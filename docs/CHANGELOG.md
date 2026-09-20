@@ -5,6 +5,10 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Added DDGI support for Three's WebGL2 fallback, sharing the existing TSL
+  transport/filtering math through texture-backed fragment passes. Includes
+  cascades, reflection tiers, live scene updates, and `?renderer=webgl` in the demo.
+- Fixed incomplete WebGPU probe resolves at 32 rays per probe.
 - Fixed GI response collapsing near 55 FPS: evaluate ray-budget changes over
   cadence windows and restore probe coverage when a reduction does not improve
   frame timing. Frame caps no longer drive repeated cuts to the minimum budget.
