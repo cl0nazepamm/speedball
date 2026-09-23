@@ -783,9 +783,10 @@ export function collectLights(THREE, scene, camera = null) {
         }
         let type = 1, range = 0, decay = 2, cosAngle = -1, cosPen = -1, w = 0, h = 0;
         dir.set(0, 0, -1);
-        if (obj.isDirectionalLight || obj.isSpotLight) {
+        if (obj.isDirectionalLight || obj.isSunLight || obj.isSpotLight) {
             type = obj.isSpotLight ? 2 : 0;
             obj.target?.updateWorldMatrix?.(true, false);
+            tgt.set(0, 0, 0);
             obj.target?.getWorldPosition(tgt);
             dir.copy(tgt).sub(pos).normalize();
             if (obj.isSpotLight) {

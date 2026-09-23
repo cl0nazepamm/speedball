@@ -3,7 +3,10 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.0] — 2026-09-23
+
+- Support Three r186 alongside r185, including native SunLight extraction.
+- Add reproducible development dependencies and package checks before packing.
 
 - Added DDGI support for Three's WebGL2 fallback, sharing the existing TSL
   transport/filtering math through texture-backed fragment passes. Includes

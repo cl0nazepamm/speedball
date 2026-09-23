@@ -312,7 +312,8 @@ function buildLightArray(scene) {
         out[o + 7] = color.r; out[o + 8] = color.g; out[o + 9] = color.b;
         out[o + 14] = Math.max(0, contribution);
 
-        if (object.isDirectionalLight) {
+        if (object.isDirectionalLight || object.isSunLight) {
+            targetPos.set(0, 0, 0);
             object.target?.getWorldPosition?.(targetPos);
             dir.copy(lightPos).sub(targetPos).normalize(); // Three lightDirection: surface -> light
             out[o + 0] = 0;
