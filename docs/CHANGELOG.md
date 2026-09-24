@@ -3,6 +3,24 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- BLAS builds run off the main thread: `spectral_scene` dispatches every
+  cache miss to a module-worker pool (`js/blas_worker.js`) that runs
+  three-mesh-bvh's own packed-tree builder and returns a byte-identical
+  tree, so a structural rebuild no longer blocks the render thread for the
+  BVH build. `createProbeField({ blasWorkers })` accepts `'auto'` (default),
+  `false`, a pool size, or `{ count, buildTreeUrl }`; any init failure falls
+  back to the synchronous build for the session.
+- Stable BLAS cache keys: a host may stamp
+  `geometry.userData.speedballGeometryKey` (a content hash) so cached BLASes
+  survive scene reloads and fresh geometry objects. Attribute versions still
+  fold into the key.
+- `createBlasCache()` is exported from the package index (`js/blas_cache.js`)
+  and `createProbeField({ blasCache })` accepts a host-owned cache that
+  outlives the field.
+- `_debugState()` reports `blasWorkers` next to `blasCache`.
+
 ## [0.8.0] — 2026-09-23
 
 - Support Three r186 alongside r185, including native SunLight extraction.

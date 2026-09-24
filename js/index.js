@@ -40,3 +40,8 @@ export { giClusteredLights, default as GiClusteredLightsNode } from './gi_cluste
 
 // Legacy surfel/lobe irradiance volume (kept for the non-BVH path).
 export { createIrradianceVolume, getGiVolumeNode, GiVolumeNode } from './gi_irradiance_volume.js';
+
+// Cross-rebuild BLAS cache factory. Create ONE per page and pass it to every
+// createProbeField({ blasCache }) so traced geometry survives field recreation
+// and scene switches (see blas_cache.js and docs/ADVANCED.md).
+export { createBlasCache } from './blas_cache.js';

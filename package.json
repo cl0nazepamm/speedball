@@ -28,6 +28,8 @@
   "files": [
     "docs/ADVANCED.md",
     "docs/CHANGELOG.md",
+    "js/blas_cache.js",
+    "js/blas_worker.js",
     "js/caustic_bvh.js",
     "js/caustic_engine.js",
     "js/gi_clustered_lights_node.js",

@@ -35,6 +35,7 @@ import {
 // NOT drag the CPU BVH builder into that module graph.
 let _buildSpectralScene = null;
 let _createBlasCache = null;
+let _getBlasWorkerState = null;
 let _rebindMaterialMapsArenaBuild = null;
 let _collectLights = null;       // cheap light/emitter re-collect for reactivity (no BVH rebuild)
 let _emissiveScaled = null;
@@ -952,6 +953,16 @@ export function createProbeField({
     reflectionSkyFallback = false,
     clusteredLighting = false,
     autoDetectChanges = true,
+    // Cross-rebuild BLAS cache. Pass ONE createBlasCache() object from
+    // blas_cache.js to every field you create so cached geometry survives
+    // field recreation and scene switches; omitted, the field owns a private
+    // cache that dies with it.
+    blasCache: hostBlasCache = null,
+    // Off-thread BLAS builds: 'auto' (default) uses module workers when the
+    // page can run them, false forces the synchronous main-thread build, a
+    // number caps the pool, { count, buildTreeUrl } also pins the
+    // three-mesh-bvh builder URL for unusual package layouts.
+    blasWorkers = 'auto',
 } = {}) {
     if (_activeProbeFieldOwner !== null) {
         throw new Error('createProbeField: only one active field is supported per module instance; dispose the existing field first.');
@@ -1068,7 +1079,7 @@ export function createProbeField({
     // it's set by geometry/light-count/volume changes (true at start), and left FALSE by
     // setDivisions/setRays so those resize the grid/kernels off the cached soup (no hitch).
     let cachedBuilt = null;
-    let blasCache = null;    // cross-rebuild BLAS cache (created with the lazy scene builder)
+    let blasCache = hostBlasCache || null;    // cross-rebuild BLAS cache (host-owned, else created with the lazy scene builder)
     let lastBuildSceneRewritten = false; // this build's scene landed as an in-place arena rewrite
     // Map extraction stages CPU bytes against this per-field arena. Accepted
     // builds either rewrite the current texture objects layer-by-layer or adopt
@@ -3179,6 +3190,7 @@ export function createProbeField({
             const mod = await import('./spectral_scene.js');
             _buildSpectralScene = mod.buildSpectralScene;
             _createBlasCache = mod.createBlasCache || null;
+            _getBlasWorkerState = mod.getBlasWorkerState || null;
             _rebindMaterialMapsArenaBuild = mod.rebindMaterialMapsArenaBuild || null;
             const collectAnalyticLights = mod.collectLights || null;
             const collectEmitterRecords = mod.collectEmitterRecords || null;
@@ -3436,6 +3448,7 @@ export function createProbeField({
                 maxTriangles: MAX_TRIANGLES,
                 blasCache,
                 mapsArena,
+                blasWorkers,
             });
             if (disposed) {
                 disposeUninstalledBuild(built);
@@ -4948,6 +4961,7 @@ export function createProbeField({
             blasCache: blasCache
                 ? { hits: blasCache.hits, misses: blasCache.misses, triangles: blasCache.triangles, entries: blasCache.map.size }
                 : null,
+            blasWorkers: _getBlasWorkerState ? _getBlasWorkerState() : null,
             pendingTransformCount: pendingAllTransforms ? -1 : pendingTransformTargets.size,
             pendingDeformRefresh,
             pendingMaterialValueCount: pendingAllMaterialValues ? -1 : pendingMaterialValueTargets.size,

@@ -896,7 +896,14 @@ export function collectEmitterRecords(THREE, scene, camera = null) {
 // vertexMaterial is stamped so the per-triangle material survives the BVH
 // index permutation; material-array draws get a unique first vertex per
 // visible triangle (preserves Multi/Sub assignment across shared vertices).
-function buildLocalBlas(THREE, d) {
+//
+// The build is split in three so the BVH itself can run off the main thread:
+//   gatherLocalSoup     — CPU gather of the local soup (main thread, linear)
+//   buildLocalBlasTree  — the three-mesh-bvh build (main thread or blas_worker)
+//   finishLocalBlas     — flatten the root + BVH-ordered materials (main thread)
+// buildLocalBlas composes the three synchronously; buildSpectralScene uses the
+// worker pool for cache misses when one is available and falls back to it.
+function gatherLocalSoup(d) {
     const { pos, index, normal, uv } = d;
     const vCount = pos.count;
     const extra = d.uniqueTriMaterial ? d.visibleTriCount : 0;
@@ -945,25 +952,255 @@ function buildLocalBlas(THREE, d) {
         vertexMaterial[a] = um;
         if (!d.uniqueTriMaterial) { vertexMaterial[b] = um; vertexMaterial[c] = um; }
     }
+    return {
+        vertexPos, vertexNormal, vertexUV, vertexMaterial, triIndex, tagSrc,
+        vertCount: totalV, triCount: d.visibleTriCount, srcVertCount: vCount,
+    };
+}
+
+const BLAS_TARGET_LEAF_SIZE = 8;
+
+// Main-thread tree build: the reference path. `soup.triIndex` is permuted in
+// place by MeshBVH. Returns the packed root buffer + root bounds in the same
+// shape blas_worker.js produces, so finishLocalBlas is shared.
+function buildLocalBlasTreeSync(THREE, soup) {
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(vertexPos, VERT_STRIDE));
-    geometry.setIndex(new THREE.BufferAttribute(triIndex, 1));
+    geometry.setAttribute('position', new THREE.BufferAttribute(soup.vertexPos, VERT_STRIDE));
+    geometry.setIndex(new THREE.BufferAttribute(soup.triIndex, 1));
     geometry.clearGroups();
-    const bvh = new MeshBVH(geometry, { targetLeafSize: 8, indirect: false });
-    // MeshBVH writes geometry.boundingBox during the build (setBoundingBox
-    // default) from the indexed triangles only — unlike computeBoundingBox,
-    // which also scanned the zero-filled slots of skipped triangles and could
-    // wrongly pull the bounds toward the origin.
-    const localBounds = geometry.boundingBox ? geometry.boundingBox.clone() : new THREE.Box3();
+    const bvh = new MeshBVH(geometry, { targetLeafSize: BLAS_TARGET_LEAF_SIZE, indirect: false });
     const roots = bvh._roots;
     geometry.dispose?.();
     if (!Array.isArray(roots) || roots.length === 0) return null;
-    const records = flattenBVHRoot(roots[0], d.visibleTriCount);
-    // Per-triangle material in BVH order (MeshBVH permuted triIndex in place;
+    // Root bounds come from the indexed triangles only (the first node of the
+    // packed root) — unlike computeBoundingBox, which also scanned the
+    // zero-filled slots of skipped triangles and could wrongly pull the bounds
+    // toward the origin. Identical to what MeshBVH stamps on geometry.boundingBox.
+    return { root: roots[0], bounds: Float32Array.from(new Float32Array(roots[0], 0, 6)) };
+}
+
+function finishLocalBlas(THREE, soup, tree) {
+    if (!tree || !tree.root) return null;
+    const { vertexPos, vertexNormal, vertexUV, vertexMaterial, triIndex, tagSrc } = soup;
+    const triCount = soup.triCount;
+    const b = tree.bounds;
+    const localBounds = new THREE.Box3(
+        new THREE.Vector3(b[0], b[1], b[2]),
+        new THREE.Vector3(b[3], b[4], b[5]),
+    );
+    const records = flattenBVHRoot(tree.root, triCount);
+    // Per-triangle material in BVH order (the build permuted triIndex in place;
     // the material rides the triangle's first vertex through the permutation).
-    const triMaterial = new Uint32Array(d.visibleTriCount);
-    for (let t = 0; t < d.visibleTriCount; t++) triMaterial[t] = vertexMaterial[triIndex[t * 3]] >>> 0;
-    return { vertexPos, vertexNormal, vertexUV, triIndex, triMaterial, records, localBounds, vertCount: totalV, triCount: d.visibleTriCount, srcVertCount: vCount, tagSrc };
+    const triMaterial = new Uint32Array(triCount);
+    for (let t = 0; t < triCount; t++) triMaterial[t] = vertexMaterial[triIndex[t * 3]] >>> 0;
+    return {
+        vertexPos, vertexNormal, vertexUV, triIndex, triMaterial, records, localBounds,
+        vertCount: soup.vertCount, triCount, srcVertCount: soup.srcVertCount, tagSrc,
+    };
+}
+
+function buildLocalBlas(THREE, d) {
+    const soup = gatherLocalSoup(d);
+    return finishLocalBlas(THREE, soup, buildLocalBlasTreeSync(THREE, soup));
+}
+
+// ── Off-thread BLAS builds ─────────────────────────────────────────────────
+// A module-worker pool runs three-mesh-bvh's packed-tree builder (see
+// blas_worker.js) so a structural rebuild no longer blocks the render thread
+// for the O(tris log tris) tree build — the one hitch the BLAS cache cannot
+// absorb on a scene the host has never traced before. The pool is lazy,
+// shared by every field in the page, and disables itself for the session on
+// the first init failure (no Worker global, blocked module workers, an
+// unresolvable three-mesh-bvh layout) so builds silently return to the
+// synchronous reference path.
+const BLAS_WORKER_MAX = 4;
+const BLAS_WORKER_READY_TIMEOUT_MS = 15_000;
+let blasWorkerPool = null;
+let blasWorkersDisabledReason = null;
+let blasWorkerFallbackWarned = false;
+
+// three-mesh-bvh's builder lives at src/core/build/buildTree.js relative to the
+// package root. Derive it from wherever this page's import map resolves the
+// bare specifier (src entry or the published bundle) — hosts with an unusual
+// layout pass blasWorkers: { buildTreeUrl } instead.
+export function resolveBvhBuildModuleUrl() {
+    try {
+        const resolved = import.meta.resolve('three-mesh-bvh');
+        if (typeof resolved !== 'string') return null;
+        const packageRoot = resolved.replace(/\/(?:src\/index\.js|build\/index\.module\.js|build\/index\.umd\.cjs)$/, '/');
+        if (packageRoot === resolved) return null;
+        return new URL('src/core/build/buildTree.js', packageRoot).href;
+    } catch {
+        return null;
+    }
+}
+
+function normalizeBlasWorkerConfig(option) {
+    if (option === false || option === 0 || option === null) return null;
+    const hw = (typeof navigator !== 'undefined' && Number.isFinite(navigator.hardwareConcurrency))
+        ? navigator.hardwareConcurrency
+        : 2;
+    const defaultCount = Math.max(1, Math.min(BLAS_WORKER_MAX, hw - 1));
+    if (option === undefined || option === 'auto' || option === true) {
+        return { count: defaultCount, buildTreeUrl: null };
+    }
+    if (typeof option === 'number') {
+        return option >= 1 ? { count: Math.min(BLAS_WORKER_MAX, option | 0), buildTreeUrl: null } : null;
+    }
+    if (typeof option === 'object') {
+        const count = Number.isFinite(option.count) ? Math.min(BLAS_WORKER_MAX, Math.max(1, option.count | 0)) : defaultCount;
+        return { count, buildTreeUrl: typeof option.buildTreeUrl === 'string' ? option.buildTreeUrl : null };
+    }
+    return null;
+}
+
+function disableBlasWorkers(reason) {
+    blasWorkersDisabledReason = String(reason || 'disabled');
+    const pool = blasWorkerPool;
+    blasWorkerPool = null;
+    if (!pool) return;
+    for (const entry of pool.workers) {
+        try { entry.worker.terminate(); } catch { /* already gone */ }
+        for (const job of entry.inflight.values()) job.reject(new Error(`blas_worker: ${blasWorkersDisabledReason}`));
+        entry.inflight.clear();
+    }
+    for (const job of pool.queue) job.reject(new Error(`blas_worker: ${blasWorkersDisabledReason}`));
+    pool.queue.length = 0;
+}
+
+function createBlasWorkerPool(config) {
+    const buildTreeUrl = config.buildTreeUrl || resolveBvhBuildModuleUrl();
+    if (!buildTreeUrl) throw new Error('cannot resolve three-mesh-bvh buildTree.js');
+    const workerUrl = new URL('./blas_worker.js', import.meta.url);
+    const pool = { workers: [], idle: [], queue: [], nextId: 1, ready: null };
+
+    const pump = () => {
+        while (pool.idle.length > 0 && pool.queue.length > 0) {
+            const entry = pool.idle.pop();
+            const job = pool.queue.shift();
+            entry.inflight.set(job.id, job);
+            entry.worker.postMessage(
+                {
+                    type: 'build',
+                    id: job.id,
+                    vertexPos: job.vertexPos,
+                    triIndex: job.triIndex,
+                    triCount: job.triCount,
+                    targetLeafSize: BLAS_TARGET_LEAF_SIZE,
+                },
+                [job.vertexPos, job.triIndex],
+            );
+        }
+    };
+
+    const readiness = [];
+    for (let i = 0; i < config.count; i++) {
+        const worker = new Worker(workerUrl, { type: 'module', name: `speedball-blas-${i}` });
+        const entry = { worker, inflight: new Map() };
+        pool.workers.push(entry);
+        readiness.push(new Promise((resolve, reject) => {
+            worker.onmessage = (event) => {
+                const msg = event.data;
+                if (!msg || typeof msg !== 'object') return;
+                if (msg.type === 'ready') { resolve(); pool.idle.push(entry); pump(); return; }
+                if (msg.type === 'init-error') { reject(new Error(msg.message)); return; }
+                const job = entry.inflight.get(msg.id);
+                if (!job) return;
+                entry.inflight.delete(msg.id);
+                pool.idle.push(entry);
+                if (msg.type === 'built') {
+                    job.resolve({ vertexPos: msg.vertexPos, triIndex: msg.triIndex, root: msg.root, bounds: msg.bounds });
+                } else {
+                    const error = new Error(msg.message || 'blas_worker: build failed');
+                    error.vertexPos = msg.vertexPos;
+                    error.triIndex = msg.triIndex;
+                    job.reject(error);
+                }
+                pump();
+            };
+            worker.onerror = (event) => {
+                const message = event?.message || 'worker error';
+                reject(new Error(message));
+                disableBlasWorkers(message);
+            };
+            worker.postMessage({ type: 'init', buildTreeUrl });
+        }));
+    }
+    // A worker that never answers (blocked script, hung import) must not
+    // stall the rebuild: past the deadline the pool is torn down and the
+    // build proceeds synchronously.
+    const readyDeadline = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`workers not ready within ${BLAS_WORKER_READY_TIMEOUT_MS} ms`)), BLAS_WORKER_READY_TIMEOUT_MS);
+    });
+    pool.ready = Promise.race([Promise.all(readiness), readyDeadline]).then(() => true, (error) => {
+        disableBlasWorkers(error?.message || error);
+        return false;
+    });
+    pool.build = (soup) => new Promise((resolve, reject) => {
+        pool.queue.push({
+            id: pool.nextId++,
+            vertexPos: soup.vertexPos.buffer,
+            triIndex: soup.triIndex.buffer,
+            triCount: soup.triCount,
+            resolve,
+            reject,
+        });
+        pump();
+    });
+    return pool;
+}
+
+// Returns a READY pool or null. Never throws: any failure disables workers for
+// the session and the caller builds on the main thread.
+async function acquireBlasWorkerPool(option) {
+    const config = normalizeBlasWorkerConfig(option);
+    if (!config || blasWorkersDisabledReason) return null;
+    if (typeof Worker !== 'function') { disableBlasWorkers('no Worker global'); return null; }
+    if (!blasWorkerPool) {
+        try {
+            blasWorkerPool = createBlasWorkerPool(config);
+        } catch (error) {
+            disableBlasWorkers(error?.message || error);
+            return null;
+        }
+    }
+    const pool = blasWorkerPool;
+    const ok = await pool.ready;
+    return ok && blasWorkerPool === pool ? pool : null;
+}
+
+export function getBlasWorkerState() {
+    return {
+        active: !!blasWorkerPool,
+        workers: blasWorkerPool ? blasWorkerPool.workers.length : 0,
+        disabledReason: blasWorkersDisabledReason,
+    };
+}
+
+// Build one BLAS with the pool, falling back to the synchronous reference
+// path if the worker rejects (its buffers come back with the error) or died
+// (re-gather from the still-live attributes).
+async function buildLocalBlasWithPool(THREE, pool, d) {
+    let soup = gatherLocalSoup(d);
+    try {
+        const out = await pool.build(soup);
+        soup.vertexPos = new Float32Array(out.vertexPos);
+        soup.triIndex = new Uint32Array(out.triIndex);
+        return finishLocalBlas(THREE, soup, { root: out.root, bounds: new Float32Array(out.bounds) });
+    } catch (error) {
+        if (!blasWorkerFallbackWarned) {
+            blasWorkerFallbackWarned = true;
+            console.warn('speedball-gi: off-thread BLAS build failed, building on the main thread:', error?.message || error);
+        }
+        if (error?.vertexPos instanceof ArrayBuffer && error.vertexPos.byteLength > 0
+            && error?.triIndex instanceof ArrayBuffer && error.triIndex.byteLength > 0) {
+            soup.vertexPos = new Float32Array(error.vertexPos);
+            soup.triIndex = new Uint32Array(error.triIndex);
+        } else if (soup.triIndex.buffer.byteLength === 0) {
+            soup = gatherLocalSoup(d);
+        }
+        return finishLocalBlas(THREE, soup, buildLocalBlasTreeSync(THREE, soup));
+    }
 }
 
 // Threaded TLAS over instance world-AABBs. Median split by index midpoint on
@@ -1004,18 +1241,65 @@ function buildTlasRecords(aabbs, leafSize = 2) {
 }
 
 // ── Cross-rebuild BLAS cache ────────────────────────────────────────────────
-// A structural rebuild used to rebuild EVERY BLAS in the scene; with a cache
-// installed a topology change pays only for the geometries it actually
-// changed. Entries are keyed by the same structural fingerprint as the
-// in-build dedup (geometry identity × attribute identity/version × per-tri
-// uber mapping), so any content change misses. The cached core is immutable
-// build output — records, soup slices, BVH-ordered materials — and every
-// build works on a shallow clone (see the reuse site), so per-build pool
-// offsets stamped by a newer build can never corrupt an older build that is
-// still draining async work against its own pool. Capacity is bounded by
-// total cached triangles, evicted least-recently-used first.
-export function createBlasCache({ maxTriangles = 2_000_000 } = {}) {
-    return { map: new Map(), maxTriangles, triangles: 0, hits: 0, misses: 0 };
+// See blas_cache.js (re-exported here for hosts that import this module
+// directly). Keys are built at the dedup site below; hosts that stamp a
+// stable content key on geometry.userData.speedballGeometryKey get hits
+// across scene reloads and across geometry objects, not just across rebuilds
+// of the same BufferGeometry.
+export { createBlasCache } from './blas_cache.js';
+
+function cacheBlasCore(blasCache, key, core) {
+    if (!blasCache) return;
+    blasCache.misses++;
+    blasCache.map.set(key, core);
+    blasCache.triangles += core.triCount;
+    for (const [oldKey, old] of blasCache.map) {
+        if (blasCache.triangles <= blasCache.maxTriangles || blasCache.map.size <= 1) break;
+        if (old === core) continue;   // never evict this build's own entry
+        blasCache.map.delete(oldKey);
+        blasCache.triangles -= old.triCount;
+    }
+}
+
+// Per-build state lives on a clone: the pool offsets and source bindings
+// stamped here must never leak into an older build that is still draining
+// async deform slices against its own pool.
+function stampBlasForBuild(core, geom, pos, index) {
+    const blas = Object.assign({}, core);
+    // Deform tracking: soup vertices [0, srcVertCount) map 1:1 onto the
+    // source geometry's vertices, so updateDeforms can re-gather this
+    // BLAS's pooled slice straight from the live attributes.
+    blas.srcGeom = geom;
+    blas.srcPosAttr = pos;
+    blas.srcNormAttr = geom.attributes.normal || null;
+    blas.srcIndexAttr = index || null;
+    blas.srcPosVersion = pos.version | 0;
+    blas.srcNormVersion = geom.attributes.normal ? (geom.attributes.normal.version | 0) : -1;
+    blas.srcIndexVersion = index ? (index.version | 0) : -1;
+    blas.srcPosDataVersion = attributeDataVersion(pos);
+    blas.srcNormDataVersion = attributeDataVersion(geom.attributes.normal || null);
+    blas.srcIndexDataVersion = attributeDataVersion(index || null);
+    blas.srcIndexCount = index ? index.count : -1;
+    return blas;
+}
+
+// Host-provided stable geometry key. A string or finite number on
+// geometry.userData.speedballGeometryKey that changes whenever the position,
+// normal, uv or index CONTENT changes (a content hash is the natural choice).
+// The host owns invalidation for in-place attribute writes; attribute
+// versions are folded in as a second line of defence for writers that follow
+// three's needsUpdate convention.
+function stableGeometryKey(geom) {
+    const key = geom?.userData?.speedballGeometryKey;
+    if (typeof key === 'string') return key.length > 0 ? key : null;
+    if (typeof key === 'number') return Number.isFinite(key) ? String(key) : null;
+    return null;
+}
+
+// Interleaved attributes version their SHARED InterleavedBuffer, not the
+// attribute view; fold that in so a rewrite of the backing buffer misses.
+function attributeDataVersion(attr) {
+    return attr?.isInterleavedBufferAttribute ? (attr.data?.version | 0) : -1;
 }
 
 let nextAttrId = 1;
@@ -1036,8 +1320,13 @@ export async function buildSpectralScene({
     maxTriangles = 4_000_000,
     blasCache = null,
     mapsArena = null,
+    blasWorkers = 'auto',
 } = {}) {
     if (!scene) return null;
+    // Resolve the worker pool BEFORE the scene walk so every cache miss can be
+    // dispatched off-thread. A pool that fails to come up returns null and the
+    // walk builds synchronously, exactly as before.
+    const workerPool = await acquireBlasWorkerPool(blasWorkers);
     scene.updateMatrixWorld(true);
 
     const uberList = [];
@@ -1073,9 +1362,13 @@ export async function buildSpectralScene({
 
     // Pass 1: gather draws; dedupe BLAS by (geometry identity × per-tri uber
     // mapping) so shared and instanced geometry costs ONE local soup + BVH.
+    // A slot is reserved per unique BLAS during the walk; cache misses are
+    // built after the walk (off-thread when a pool is up) and a slot whose
+    // build fails is compacted away together with its instances.
     const blasList = [];
     const blasByKey = new Map();
-    const instances = []; // { blas, object, instanceIndex } — matrices re-read on update
+    const pendingBuilds = []; // { slot, key, d, geom, pos, index }
+    let instances = []; // { blas, object, instanceIndex } — matrices re-read on update
     scene.traverseVisible((obj) => {
         if (!isTraceableMesh(obj, camera)) return;
         const geom = obj.geometry;
@@ -1096,13 +1389,22 @@ export async function buildSpectralScene({
 
         const uniqueTriMaterial = Array.isArray(obj.material);
         const normalAttr = geom.attributes.normal || null;
-        // Doubles as the cross-rebuild cache key: attribute identities catch
-        // swapped-in attributes whose fresh version counters would collide,
-        // and the normal fingerprint keeps cached soup normals honest.
-        let key = `${geom.uuid}:${attrIdentity(index)}.${index ? index.version : -1}`
-            + `:${attrIdentity(pos)}.${pos.version}.${attributeDataVersion(pos)}`
-            + `:${attrIdentity(normalAttr)}.${normalAttr ? normalAttr.version : -1}.${attributeDataVersion(normalAttr)}`
-            + `:${uniqueTriMaterial ? 1 : 0}`;
+        // Doubles as the cross-rebuild cache key. With a host-stamped stable
+        // key the fingerprint survives scene reloads and fresh geometry
+        // objects; attribute versions still ride along so an in-place write
+        // that bumps needsUpdate misses even if the host forgot to re-stamp.
+        // Without one, attribute identities catch swapped-in attributes whose
+        // fresh version counters would collide, and the normal fingerprint
+        // keeps cached soup normals honest.
+        const stableKey = stableGeometryKey(geom);
+        let key = stableKey !== null
+            ? `k:${stableKey}:${index ? index.version : -1}`
+                + `:${pos.version}.${attributeDataVersion(pos)}`
+                + `:${normalAttr ? normalAttr.version : -1}.${attributeDataVersion(normalAttr)}`
+            : `${geom.uuid}:${attrIdentity(index)}.${index ? index.version : -1}`
+                + `:${attrIdentity(pos)}.${pos.version}.${attributeDataVersion(pos)}`
+                + `:${attrIdentity(normalAttr)}.${normalAttr ? normalAttr.version : -1}.${attributeDataVersion(normalAttr)}`;
+        key += `:${uniqueTriMaterial ? 1 : 0}`;
         if (uniqueTriMaterial) {
             let h = 0;
             for (let t = 0; t < triCount; t++) h = ((h * 31) + triMat[t] + 1) >>> 0;
@@ -1113,51 +1415,29 @@ export async function buildSpectralScene({
 
         let blasIdx = blasByKey.get(key);
         if (blasIdx === undefined) {
+            blasIdx = blasList.length;
+            blasByKey.set(key, blasIdx);
             let core = blasCache ? blasCache.map.get(key) : undefined;
             if (core) {
                 blasCache.hits++;
                 blasCache.map.delete(key);   // LRU touch: re-insert as newest
                 blasCache.map.set(key, core);
+                blasList.push(stampBlasForBuild(core, geom, pos, index));
             } else {
-                core = buildLocalBlas(THREE, {
+                const d = {
                     pos, index, triCount, visibleTriCount, visibleTriIndices, triMat, uniqueTriMaterial,
                     normal: normalAttr,
                     uv: geom.attributes.uv || null,
-                });
-                if (!core) return;
-                if (blasCache) {
-                    blasCache.misses++;
-                    blasCache.map.set(key, core);
-                    blasCache.triangles += core.triCount;
-                    for (const [oldKey, old] of blasCache.map) {
-                        if (blasCache.triangles <= blasCache.maxTriangles || blasCache.map.size <= 1) break;
-                        if (old === core) continue;   // never evict this build's own entry
-                        blasCache.map.delete(oldKey);
-                        blasCache.triangles -= old.triCount;
-                    }
+                };
+                if (workerPool) {
+                    blasList.push(null); // filled by the off-thread build below
+                    pendingBuilds.push({ slot: blasIdx, key, d, geom, pos, index });
+                } else {
+                    core = buildLocalBlas(THREE, d);
+                    if (core) cacheBlasCore(blasCache, key, core);
+                    blasList.push(core ? stampBlasForBuild(core, geom, pos, index) : null);
                 }
             }
-            // Per-build state lives on a clone: the pool offsets and source
-            // bindings stamped below must never leak into an older build that
-            // is still draining async deform slices against its own pool.
-            const blas = Object.assign({}, core);
-            // Deform tracking: soup vertices [0, srcVertCount) map 1:1 onto the
-            // source geometry's vertices, so updateDeforms can re-gather this
-            // BLAS's pooled slice straight from the live attributes.
-            blas.srcGeom = geom;
-            blas.srcPosAttr = pos;
-            blas.srcNormAttr = geom.attributes.normal || null;
-            blas.srcIndexAttr = index || null;
-            blas.srcPosVersion = pos.version | 0;
-            blas.srcNormVersion = geom.attributes.normal ? (geom.attributes.normal.version | 0) : -1;
-            blas.srcIndexVersion = index ? (index.version | 0) : -1;
-            blas.srcPosDataVersion = attributeDataVersion(pos);
-            blas.srcNormDataVersion = attributeDataVersion(geom.attributes.normal || null);
-            blas.srcIndexDataVersion = attributeDataVersion(index || null);
-            blas.srcIndexCount = index ? index.count : -1;
-            blasIdx = blasList.length;
-            blasList.push(blas);
-            blasByKey.set(key, blasIdx);
         }
         if (obj.isInstancedMesh) {
             const capacity = Number.isFinite(obj.instanceMatrix?.count) ? obj.instanceMatrix.count : obj.count;
@@ -1171,6 +1451,35 @@ export async function buildSpectralScene({
             instances.push({ blas: blasIdx, object: obj, instanceIndex: -1 });
         }
     });
+
+    // Pass 1b: build every cache miss off-thread, all in flight at once, then
+    // install the cores in slot order so the cache and the pool layout stay
+    // deterministic regardless of which worker finishes first.
+    if (pendingBuilds.length > 0) {
+        const cores = await Promise.all(pendingBuilds.map((job) => buildLocalBlasWithPool(THREE, workerPool, job.d)));
+        for (let i = 0; i < pendingBuilds.length; i++) {
+            const job = pendingBuilds[i];
+            const core = cores[i];
+            if (!core) continue;
+            cacheBlasCore(blasCache, job.key, core);
+            blasList[job.slot] = stampBlasForBuild(core, job.geom, job.pos, job.index);
+        }
+    }
+    // Compact failed slots (null) and drop the draws that referenced them —
+    // the same outcome as the old synchronous walk skipping that object.
+    if (blasList.some((b) => b === null)) {
+        const remap = new Int32Array(blasList.length).fill(-1);
+        const compacted = [];
+        for (let i = 0; i < blasList.length; i++) {
+            if (!blasList[i]) continue;
+            remap[i] = compacted.length;
+            compacted.push(blasList[i]);
+        }
+        blasList.length = 0;
+        for (const b of compacted) blasList.push(b);
+        instances = instances.filter((ins) => remap[ins.blas] >= 0);
+        for (const ins of instances) ins.blas = remap[ins.blas];
+    }
 
     if (blasList.length === 0 || instances.length === 0) return null;
     const instCount = instances.length;
@@ -1589,10 +1898,6 @@ export async function buildSpectralScene({
 
     function attributeArrayIdentity(attr) {
         return attr?.isInterleavedBufferAttribute ? attr.data?.array : attr?.array;
-    }
-
-    function attributeDataVersion(attr) {
-        return attr?.isInterleavedBufferAttribute ? (attr.data?.version | 0) : -1;
     }
 
     function directFloatVec3(attr) {

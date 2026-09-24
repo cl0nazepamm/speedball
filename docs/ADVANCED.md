@@ -107,6 +107,43 @@ Use `forceLightingRefresh()` for known light changes. Use
 `markMaterialValuesDirty()` for scalar/color material edits that keep the same
 material and texture bindings.
 
+## BLAS cache and off-thread builds
+
+A structural rebuild traces one BLAS per unique geometry. Two mechanisms keep
+that from hitching:
+
+- **Cross-rebuild cache.** Every field caches built BLASes by geometry
+  fingerprint, so a topology change pays only for the geometries it touched.
+  Hosts that switch scenes or recreate fields should own the cache:
+
+  ```js
+  import { createBlasCache, createProbeField } from 'speedball-gi';
+  const blasCache = createBlasCache({ maxTriangles: 4_000_000 });
+  const field = createProbeField({ renderer, scene, blasCache });
+  ```
+
+  By default the fingerprint is the `BufferGeometry` identity plus attribute
+  identity/version, so a reload misses. Stamp
+  `geometry.userData.speedballGeometryKey` with a content hash (string or
+  number) and identical meshes hit across reloads and across geometry
+  objects. The host owns invalidation: clear or re-stamp the key whenever it
+  writes position, normal, uv or index arrays in place. Attribute versions
+  are folded in as a second line of defence, and note that three's
+  `BufferGeometry.copy()` shares `userData` between a geometry and its clone.
+
+- **Off-thread builds.** Cache misses are built in a module-worker pool that
+  runs three-mesh-bvh's packed-tree builder (`js/blas_worker.js`) and returns
+  a tree byte-identical to a main-thread `MeshBVH`. `createProbeField({
+  blasWorkers })` takes `'auto'` (default: workers when the page can run
+  them), `false` (synchronous), a pool size, or `{ count, buildTreeUrl }` to
+  pin the builder URL when `import.meta.resolve('three-mesh-bvh')` does not
+  land on the package's `src/` or `build/` entry. Any init failure disables
+  workers for the session and builds synchronously. Soup gathering, tree
+  flattening and pool assembly stay on the main thread.
+
+`_debugState().blasCache` reports hits/misses/entries; `blasWorkers` reports
+the pool state and, when disabled, why.
+
 ## Helpers
 
 - `excludeFromGI(object)` excludes an object and its subtree from tracing and
