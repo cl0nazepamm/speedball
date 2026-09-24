@@ -3,7 +3,7 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.0] — 2026-09-24
 
 - BLAS builds run off the main thread: `spectral_scene` dispatches every
   cache miss to a module-worker pool (`js/blas_worker.js`) that runs
