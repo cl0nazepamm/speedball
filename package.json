@@ -70,11 +70,11 @@
     "prepack": "npm run check && npm test"
   },
   "devDependencies": {
-    "three": "0.186.0",
-    "three-mesh-bvh": "^0.9.14"
+    "three": "0.187.0",
+    "three-mesh-bvh": "^0.9.17"
   },
   "peerDependencies": {
-    "three": ">=0.185.0 <0.187.0",
+    "three": ">=0.185.0 <0.188.0",
     "three-mesh-bvh": ">=0.9.11 <0.10.0"
   }
 }

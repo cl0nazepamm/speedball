@@ -6,7 +6,7 @@ lower-level light-transport surfaces. The normal application path is the concise
 
 ## Renderer backends
 
-DDGI supports Three r185 `WebGPURenderer` with either its WebGPU backend or its
+DDGI supports Three r185 through r187 `WebGPURenderer` with either its WebGPU backend or its
 WebGL2 fallback (`forceWebGL: true`). Call `renderer.init()` before checking
 `gi.isSupported()`. WebGL2 requires `EXT_color_buffer_float`; classic
 `WebGLRenderer` does not provide the required node-material integration.
@@ -242,9 +242,9 @@ illuminators only while PowerShot senses NIR).
 
 ## Limitations
 
-- WebGPU only.
-- Tested against Three `>=0.185.0 <0.186.0`; WebGPU/TSL and cleanup code touches
-  revision-specific renderer APIs.
+- `WebGPURenderer` only (WebGPU or WebGL2 backend).
+- Tested against Three r186 and r187 (`>=0.185.0 <0.188.0`); WebGPU/TSL and
+  cleanup code touches revision-specific renderer APIs.
 - One active probe field per module instance.
 - Standard/Physical-style materials are the target. Exotic node graphs,
   transmission, alpha edge cases, and tiny normal-map detail remain approximate.

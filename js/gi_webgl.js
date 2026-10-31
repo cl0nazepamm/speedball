@@ -51,7 +51,10 @@ export function createWebGLProbeBackend(renderer) {
             integer ? THREE.RGBAIntegerFormat : THREE.RGBAFormat,
             integer ? THREE.UnsignedIntType : THREE.FloatType);
         tex.needsUpdate = true;
+        // The raw sampler name for the GLSL loaders. Never cached: r187 hoists
+        // a node used more than once into a const, which a sampler cannot be.
         const sampler = texture(tex).convert('property');
+        sampler.isCacheable = () => false;
         const fetch = integer ? loadUint : loadFloat;
         const node = {
             element(index) { return fetch(sampler, uint(index)); },

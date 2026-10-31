@@ -1,4 +1,4 @@
-// WebGPU resource teardown shared by the DDGI field and spectral tracer.
+// WebGPU resource teardown for the DDGI field.
 //
 // Three r185's BufferAttribute.dispose() emits a dispose event, but standalone
 // StorageBufferAttributes owned only by compute bindings are not registered with

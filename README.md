@@ -12,11 +12,11 @@ structural rebuilds wait for a safe idle window.
 npm install speedball-gi three three-mesh-bvh
 ```
 
-Speedball supports Three r185 and r186:
+Speedball supports Three r185 through r187:
 
 ```json
 {
-  "three": ">=0.185.0 <0.187.0",
+  "three": ">=0.185.0 <0.188.0",
   "three-mesh-bvh": ">=0.9.11 <0.10.0"
 }
 ```

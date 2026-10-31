@@ -3,6 +3,14 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- Three r187 support (`three >=0.185.0 <0.188.0`). r187 hoists a node used
+  more than once into a const; the WebGL2 backend's raw sampler argument to its
+  GLSL storage loaders is no longer cached, which would declare a `property`
+  const and fail to compile. Dev dependencies and the demos move to three
+  0.187.0 and three-mesh-bvh 0.9.17.
+
 ## [0.10.0] — 2026-10-31
 
 Speedball is GI only.
