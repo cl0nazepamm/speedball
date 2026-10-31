@@ -3,7 +3,7 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.12.0] — 2026-10-31
 
 - The photon caustic engine moved to Sigils (`three-sigils/caustics`):
   `speedball-gi/caustics`, `js/caustic_engine.js` and `js/caustic_bvh.js` are
