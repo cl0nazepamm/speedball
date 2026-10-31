@@ -223,7 +223,7 @@ The photon caustic engine moved to Sigils as `three-sigils/caustics`.
 Plain CDN import maps can use:
 
 ```text
-https://cdn.jsdelivr.net/npm/speedball-gi@0.7.0/js/index.js
+https://cdn.jsdelivr.net/npm/speedball-gi@0.12.0/js/index.js
 ```
 
 Packed light records use 17 floats; slot 16 is reserved. Material records use 28

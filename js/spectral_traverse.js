@@ -1,5 +1,5 @@
 // spectral_traverse.js — TSL BVH traversal + material helpers for the
-// SPEEDBALL GI probe kernel (docs/GI_SPEEDBALL_design.md §3.4). The module and
+// SPEEDBALL GI probe kernel. The module and
 // its package export keep the name of the spectral path tracer that once
 // shared it.
 //

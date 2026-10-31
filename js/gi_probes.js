@@ -1,8 +1,8 @@
-// gi_probes.js — SPEEDBALL GI DDGI irradiance field (docs/GI_SPEEDBALL_design.md §3).
+// gi_probes.js — SPEEDBALL GI DDGI irradiance field.
 //
-// A world-space grid of octahedral irradiance probes traced against the SAME
-// stackless BVH the spectral path tracer uses (shared byte-identically via
-// spectral_traverse.js — no second acceleration structure). Shared TSL math runs
+// A world-space grid of octahedral irradiance probes traced against the
+// stackless two-level BVH spectral_scene.js builds and spectral_traverse.js
+// walks. Shared TSL math runs
 // in WebGPU compute or WebGL2 fragment passes; neither solve reads back to the CPU.
 //
 // MVP (Phase 1): single grid, trace + cosine-gather blend + temporal hysteresis,
@@ -175,7 +175,7 @@ const PROBE_SCENE_BUFFER_KEYS = ['bvhNodes', 'triIndex', 'vertexData', 'triMater
 const PROBE_SCENE_STORAGE_GROWTH = 1.5;
 const PROBE_MAP_KEYS = ['albedo', 'normal', 'roughness', 'metalness', 'emissive', 'alpha'];
 const TEXTURE_ARRAY_LAYERS_FALLBACK = 256;
-// ── denoise uplift (CORE, docs/GI_SPEEDBALL_design.md §11) tunables ──
+// ── denoise uplift (CORE) tunables ──
 const GI_FILTER_K = 8.0;           // spatial filter: variance→edge-stop bandwidth
 const GI_FILTER_EPS = 0.001;       // spatial filter luma² absolute floor (avoids /0 on black)
 const GI_FILTER_REL = 0.0225;      // spatial filter RELATIVE floor (~15% luma)²: even a temporally

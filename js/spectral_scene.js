@@ -1,4 +1,5 @@
-// spectral_scene.js — CPU build pipeline for the WebGPU spectral path tracer.
+// spectral_scene.js — CPU build pipeline for the scene the GI probes trace. The
+// module keeps the name of the spectral path tracer it was written for.
 //
 // TWO-LEVEL BVH: one LOCAL-space BLAS per unique geometry (deduped, so
 // shared/instanced geometry is built once) pooled into a single stackless
@@ -12,8 +13,8 @@
 // slice + in-place bounds refit (gi_refit.js) + the same TLAS rewrite, so a
 // vertex-animated mesh never forces the synchronous MeshBVH rebuild.
 //
-// Output is plain typed arrays + counts; spectral_kernel turns them into
-// StorageBufferAttributes. Nothing here touches the GPU.
+// Output is plain typed arrays + counts; gi_probes turns them into storage
+// buffers. Nothing here touches the GPU.
 //
 // Materials are read as scalar PBR fields off the live material (works for
 // every Standard/Physical/Lambert/Phong/Basic node material; TSL/MaterialX
@@ -1432,7 +1433,7 @@ export async function buildSpectralScene({
     if (poolTris > maxTriangles) {
         // Hard cap: refuse to build rather than blow the storage-buffer ceiling.
         // NOTE: the cap now applies to POOLED (unique) triangles — instances are free.
-        return { error: `scene too large for path tracer: ${poolTris} tris > ${maxTriangles} cap` };
+        return { error: `scene too large for the GI BVH: ${poolTris} tris > ${maxTriangles} cap` };
     }
     if (poolTris >= (1 << 24) || poolNodes >= (1 << 24)) {
         return { error: `BVH pool exceeds the 24-bit index ceiling (${poolTris} tris / ${poolNodes} nodes)` };
