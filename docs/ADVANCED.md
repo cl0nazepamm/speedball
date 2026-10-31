@@ -217,10 +217,12 @@ const gi = installSpeedballGI({
 Speedball also ships lower-level light-transport entry points:
 
 - `speedball-gi/spectral-tracer` exports `createSpectralTracer`, a progressive
-  BVH-traced spectral path tracer with RGB and NIR/night-vision modes.
+  BVH-traced spectral path tracer with RGB and NIR/night-vision modes. Its
+  spectral model - the Jakob-Hanika sRGB-to-reflectance upsampler and LUT, the
+  NV photocathode band, and the NIR material classifier - comes from
+  `powershot-threejs/infrared`, an optional peer dependency needed only here.
 - `speedball-gi/spectral-scene` and `speedball-gi/spectral-traverse` expose the
   shared flattened scene, BVH, materials, lights, and traversal foundation.
-- `speedball-gi/srgb-lut` contains the embedded sRGB-to-reflectance LUT.
 - `speedball-gi/caustics` exports `createCausticEngine` and receiver/caster presets.
 
 The caustic engine supports analytic and mesh emission, rigid caster updates with

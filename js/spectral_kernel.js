@@ -26,6 +26,8 @@
 //
 // The BVH traversal + JH-spectral/env/PBR shading emitters live in
 // spectral_traverse.js (shared byte-identically with the Speedball GI probe kernel).
+// The NV band (Gen-3 photocathode response) and the Jakob–Hanika RGB →
+// reflectance upsampler are PowerShot's (powershot-threejs/infrared).
 
 import * as TSL from 'three/tsl';
 
@@ -39,10 +41,11 @@ const {
 
 import {
     buildTraversal,
-    photocathodeS, buildPhotocathodeSampler,
-    PI, LAMBDA_MIN, LAMBDA_MAX, LAMBDA_RANGE,
-    NV_LAMBDA_MIN, NV_LAMBDA_MAX, T_MAX, RAY_EPS,
+    PI, LAMBDA_MIN, LAMBDA_MAX, LAMBDA_RANGE, T_MAX, RAY_EPS,
 } from './spectral_traverse.js';
+import {
+    photocathodeS, buildPhotocathodeSampler, NV_LAMBDA_MIN, NV_LAMBDA_MAX,
+} from 'powershot-threejs/infrared';
 
 // ∫ȳ(λ)dλ over [380,720] for the Wyman fits below. Dividing the XYZ Monte
 // Carlo estimate by this maps a unit flat spectrum to Y=1 (neutral white);
@@ -107,7 +110,7 @@ const XYZ_TO_SRGB_D65 = (() => {
 })();
 
 export function buildKernels({
-    THREE, buffers, env, lut = null, lutRes = 0, maps = {}, width, height,
+    THREE, buffers, env, spectral = null, maps = {}, width, height,
     // 'visible' | 'nv'. nvSampling 'uniform' exists only for A/B-validating
     // the importance estimator (means must agree within Monte Carlo noise).
     mode = 'visible', nvSampling = 'importance',
@@ -180,7 +183,7 @@ export function buildKernels({
     // against the same resident BVH (no second acceleration structure).
     const trav = buildTraversal({
         storages: { bvhNodes, triIndex, vertexData, triMaterial, materials },
-        U, env, lut, lutRes, maps,
+        U, env, spectral, maps,
     });
     const {
         fetchVert, fetchNorm, fetchUV, triVert, matFloat,

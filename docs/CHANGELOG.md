@@ -3,6 +3,23 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- The spectral tracer's spectral model moved to PowerShot
+  (`powershot-threejs/infrared`): the Jakob-Hanika sRGB-to-reflectance
+  upsampler with its coefficient LUT and generator, the Gen-3 photocathode
+  response (NV band), and the `classifyNir` material heuristics. The
+  `speedball-gi/srgb-lut` export, `photocathodeResponseJS` / `photocathodeS` /
+  `buildPhotocathodeSampler` / `NV_LAMBDA_*` from `spectral-traverse`, and
+  `classifyNir` from `spectral-scene` are removed; import them from PowerShot.
+  `powershot-threejs` is an optional peer dependency, required only by
+  `speedball-gi/spectral-tracer`. Tracer output is unchanged.
+- `buildTraversal` takes `spectral` (a PowerShot `createJhUpsampler`) in place
+  of `lut` / `lutRes`; `buildKernels` likewise. Without one, reflectance and
+  emission use the 3-bin `rgbToSpectral`, as the GI probes always have.
+- `buildSpectralScene({ classifyNir })` estimates material slot [25] for
+  untagged materials; GI no longer computes it.
+
 ## [0.9.0] — 2026-09-24
 
 - BLAS builds run off the main thread: `spectral_scene` dispatches every

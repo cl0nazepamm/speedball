@@ -44,7 +44,7 @@ const NODE_STRIDE_U32 = 8;     // bvhNodes: 6 aabb floats + miss + payload
 //   [24] alpha-map layer
 //   [25] nirAlbedo: −1 = untagged (kernel uses JH extrapolation as prior),
 //        else authored [0,1] NIR reflectance (userData.nirAlbedo wins over
-//        the classifyNir heuristics) · [26] traversal flags · [27] pad
+//        the host's classifyNir option) · [26] traversal flags · [27] pad
 const MAT_STRIDE = 28;
 const MAT_FLAG_ALPHA_TEXTURE = 1; // alpha acceptance requires UV/map sampling
 const MAT_FLAG_ALPHA_ACCEPT = 2;  // constant alpha path is guaranteed accepted
@@ -184,34 +184,7 @@ export function emissiveScaled(material, out) {
     return out;
 }
 
-// ── NIR albedo authoring ───────────────────────────────────────────
-// RGB carries zero information about NIR (metamerism): two identical greens
-// can differ 10× at 850 nm (chlorophyll red edge vs green paint). Truth is
-// injected as DATA — one scalar NIR reflectance per material — with cheap
-// name/colour heuristics providing defaults for the big classes. −1 leaves
-// the material on the JH-extrapolation prior. Colour inputs are LINEAR.
-export function classifyNir(name, r, g, b, roughness, metalness, transmission) {
-    const n = String(name || '');
-    const maxc = Math.max(r, g, b);
-    const minc = Math.min(r, g, b);
-    const sat = maxc > 1e-6 ? (maxc - minc) / maxc : 0;
-    // chlorophyll red edge: foliage is DARK green visibly, ~0.5 in NIR
-    if (/leaf|foliage|grass|tree|plant|veg/i.test(n)) return 0.55;
-    if (g > 1.15 * Math.max(r, b) && roughness > 0.5 && metalness < 0.2) return 0.55;
-    // water absorbs strongly past ~750 nm → near-black through a tube
-    if (/water|ocean|pool/i.test(n)) return 0.04;
-    if (transmission > 0.5 && b > r) return 0.04;
-    // asphalt / very dark low-saturation dielectric
-    if (/asphalt|tarmac|road/i.test(n)) return 0.06;
-    if (maxc < 0.08 && sat < 0.15 && metalness < 0.2 && transmission < 0.5) return 0.06;
-    // skin: waxy NIR lift (sub-surface scattering)
-    const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    if (r > g && g > b && b > 1e-6 && r / b >= 1.3 && r / b <= 2.5
-        && lum > 0.12 && lum < 0.7 && metalness < 0.2) return 0.62;
-    return -1; // untagged → JH extrapolation prior
-}
-
-function materialToUber(material) {
+function materialToUber(material, classifyNir = null) {
     const color = material.color;
     let r = color?.isColor ? color.r : 1;
     let g = color?.isColor ? color.g : 1;
@@ -268,15 +241,16 @@ function materialToUber(material) {
         : 0;
 
     // NIR reflectance (slot [25]): explicit userData.nirAlbedo wins, else the
-    // name/colour classifier, else −1 (JH prior). Clamped roughness/metalness
-    // values match what the classifier expects.
+    // host's classifier (the spectral tracer passes PowerShot's classifyNir),
+    // else −1 (JH prior). Clamped roughness/metalness values match what the
+    // classifier expects.
     const udNir = material.userData?.nirAlbedo;
     const roughnessC = Math.min(1, Math.max(0, roughness)); // 0 = delta mirror, legal
     const metalnessC = Math.min(1, Math.max(0, metalness));
     const transmissionC = Math.min(1, Math.max(0, transmission));
     const nirAlbedo = Number.isFinite(udNir)
         ? Math.min(1, Math.max(0, udNir))
-        : classifyNir(material.name, r, g, b, roughnessC, metalnessC, transmissionC);
+        : (classifyNir ? classifyNir(material.name, r, g, b, roughnessC, metalnessC, transmissionC) : -1);
 
     // Traversal classification is packed once instead of rediscovered for
     // every candidate triangle. A bound color/alpha map stays on the exact
@@ -1321,6 +1295,9 @@ export async function buildSpectralScene({
     blasCache = null,
     mapsArena = null,
     blasWorkers = 'auto',
+    // NIR reflectance estimator for untagged materials (material slot [25]);
+    // the spectral tracer passes PowerShot's classifyNir, GI leaves it unset.
+    classifyNir = null,
 } = {}) {
     if (!scene) return null;
     // Resolve the worker pool BEFORE the scene walk so every cache miss can be
@@ -1338,7 +1315,7 @@ export async function buildSpectralScene({
     const uberMap = new Map();
     function internMaterial(material, zeroEmissive = false) {
         const mat = material || {};
-        const rec = materialToUber(mat);
+        const rec = materialToUber(mat, classifyNir);
         if (zeroEmissive) {
             // Tier-1 limitation: probe-space glossy reflections lose this self-glow;
             // the raster still draws the emitter while NEE owns its traced direct light.
@@ -1857,11 +1834,11 @@ export async function buildSpectralScene({
             const zeroEmissive = uberZeroEmissive[i] === true;
             if (zeroEmissive) emitterValuesTouched = true;
             if (materialMapTail(sharers[0]) !== uberMapTails[i]) return null;
-            const rec = materialToUber(sharers[0]);
+            const rec = materialToUber(sharers[0], classifyNir);
             if (zeroEmissive) { rec[7] = 0; rec[8] = 0; rec[9] = 0; }
             for (let s = 1; s < sharers.length; s++) {
                 if (materialMapTail(sharers[s]) !== uberMapTails[i]) return null;
-                const r2 = materialToUber(sharers[s]);
+                const r2 = materialToUber(sharers[s], classifyNir);
                 if (zeroEmissive) { r2[7] = 0; r2[8] = 0; r2[9] = 0; }
                 for (let f = 0; f < MAT_STRIDE; f++) {
                     if (Math.round(r2[f] * 1000) !== Math.round(rec[f] * 1000)) return null;

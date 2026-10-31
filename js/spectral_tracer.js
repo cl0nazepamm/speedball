@@ -14,37 +14,20 @@
 import * as THREE from 'three/webgpu';
 import { buildSpectralScene } from './spectral_scene.js';
 import { buildKernels } from './spectral_kernel.js';
-import { decodeSpectralLut, SPECTRAL_LUT_RES } from './srgb_lut.js';
+import {
+    classifyNir, createJhUpsampler, createSpectralLutTextures, loadSpectralLut,
+} from 'powershot-threejs/infrared';
 import { disposeComputeNodes, disposeStorageAttributes } from './webgpu_cleanup.js';
 
-// RGB→reflectance LUT as 3 Data3DTextures (one per argmax slab), built once and
-// shared across scene rebuilds. The packed module stores depth = slab*res+zi,
-// so slab s occupies a contiguous res³ RGBA-float slice.
-let spectralLutTextures = null;
-function getSpectralLutTextures() {
-    if (spectralLutTextures) return spectralLutTextures;
-    try {
-        const res = SPECTRAL_LUT_RES;
-        const all = decodeSpectralLut(); // Float32Array, RGBA, 3 slabs packed in depth
-        const sliceLen = res * res * res * 4;
-        const out = [];
-        for (let s = 0; s < 3; s++) {
-            const slice = all.slice(s * sliceLen, (s + 1) * sliceLen);
-            const tex = new THREE.Data3DTexture(slice, res, res, res);
-            tex.format = THREE.RGBAFormat;
-            tex.type = THREE.FloatType;
-            tex.minFilter = THREE.LinearFilter;
-            tex.magFilter = THREE.LinearFilter;
-            tex.wrapS = tex.wrapT = tex.wrapR = THREE.ClampToEdgeWrapping;
-            tex.colorSpace = THREE.NoColorSpace; // raw coefficients, not colour
-            tex.needsUpdate = true;
-            out.push(tex);
-        }
-        spectralLutTextures = out;
-    } catch (e) {
-        spectralLutTextures = null; // kernel falls back to the cheap 3-bin upsample
-    }
-    return spectralLutTextures;
+// PowerShot's Jakob–Hanika upsampler over its coefficient LUT, built once and
+// shared across scene rebuilds. If the LUT cannot load, the kernel falls back
+// to the cheap 3-bin upsample.
+let spectralUpsampler = null;
+function getSpectralUpsampler() {
+    spectralUpsampler ??= loadSpectralLut()
+        .then((lut) => createJhUpsampler(createSpectralLutTextures(lut), lut.res))
+        .catch(() => null);
+    return spectralUpsampler;
 }
 
 const SCENE_REBUILD_COALESCE_MS = 25;
@@ -322,7 +305,10 @@ export function createSpectralTracer({
         const buildRevision = sceneRevision;
         (async () => {
         try {
-            const built = await buildSpectralScene({ THREE, scene, camera: activeCamera, maxTriangles: MAX_TRIANGLES });
+            const [built, spectral] = await Promise.all([
+                buildSpectralScene({ THREE, scene, camera: activeCamera, maxTriangles: MAX_TRIANGLES, classifyNir }),
+                getSpectralUpsampler(),
+            ]);
             if (!built) {
                 // Empty scene — nothing to trace. Treat as built so we just clear.
                 disposeGPU();
@@ -382,7 +368,7 @@ export function createSpectralTracer({
             };
             const kernels = buildKernels({
                 THREE, buffers, env: built.env,
-                lut: getSpectralLutTextures(), lutRes: SPECTRAL_LUT_RES,
+                spectral,
                 maps: built.maps, width, height,
                 mode: renderMode,
             });

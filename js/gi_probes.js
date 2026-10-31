@@ -1794,7 +1794,7 @@ export function createProbeField({
         const Utrav = sharedScene.traversalUniforms;
         const trav = buildTraversal({
             storages: { bvhNodes, triIndex, vertexData, triMaterial, materials },
-            U: Utrav, env: null, lut: null, lutRes: 0, maps: sharedScene.maps,
+            U: Utrav, env: null, maps: sharedScene.maps,
         });
         const { fetchVert, fetchNorm, traverseClosest, traverseAny, instLocalRay, instNormalToWorld, matFloat, triVert, fetchUV, hitUV, sampleLayer, srgbToLinear, albedoTex, emissiveTex, haveAlbedoMap, haveEmissiveMap } = trav;
 
