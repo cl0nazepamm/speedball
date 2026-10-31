@@ -12,7 +12,6 @@
     "./install": "./js/install.js",
     "./spectral-scene": "./js/spectral_scene.js",
     "./spectral-traverse": "./js/spectral_traverse.js",
-    "./spectral-tracer": "./js/spectral_tracer.js",
     "./caustics": "./js/caustic_engine.js",
     "./package.json": "./package.json"
   },
@@ -41,9 +40,7 @@
     "js/gi_webgl.js",
     "js/index.js",
     "js/install.js",
-    "js/spectral_kernel.js",
     "js/spectral_scene.js",
-    "js/spectral_tracer.js",
     "js/spectral_traverse.js",
     "js/webgpu_cleanup.js",
     "LICENSE",
@@ -77,13 +74,7 @@
     "three-mesh-bvh": "^0.9.14"
   },
   "peerDependencies": {
-    "powershot-threejs": ">0.10.0",
     "three": ">=0.185.0 <0.187.0",
     "three-mesh-bvh": ">=0.9.11 <0.10.0"
-  },
-  "peerDependenciesMeta": {
-    "powershot-threejs": {
-      "optional": true
-    }
   }
 }

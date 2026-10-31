@@ -12,7 +12,7 @@ WebGL2 fallback (`forceWebGL: true`). Call `renderer.init()` before checking
 `WebGLRenderer` does not provide the required node-material integration.
 
 Both paths share BVH traversal, texture/alpha sampling, direct and emissive
-lighting, multibounce, sky/NIR injection, temporal filtering, probe classification,
+lighting, multibounce, sky injection, temporal filtering, probe classification,
 cascades, and all reflection tiers. WebGL uses integer/float data textures and
 fragment passes with separate read/write history. Atlas bindings remain stable
 through solves and compatible rebuilds. It performs no CPU readback during solving.
@@ -46,7 +46,7 @@ Always call the installer handle's `dispose()` before disposing renderer or scen
 resources.
 
 The stable handle exposes lifecycle, tuning, scene-dirty notifications, field
-queries, reflections, and NIR controls. Raw probe-node access, manual ticking,
+queries, and reflections. Raw probe-node access, manual ticking,
 rebuild controls, pacing controls, and GPU diagnostics live under `gi.advanced`.
 That namespace is intentionally unstable and intended for adapters and test
 harnesses. Integrations that need complete ownership can instead import
@@ -216,11 +216,6 @@ const gi = installSpeedballGI({
 
 Speedball also ships lower-level light-transport entry points:
 
-- `speedball-gi/spectral-tracer` exports `createSpectralTracer`, a progressive
-  BVH-traced spectral path tracer with RGB and NIR/night-vision modes. Its
-  spectral model - the Jakob-Hanika sRGB-to-reflectance upsampler and LUT, the
-  NV photocathode band, and the NIR material classifier - comes from
-  `powershot-threejs/infrared`, an optional peer dependency needed only here.
 - `speedball-gi/spectral-scene` and `speedball-gi/spectral-traverse` expose the
   shared flattened scene, BVH, materials, lights, and traversal foundation.
 - `speedball-gi/caustics` exports `createCausticEngine` and receiver/caster presets.
@@ -238,8 +233,12 @@ Plain CDN import maps can use:
 https://cdn.jsdelivr.net/npm/speedball-gi@0.7.0/js/index.js
 ```
 
-Packed light records use 17 floats; slot 16 stores emitter class. Material records
-use 28 floats; slot 25 stores NIR albedo and slot 26 stores traversal flags.
+Packed light records use 17 floats; slot 16 is reserved. Material records use 28
+floats; slot 25 is reserved and slot 26 stores traversal flags.
+
+Band-specific emitters such as IR illuminators are ordinary lights: a black
+light emits nothing, so gate one through its colour (max.js lights IR
+illuminators only while PowerShot senses NIR).
 
 ## Limitations
 

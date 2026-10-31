@@ -42,9 +42,7 @@ const NODE_STRIDE_U32 = 8;     // bvhNodes: 6 aabb floats + miss + payload
 //   [17] normalScale · [18..19] uv repeat xy · [20..21] uv offset xy
 //   [22] side (0 front, 1 back, 2 double) · [23] alphaTest
 //   [24] alpha-map layer
-//   [25] nirAlbedo: −1 = untagged (kernel uses JH extrapolation as prior),
-//        else authored [0,1] NIR reflectance (userData.nirAlbedo wins over
-//        the host's classifyNir option) · [26] traversal flags · [27] pad
+//   [25] reserved (0) · [26] traversal flags · [27] pad
 const MAT_STRIDE = 28;
 const MAT_FLAG_ALPHA_TEXTURE = 1; // alpha acceptance requires UV/map sampling
 const MAT_FLAG_ALPHA_ACCEPT = 2;  // constant alpha path is guaranteed accepted
@@ -184,7 +182,7 @@ export function emissiveScaled(material, out) {
     return out;
 }
 
-function materialToUber(material, classifyNir = null) {
+function materialToUber(material) {
     const color = material.color;
     let r = color?.isColor ? color.r : 1;
     let g = color?.isColor ? color.g : 1;
@@ -240,17 +238,7 @@ function materialToUber(material, classifyNir = null) {
         ? Math.min(2, Math.max(0, material.side | 0))
         : 0;
 
-    // NIR reflectance (slot [25]): explicit userData.nirAlbedo wins, else the
-    // host's classifier (the spectral tracer passes PowerShot's classifyNir),
-    // else −1 (JH prior). Clamped roughness/metalness values match what the
-    // classifier expects.
-    const udNir = material.userData?.nirAlbedo;
-    const roughnessC = Math.min(1, Math.max(0, roughness)); // 0 = delta mirror, legal
-    const metalnessC = Math.min(1, Math.max(0, metalness));
     const transmissionC = Math.min(1, Math.max(0, transmission));
-    const nirAlbedo = Number.isFinite(udNir)
-        ? Math.min(1, Math.max(0, udNir))
-        : (classifyNir ? classifyNir(material.name, r, g, b, roughnessC, metalnessC, transmissionC) : -1);
 
     // Traversal classification is packed once instead of rediscovered for
     // every candidate triangle. A bound color/alpha map stays on the exact
@@ -276,7 +264,7 @@ function materialToUber(material, classifyNir = null) {
         side,
         Math.min(1, Math.max(0, alphaTest)),
         -1,                     // [24] alpha-map layer, filled by buildMaterialTextures
-        nirAlbedo,              // [25] NIR reflectance (−1 = JH prior)
+        0,                      // [25] reserved
         traversalFlags, 0];     // [26] traversal flags, [27] pad
 }
 
@@ -468,8 +456,8 @@ function createMaterialMapsGeneration(
 }
 
 // Walk every uber material, extract each map type, and write the assigned layer
-// index back into each uber record. Without an arena this preserves the public
-// spectral-tracer behavior and allocates exact-size DataArrayTextures. With an
+// index back into each uber record. Without an arena this allocates exact-size
+// DataArrayTextures. With an
 // arena, extraction remains a CPU staging operation: an accepted probe build
 // commits the staged live layers later, at the same boundary as its resident
 // material-buffer rewrite. This prevents an async/stale build from changing the
@@ -698,32 +686,7 @@ function flattenBVHRoot(rootBuffer, expectedTriCount) {
 // Layout (stride 17 floats): [0] type(0 dir/1 point/2 spot/3 emissive sphere),
 // [1..3] worldPos, [4..6] worldDir (toward target), [7..9] color*intensity,
 // [10] range, [11] decay, [12] cosAngle, [13] cosPenumbra, [14] w, [15] h,
-// [16] emitter class (packed): 0 untagged (JH emission), 2 LED,
-//      3 sodium (LPS 589 nm), 4 IR illuminator (850 nm band); any value
-//      ≥ 500 = incandescent/halogen with that colour temperature in Kelvin
-//      (class 1 + userData.colorTemp ?? 2856 collapse to this at pack time).
-// Source: light.userData.emitterClass — string ('incandescent', 'halogen',
-// 'led', 'sodium', 'ir') or number 0..4. Untagged lights keep today's
-// JH-emission behaviour exactly.
-
-function emitterClassValue(obj) {
-    const raw = obj.userData?.emitterClass;
-    let cls = 0;
-    if (typeof raw === 'string') {
-        const s = raw.trim().toLowerCase();
-        if (s.startsWith('incan') || s === 'halogen' || s === 'tungsten') cls = 1;
-        else if (s === 'led') cls = 2;
-        else if (s.startsWith('sodium') || s === 'lps') cls = 3;
-        else if (s === 'ir' || s.startsWith('ir_') || s.startsWith('ir ') || s.includes('illuminator')) cls = 4;
-    } else if (Number.isFinite(raw)) {
-        cls = Math.min(4, Math.max(0, Math.trunc(raw)));
-    }
-    if (cls === 1) {
-        const t = Number.isFinite(obj.userData?.colorTemp) ? obj.userData.colorTemp : 2856;
-        return Math.min(20000, Math.max(500, t));
-    }
-    return cls;
-}
+// [16] reserved (0).
 
 export function collectLights(THREE, scene, camera = null) {
     const out = [];
@@ -738,23 +701,12 @@ export function collectLights(THREE, scene, camera = null) {
         obj.getWorldPosition(pos);
         const c = obj.color, k = Number.isFinite(obj.intensity) ? obj.intensity : 1;
         if (k <= 0) return;
-        const eclass = emitterClassValue(obj);
-        let cr = (c?.isColor ? c.r : 1) * k;
-        let cg = (c?.isColor ? c.g : 1) * k;
-        let cb = (c?.isColor ? c.b : 1) * k;
-        if (cr <= 0 && cg <= 0 && cb <= 0) {
-            // An IR illuminator is legitimately BLACK in RGB — intensity alone
-            // drives its 850 nm band (and it stays invisible in visible mode
-            // because the band is far outside the sampled domain). Everything
-            // else with a black colour genuinely emits nothing.
-            // NOTE the promotion below is for the PT's emitterAtLambda (max
-            // channel = the band's peak radiance). RGB-domain consumers (the GI
-            // probes' NEE) must NOT shade this white as-is — they gate class-4
-            // lights on the nirGate uniform (see gi_probes.js), so the light
-            // stays dark in the visible band and appears under NV.
-            if (eclass !== 4) return;
-            cr = cg = cb = k;
-        }
+        const cr = (c?.isColor ? c.r : 1) * k;
+        const cg = (c?.isColor ? c.g : 1) * k;
+        const cb = (c?.isColor ? c.b : 1) * k;
+        // A black light emits nothing; hosts gate band-specific emitters (an IR
+        // illuminator under night vision) through the light's colour.
+        if (cr <= 0 && cg <= 0 && cb <= 0) return;
         let type = 1, range = 0, decay = 2, cosAngle = -1, cosPen = -1, w = 0, h = 0;
         dir.set(0, 0, -1);
         if (obj.isDirectionalLight || obj.isSunLight || obj.isSpotLight) {
@@ -782,7 +734,7 @@ export function collectLights(THREE, scene, camera = null) {
         } else {
             return;
         }
-        out.push([type, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z, cr, cg, cb, range, decay, cosAngle, cosPen, w, h, eclass]);
+        out.push([type, pos.x, pos.y, pos.z, dir.x, dir.y, dir.z, cr, cg, cb, range, decay, cosAngle, cosPen, w, h, 0]);
     });
     return out;
 }
@@ -1295,9 +1247,6 @@ export async function buildSpectralScene({
     blasCache = null,
     mapsArena = null,
     blasWorkers = 'auto',
-    // NIR reflectance estimator for untagged materials (material slot [25]);
-    // the spectral tracer passes PowerShot's classifyNir, GI leaves it unset.
-    classifyNir = null,
 } = {}) {
     if (!scene) return null;
     // Resolve the worker pool BEFORE the scene walk so every cache miss can be
@@ -1315,7 +1264,7 @@ export async function buildSpectralScene({
     const uberMap = new Map();
     function internMaterial(material, zeroEmissive = false) {
         const mat = material || {};
-        const rec = materialToUber(mat, classifyNir);
+        const rec = materialToUber(mat);
         if (zeroEmissive) {
             // Tier-1 limitation: probe-space glossy reflections lose this self-glow;
             // the raster still draws the emitter while NEE owns its traced direct light.
@@ -1834,11 +1783,11 @@ export async function buildSpectralScene({
             const zeroEmissive = uberZeroEmissive[i] === true;
             if (zeroEmissive) emitterValuesTouched = true;
             if (materialMapTail(sharers[0]) !== uberMapTails[i]) return null;
-            const rec = materialToUber(sharers[0], classifyNir);
+            const rec = materialToUber(sharers[0]);
             if (zeroEmissive) { rec[7] = 0; rec[8] = 0; rec[9] = 0; }
             for (let s = 1; s < sharers.length; s++) {
                 if (materialMapTail(sharers[s]) !== uberMapTails[i]) return null;
-                const r2 = materialToUber(sharers[s], classifyNir);
+                const r2 = materialToUber(sharers[s]);
                 if (zeroEmissive) { r2[7] = 0; r2[8] = 0; r2[9] = 0; }
                 for (let f = 0; f < MAT_STRIDE; f++) {
                     if (Math.round(r2[f] * 1000) !== Math.round(rec[f] * 1000)) return null;
@@ -2316,11 +2265,6 @@ export async function buildSpectralScene({
         return { lightCount: nextRecords.length };
     }
 
-    // Environment (equirect)
-    const env = scene.userData?.maxjsPathTraceEnvironment?.isTexture
-        ? scene.userData.maxjsPathTraceEnvironment
-        : (scene.environment?.isTexture ? scene.environment : null);
-
     return {
         error: null,
         bounds: dyn0.worldBounds.clone(), // world-space AABB of the traced instances
@@ -2339,7 +2283,6 @@ export async function buildSpectralScene({
         disposeDeformUpdates,
         updateLights,
         lights, lightCount: lightRecords.length,
-        env,
         maps, // { albedo, normal, roughness, metalness, emissive, alpha } DataArrayTexture | null
         mapsArenaGeneration,
         mapsArenaPlan,

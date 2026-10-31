@@ -8,14 +8,10 @@
 // near-constant cost. Everything else (directional, spot, shadow-casting points) falls
 // through to the stock per-light path unchanged.
 //
-// This subclass adds the SAME three seams GiLightsNode adds to DynamicLightsNode:
+// This subclass adds the SAME two seams GiLightsNode adds to DynamicLightsNode:
 //   1. GI probe / legacy-volume injection into builder.context.irradiance (only when
 //      active — with GI off the node is behaviour-identical to stock ClusteredLightsNode),
-//   2. IR-emitter lifting: class-4 IR illuminators are black-RGB point lights, so the
-//      stock partition would waste cluster slots on lights that shade to zero and can
-//      never see the NIR band gate. They ride per-light AnalyticLightNodes shared with
-//      gi_lights_node — setNirDirectSensing stays the single band switch for BOTH modes,
-//   3. cache-key stamping so GI activation / IR tagging recompiles materials.
+//   2. cache-key stamping so GI activation recompiles materials.
 //
 // Unlike GiLightsNode there is NO environment-restore step: core LightsNode (the
 // clustered node's base) already folds builder.context.materialLightings into the
@@ -31,59 +27,25 @@ import ClusteredLightsNode from 'three/addons/tsl/lighting/ClusteredLightsNode.j
 import { NodeUtils } from 'three/webgpu';
 import { getGiProbeNode } from './gi_probes.js';
 import { getGiVolumeNode } from './gi_irradiance_volume.js';
-import { isIrEmitter, getOrCreateIrLightNode } from './gi_lights_node.js';
 
 export default class GiClusteredLightsNode extends ClusteredLightsNode {
     static get type() { return 'GiClusteredLightsNode'; }
 
-    constructor(maxLights = 1024, tileSize = 32, zSlices = 24, maxLightsPerCluster = 64) {
-        super(maxLights, tileSize, zSlices, maxLightsPerCluster);
-        this._irLights = [];
-        this._restLights = [];
-    }
-
-    // Partition IR-tagged emitters OUT before the stock clustered/material split
-    // (mirrors ClusteredLightsNode.setLights' reuse-the-arrays pattern — called
-    // per frame, so no fresh allocations).
-    setLights(lights) {
-        const ir = this._irLights, rest = this._restLights;
-        let ni = 0, nr = 0;
-        for (const light of lights) {
-            if (isIrEmitter(light)) ir[ni++] = light; else rest[nr++] = light;
-        }
-        ir.length = ni; rest.length = nr;
-        super.setLights(rest);
-        this._allLights = lights;   // keep getLights() faithful to the renderer's list
-        return this;
-    }
-
     customCacheKey() {
         // super = clustered compute key + core LightsNode key over the non-clustered
-        // lights (IR lights are already filtered out of both). Hash IR identity and
-        // the GI tokens in so tagging/untagging or GI activation recompiles.
+        // lights. Hash the GI tokens in so GI activation recompiles.
         const base = super.customCacheKey();
         const arr = [base];
-        for (const l of this._irLights) arr.push(l.id, l.castShadow ? 1 : 0);
         const probe = getGiProbeNode();
         if (probe.active) arr.push(NodeUtils.hashString(probe.cacheToken));
         const vol = getGiVolumeNode();
         if (vol.active) arr.push(NodeUtils.hashString(vol.cacheToken));
-        if (arr.length === 1) return base;   // GI off, no IR → identical key to stock
+        if (arr.length === 1) return base;   // GI off → identical key to stock
         return NodeUtils.hashArray(arr);
-    }
-
-    // IR lights live in NEITHER stock list (clustered / material), so without this a
-    // scene lit only by IR illuminators would report hasLights false and skip setup.
-    get hasLights() {
-        return super.hasLights || this._irLights.length > 0;
     }
 
     setupLightsNode(builder) {
         const lightNodes = super.setupLightsNode(builder);
-        for (const light of this._irLights) {
-            const node = getOrCreateIrLightNode(light, builder.renderer.library);
-            if (node !== null) lightNodes.push(node);
-        }
         const probe = getGiProbeNode();
         // Indirect bounce into builder.context.irradiance — global, unmasked, only
         // when active (same contract as GiLightsNode / MaxLightsNode's GI push).

@@ -11,7 +11,7 @@
 
 import * as THREE from 'three/webgpu';
 import { createProbeField } from './gi_probes.js';
-import { giLights, setNirDirectSensing, setNirIlluminatorGain } from './gi_lights_node.js';
+import { giLights } from './gi_lights_node.js';
 import { giClusteredLights } from './gi_clustered_lights_node.js';
 
 // spectral_scene / gi_probes gate: userData.maxjsVisible === false → kept out of the
@@ -138,10 +138,6 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @property {Function} setSky
  * @property {Function} setSkyIntensity
  * @property {Function} getSkyIntensity
- * @property {Function} setNirSensing
- * @property {Function} getNirSensing
- * @property {Function} setNirGain
- * @property {Function} getNirGain
  * @property {Function} setChangeThreshold
  * @property {Function} getChangeThreshold
  * @property {Function} setSnapAmount
@@ -428,31 +424,6 @@ export function installSpeedballGI({
         setSkyIntensity: mutate('setSkyIntensity'),
         getSkyIntensity: query('getSkyIntensity'),
 
-        /**
-         * NIR band sensing (white-phosphor NV filter on/off). One switch for BOTH terms
-         * of emitter-class-'ir' lights: the probes' NEE gate (GI) and the direct raster
-         * gate (gi_lights_node). Uniform writes only — no recompile, no scene mutation;
-         * light.color stays black, so the light never exists in the visible band.
-         */
-        setNirSensing(on) {
-            if (disposed) return;
-            gi.setNirSensing(on);
-            setNirDirectSensing(on);
-        },
-
-        /**
-         * Sensed-band illuminator gain: one scalar trim for BOTH raster terms of
-         * emitter-class-'ir' lights (probes' NEE + direct raster). Uniform writes
-         * only. Hosts running the spectral tracer wire its setNirGain alongside.
-         */
-        setNirGain(gain) {
-            if (disposed) return;
-            gi.setNirGain?.(gain);
-            setNirIlluminatorGain(gain);
-        },
-
-        getNirSensing: query('getNirSensing'),
-        getNirGain: query('getNirGain'),
         setChangeThreshold: mutate('setChangeThreshold'),
         setSnapAmount: mutate('setSnapAmount'),
         setFireflyClamp: mutate('setFireflyClamp'),

@@ -18,19 +18,9 @@ export {
     REFLECTION_QUALITY_TIERS, resolveReflectionQuality,
 } from './gi_probes.js';
 
-// Lights node that injects the GI term into every PBR material.
-// setNirDirectSensing flips the DIRECT term of emitter-class-'ir' lights between
-// bands (0 in visible, white × intensity under NV); pair it with the probe field's
-// setNirSensing — or use the install handle's setNirSensing, which does both.
-// isIrEmitter / getOrCreateIrLightNode are the seam for hosts with a CUSTOM lights
-// node: lift IR lights out of your batched path onto these nodes and the same
-// setNirDirectSensing switch drives them.
-export {
-    giLights, default as GiLightsNode,
-    setNirDirectSensing, getNirDirectSensing,
-    setNirIlluminatorGain, getNirIlluminatorGain,
-    isIrEmitter, getOrCreateIrLightNode,
-} from './gi_lights_node.js';
+// Lights node that injects the GI term into every PBR material. Band-specific
+// emitters (IR illuminators) are ordinary lights: gate them through their colour.
+export { giLights, default as GiLightsNode } from './gi_lights_node.js';
 
 // SECONDARY MODE — clustered lighting (three r185+ Forward+ addon): thousands of
 // non-shadowed point lights drawn cheaply by the raster while the GI lane budgets

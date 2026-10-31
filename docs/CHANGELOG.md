@@ -5,20 +5,26 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
-- The spectral tracer's spectral model moved to PowerShot
-  (`powershot-threejs/infrared`): the Jakob-Hanika sRGB-to-reflectance
-  upsampler with its coefficient LUT and generator, the Gen-3 photocathode
-  response (NV band), and the `classifyNir` material heuristics. The
-  `speedball-gi/srgb-lut` export, `photocathodeResponseJS` / `photocathodeS` /
-  `buildPhotocathodeSampler` / `NV_LAMBDA_*` from `spectral-traverse`, and
-  `classifyNir` from `spectral-scene` are removed; import them from PowerShot.
-  `powershot-threejs` is an optional peer dependency, required only by
-  `speedball-gi/spectral-tracer`. Tracer output is unchanged.
-- `buildTraversal` takes `spectral` (a PowerShot `createJhUpsampler`) in place
-  of `lut` / `lutRes`; `buildKernels` likewise. Without one, reflectance and
-  emission use the 3-bin `rgbToSpectral`, as the GI probes always have.
-- `buildSpectralScene({ classifyNir })` estimates material slot [25] for
-  untagged materials; GI no longer computes it.
+Speedball is GI only.
+
+- The spectral path tracer is removed (`speedball-gi/spectral-tracer`,
+  `spectral_kernel.js`); max.js now path traces with three-gpu-pathtracer.
+  Its spectral model moved to PowerShot (`powershot-threejs/infrared`): the
+  Jakob-Hanika sRGB-to-reflectance upsampler with its coefficient LUT and
+  generator, the Gen-3 photocathode response (NV band), and `classifyNir`.
+  Removed exports: `speedball-gi/srgb-lut`, `speedball-gi/spectral-tracer`,
+  `rgbToSpectral`, `LAMBDA_*`, `NV_LAMBDA_*` and the photocathode functions
+  from `spectral-traverse`, and `classifyNir` from `spectral-scene`.
+  `buildTraversal` no longer takes `env` / `lut` / `lutRes` nor returns the
+  spectral shading emitters (`jhReflectance`, `jhEmission`, `emitterAtLambda`,
+  `envAtLambda`, `cosineSample`); `buildSpectralScene` no longer returns `env`.
+- IR illuminators are ordinary lights. The GI NIR band gate is removed:
+  `setNirSensing` / `getNirSensing` / `setNirGain` / `getNirGain` on the field
+  and the install handle, and `setNirDirectSensing`, `setNirIlluminatorGain`,
+  `isIrEmitter` and `getOrCreateIrLightNode`. A black light emits nothing;
+  hosts gate band-specific emitters through the light's colour. Light record
+  slot 16 and material slot 25 are reserved (0). The GI lights nodes no longer
+  call `NodeLibrary.getLightNodeClass`, which three r187 removes.
 
 ## [0.9.0] — 2026-09-24
 
