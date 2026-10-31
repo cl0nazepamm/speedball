@@ -3,7 +3,7 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.11.0] — 2026-10-31
 
 - Three r187 support (`three >=0.185.0 <0.188.0`). r187 hoists a node used
   more than once into a const; the WebGL2 backend's raw sampler argument to its
