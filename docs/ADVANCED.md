@@ -22,8 +22,7 @@ ray budget and grid density for the target device.
 With `clusteredLighting` on WebGL, direct lighting uses the regular batched lights
 node and its configured `lights` caps. The GI light selection still uses the
 importance budget but traverses that list without compute-built cell lists.
-Forward+ raster clustering, spectral path tracing, and photon caustics remain
-WebGPU features.
+Forward+ raster clustering remains a WebGPU feature.
 
 To verify both backends locally, install the peer dependencies, serve the repo
 with `python -m http.server 8778`, and run:
@@ -214,18 +213,12 @@ const gi = installSpeedballGI({
 
 ## Additional package surfaces
 
-Speedball also ships lower-level light-transport entry points:
+Speedball also ships its lower-level scene entry points:
 
 - `speedball-gi/spectral-scene` and `speedball-gi/spectral-traverse` expose the
-  shared flattened scene, BVH, materials, lights, and traversal foundation.
-- `speedball-gi/caustics` exports `createCausticEngine` and receiver/caster presets.
+  flattened scene, BVH, materials, lights, and traversal the probes trace.
 
-The caustic engine supports analytic and mesh emission, rigid caster updates with
-`setCasterTransform()`, and procedural deformation through `setCasterMesh(mesh,
-{ shaper })`. Refraction mode uses BVH-accelerated through-mesh Snell traversal
-and Cauchy-style chromatic R/G/B grids. Response controls include
-`setLightIntensity`, `setLightColor`, `setReceiverAlbedo`, `setStrength`, and
-`setLightCone(direction, angleRadians, penumbra)`.
+The photon caustic engine moved to Sigils as `three-sigils/caustics`.
 
 Plain CDN import maps can use:
 

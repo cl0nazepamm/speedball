@@ -1,7 +1,7 @@
 {
   "name": "speedball-gi",
   "version": "0.11.0",
-  "description": "Real-time BVH-traced dynamic diffuse global illumination (DDGI) for three.js WebGPU and WebGL2 fallback, plus WebGPU spectral tracing and photon caustics.",
+  "description": "Real-time BVH-traced dynamic diffuse global illumination (DDGI) for three.js WebGPU and its WebGL2 fallback.",
   "type": "module",
   "license": "MIT",
   "author": "clone.software",
@@ -12,7 +12,6 @@
     "./install": "./js/install.js",
     "./spectral-scene": "./js/spectral_scene.js",
     "./spectral-traverse": "./js/spectral_traverse.js",
-    "./caustics": "./js/caustic_engine.js",
     "./package.json": "./package.json"
   },
   "repository": {
@@ -28,8 +27,6 @@
     "docs/CHANGELOG.md",
     "js/blas_cache.js",
     "js/blas_worker.js",
-    "js/caustic_bvh.js",
-    "js/caustic_engine.js",
     "js/gi_clustered_lights_node.js",
     "js/gi_budget.js",
     "js/gi_irradiance_volume.js",
@@ -59,10 +56,7 @@
     "probe",
     "irradiance",
     "bvh",
-    "real-time",
-    "path-tracing",
-    "spectral",
-    "caustics"
+    "real-time"
   ],
   "scripts": {
     "check": "node scripts/check-package.mjs",

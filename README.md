@@ -87,7 +87,7 @@ supports one active probe field per module instance.
 ## Documentation
 
 - [Advanced integration](docs/ADVANCED.md) — tuning, reflections, clustered
-  lighting, explicit dirty lanes, diagnostics, spectral tracing, and caustics.
+  lighting, explicit dirty lanes, diagnostics, and the scene entry points.
 - [Changelog](docs/CHANGELOG.md)
 
 ## License

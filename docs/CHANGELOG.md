@@ -3,6 +3,13 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- The photon caustic engine moved to Sigils (`three-sigils/caustics`):
+  `speedball-gi/caustics`, `js/caustic_engine.js` and `js/caustic_bvh.js` are
+  removed. The package description and keywords no longer list spectral
+  tracing or caustics.
+
 ## [0.11.0] — 2026-10-31
 
 - Three r187 support (`three >=0.185.0 <0.188.0`). r187 hoists a node used
