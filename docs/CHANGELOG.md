@@ -3,6 +3,22 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] — 2026-11-04
+
+- **Breaking:** the GI scene modules drop the name of the removed spectral
+  path tracer. The old subpaths are removed, not aliased:
+  - `speedball-gi/spectral-scene` → `speedball-gi/gi-scene`
+    (`js/spectral_scene.js` → `js/gi_scene.js`)
+  - `speedball-gi/spectral-traverse` → `speedball-gi/gi-traverse`
+    (`js/spectral_traverse.js` → `js/gi_traverse.js`)
+  - `buildSpectralScene` → `buildGiScene`
+- Material record slot 11 is reserved (0), like slot 25. It carried
+  `material.dispersion` for the removed tracer and nothing read it. The record
+  layout and every other slot index are unchanged, and GI output is identical.
+  Materials that differ only in `dispersion` now share one record.
+- The docs drop the IR-illuminator note; Speedball has no band-specific
+  concept.
+
 ## [0.12.0] — 2026-10-31
 
 - The photon caustic engine moved to Sigils (`three-sigils/caustics`):

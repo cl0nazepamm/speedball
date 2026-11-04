@@ -1,6 +1,6 @@
 {
   "name": "speedball-gi",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Real-time BVH-traced dynamic diffuse global illumination (DDGI) for three.js WebGPU and its WebGL2 fallback.",
   "type": "module",
   "license": "MIT",
@@ -10,8 +10,8 @@
   "exports": {
     ".": "./js/index.js",
     "./install": "./js/install.js",
-    "./spectral-scene": "./js/spectral_scene.js",
-    "./spectral-traverse": "./js/spectral_traverse.js",
+    "./gi-scene": "./js/gi_scene.js",
+    "./gi-traverse": "./js/gi_traverse.js",
     "./package.json": "./package.json"
   },
   "repository": {
@@ -34,11 +34,11 @@
     "js/gi_oct.js",
     "js/gi_probes.js",
     "js/gi_refit.js",
+    "js/gi_scene.js",
+    "js/gi_traverse.js",
     "js/gi_webgl.js",
     "js/index.js",
     "js/install.js",
-    "js/spectral_scene.js",
-    "js/spectral_traverse.js",
     "js/webgpu_cleanup.js",
     "LICENSE",
     "README.md"

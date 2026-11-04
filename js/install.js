@@ -14,7 +14,7 @@ import { createProbeField } from './gi_probes.js';
 import { giLights } from './gi_lights_node.js';
 import { giClusteredLights } from './gi_clustered_lights_node.js';
 
-// spectral_scene / gi_probes gate: userData.maxjsVisible === false → kept out of the
+// gi_scene / gi_probes gate: userData.maxjsVisible === false → kept out of the
 // GI BVH and the auto-fit bounds. Wrapped here so callers never touch the raw flag.
 const EXCLUDE_FLAG = 'maxjsVisible';
 

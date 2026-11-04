@@ -1,13 +1,13 @@
 // ── In-place bounds refit for a flattened, threaded BLAS node range ──
 //
-// spectral_scene.js pools every BLAS into flat bvhNodes/triIndex/vertexData
+// gi_scene.js pools every BLAS into flat bvhNodes/triIndex/vertexData
 // buffers (see its header). When a mesh DEFORMS without changing topology
 // (streamed vertex buffers, morphs, CPU skinning), the tree STRUCTURE stays
 // valid — only the node bounds go stale. This refit rewrites them in place,
 // so a deform costs O(verts + nodes) instead of a ~200 ms synchronous
 // MeshBVH rebuild on the render thread.
 //
-// Layout contract (flattenBVHRoot + the pool assembly in spectral_scene.js):
+// Layout contract (flattenBVHRoot + the pool assembly in gi_scene.js):
 //   • nodes are PRE-ORDER: an interior node's left child is at i+1;
 //   • the miss/escape link of the left child IS the right child's index
 //     (a node's miss = first slot after its whole subtree, so the left
@@ -182,7 +182,7 @@ function defaultBudgetYield() {
     return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-// Generic latest-state runner used by spectral_scene's large deform path.
+// Generic latest-state runner used by gi_scene's large deform path.
 // `task.step` may mutate CPU staging arrays, but `commit` is reached only after
 // a complete, still-current task. A stale snapshot is discarded and captured
 // again after yielding; callers therefore converge to the latest quiet state

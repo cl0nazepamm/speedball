@@ -10,7 +10,7 @@ Thin wall strips, ceiling panels, and monitors should contribute predictably at 
 
 - The reference room has no active traced lights or injected sky. Its emissives currently reach probes through discovery rays; the explicit emitter list was empty during diagnosis.
 - At the reference bounds and default padding, Divisions 14/15/16 create 975/1,120/1,530 probes. The first interior Y layer moves from 30.8/36.0/2.4 cm. Placement, visibility, cell-scaled bias, and update cadence therefore confound a density comparison.
-- `spectral_scene.js::collectEmitterRecords` is opt-in through `giEmitter`, approximates emitters with bounding spheres, and currently reads only the first material. Its geometry/area collection does not expand instance transforms.
+- `gi_scene.js::collectEmitterRecords` is opt-in through `giEmitter`, approximates emitters with bounding spheres, and currently reads only the first material. Its geometry/area collection does not expand instance transforms.
 - `gi_probes.js::emitterVisKernel` and `injectEmitterVirtualRays` skip probes inside an emitter's bounding sphere. This fails for long strips surrounding nearby probes. The selected emitter cap is 16.
 - Tagged emitters have traced emission zeroed to avoid double counting. Replacing that policy requires coordinated changes to discovery hits, explicit sampling, diffuse history, and reflection history.
 

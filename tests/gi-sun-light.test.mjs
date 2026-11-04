@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import * as THREE from 'three';
-import { collectLights } from '../js/spectral_scene.js';
+import { collectLights } from '../js/gi_scene.js';
 
 test('SunLight is directional and does not inherit the previous light target', () => {
     const scene = new THREE.Scene();

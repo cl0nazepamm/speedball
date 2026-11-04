@@ -1,7 +1,5 @@
-// spectral_traverse.js — TSL BVH traversal + material helpers for the
-// SPEEDBALL GI probe kernel. The module and
-// its package export keep the name of the spectral path tracer that once
-// shared it.
+// gi_traverse.js — TSL BVH traversal + material helpers for the
+// SPEEDBALL GI probe kernel.
 //
 // buildTraversal() returns graph EMITTERS (not values): each call site builds a
 // fresh subgraph. It closes over the storage nodes + uniforms passed in, so the
@@ -25,7 +23,7 @@ export const RAY_EPS = 1e-3;
 // uniforms. `storages` = { bvhNodes, triIndex, vertexData, triMaterial,
 // materials } (TSL storage nodes). `U` must expose nodeCount (BLAS pool),
 // tlasNodeCount, instBase, tlasBase (uint uniforms — instance records + TLAS
-// nodes live in the tail of the materials buffer, see spectral_scene.js).
+// nodes live in the tail of the materials buffer, see gi_scene.js).
 // `maps` holds the scene's PBR DataArrayTextures ({} when none). Traversal is
 // TWO-LEVEL: world-ray TLAS walk over
 // instance AABBs → local-ray BLAS walk per instance; hit shading transforms

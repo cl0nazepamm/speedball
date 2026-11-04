@@ -215,23 +215,19 @@ const gi = installSpeedballGI({
 
 Speedball also ships its lower-level scene entry points:
 
-- `speedball-gi/spectral-scene` and `speedball-gi/spectral-traverse` expose the
-  flattened scene, BVH, materials, lights, and traversal the probes trace.
+- `speedball-gi/gi-scene` and `speedball-gi/gi-traverse` expose the flattened
+  scene, BVH, materials, lights, and traversal the probes trace.
 
 The photon caustic engine moved to Sigils as `three-sigils/caustics`.
 
 Plain CDN import maps can use:
 
 ```text
-https://cdn.jsdelivr.net/npm/speedball-gi@0.12.0/js/index.js
+https://cdn.jsdelivr.net/npm/speedball-gi@0.13.0/js/index.js
 ```
 
 Packed light records use 17 floats; slot 16 is reserved. Material records use 28
-floats; slot 25 is reserved and slot 26 stores traversal flags.
-
-Band-specific emitters such as IR illuminators are ordinary lights: a black
-light emits nothing, so gate one through its colour (max.js lights IR
-illuminators only while PowerShot senses NIR).
+floats; slots 11 and 25 are reserved and slot 26 stores traversal flags.
 
 ## Limitations
 

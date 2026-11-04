@@ -18,8 +18,7 @@ export {
     REFLECTION_QUALITY_TIERS, resolveReflectionQuality,
 } from './gi_probes.js';
 
-// Lights node that injects the GI term into every PBR material. Band-specific
-// emitters (IR illuminators) are ordinary lights: gate them through their colour.
+// Lights node that injects the GI term into every PBR material.
 export { giLights, default as GiLightsNode } from './gi_lights_node.js';
 
 // SECONDARY MODE — clustered lighting (three r185+ Forward+ addon): thousands of

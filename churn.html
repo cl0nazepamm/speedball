@@ -192,7 +192,7 @@ const M = {
   flag: new THREE.MeshStandardMaterial({
     color: 0x3a6fd8, roughness: 0.78, metalness: 0, side: THREE.DoubleSide }),
 };
-// Shared-geometry cache. spectral_scene dedupes one BLAS per (geometry identity ×
+// Shared-geometry cache. gi_scene dedupes one BLAS per (geometry identity ×
 // per-tri material mapping), so re-using a BoxGeometry across dozens of dressing
 // meshes keeps the ENTER/LEAVE and TOPOLOGY rebuild cost about the CHURN instead of
 // about the dressing — the dressing costs instance rows, not BVH builds.
@@ -479,7 +479,7 @@ droneRing.rotation.x = Math.PI / 2;
 droneOrb.castShadow = droneRing.castShadow = droneRing.receiveShadow = true;
 drone.add(droneOrb, droneRing);
 scene.add(drone);
-// spectral_scene resolves transform targets against its traced-MESH table, so a
+// gi_scene resolves transform targets against its traced-MESH table, so a
 // parent Group is silently skipped — the lane reports the meshes themselves.
 const droneParts = [droneOrb, droneRing];
 function animateEmissive(t) {

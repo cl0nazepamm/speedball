@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import * as THREE from 'three';
-import { buildSpectralScene } from '../js/spectral_scene.js';
+import { buildGiScene } from '../js/gi_scene.js';
 
 test('density centroids follow shared geometry, parent transforms, and active instances', async () => {
     const scene = new THREE.Scene();
@@ -23,7 +23,7 @@ test('density centroids follow shared geometry, parent transforms, and active in
     const ordinary = new THREE.Mesh(geometry, material);
     ordinary.position.set(-100, 25, 300);
     scene.add(ordinary);
-    const built = await buildSpectralScene({ THREE, scene });
+    const built = await buildGiScene({ THREE, scene });
     assert.equal(built.error, null);
     assert.equal(built.triCount, 1, 'geometry remains one shared BLAS');
     const collect = () => {

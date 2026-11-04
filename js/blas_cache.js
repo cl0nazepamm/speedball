@@ -4,7 +4,7 @@
 // changed. Entries are keyed by the same structural fingerprint as the
 // in-build dedup (geometry identity × attribute identity/version × per-tri
 // uber mapping — or the host's stable `userData.speedballGeometryKey`, see
-// spectral_scene.js), so any content change misses. The cached core is
+// gi_scene.js), so any content change misses. The cached core is
 // immutable build output — records, soup slices, BVH-ordered materials — and
 // every build works on a shallow clone (see the reuse site), so per-build pool
 // offsets stamped by a newer build can never corrupt an older build that is

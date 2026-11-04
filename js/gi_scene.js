@@ -1,5 +1,4 @@
-// spectral_scene.js — CPU build pipeline for the scene the GI probes trace. The
-// module keeps the name of the spectral path tracer it was written for.
+// gi_scene.js — CPU build pipeline for the scene the GI probes trace.
 //
 // TWO-LEVEL BVH: one LOCAL-space BLAS per unique geometry (deduped, so
 // shared/instanced geometry is built once) pooled into a single stackless
@@ -18,10 +17,9 @@
 //
 // Materials are read as scalar PBR fields off the live material (works for
 // every Standard/Physical/Lambert/Phong/Basic node material; TSL/MaterialX
-// graphs fall back to their scalar values, same limitation as the old WebGL
-// tracer). PBR *maps* (albedo/normal/roughness/metalness/emissive) are also
-// extracted to GPU array textures and sampled at the hit UV — see
-// buildMaterialTextures below.
+// graphs fall back to their scalar values). PBR *maps*
+// (albedo/normal/roughness/metalness/emissive) are also extracted to GPU array
+// textures and sampled at the hit UV — see buildMaterialTextures below.
 
 import { MeshBVH } from 'three-mesh-bvh';
 import {
@@ -37,7 +35,7 @@ const NODE_STRIDE_U32 = 8;     // bvhNodes: 6 aabb floats + miss + payload
 // materials stride (floats). Layout:
 //   [0..2] baseColor RGB (linear) · [3] roughness · [4] metalness
 //   [5] transmission · [6] ior · [7..9] emissive RGB (linear×intensity)
-//   [10] opacity · [11] dispersionB
+//   [10] opacity · [11] reserved (0)
 //   [12] albedo-map layer · [13] normal-map layer · [14] roughness-map layer
 //   [15] metalness-map layer · [16] emissive-map layer   (all −1 = none)
 //   [17] normalScale · [18..19] uv repeat xy · [20..21] uv offset xy
@@ -155,7 +153,7 @@ function buildTriangleMaterialMap(geometry, materials, triCount, internMaterial,
 
 // ── Uber material mapping ──────────────────────────────────────────
 // One flat record maps every material model to: baseColor, roughness,
-// metalness, transmission, ior, emissive*intensity, opacity, dispersionB.
+// metalness, transmission, ior, emissive*intensity, opacity.
 // Reads linear-space color components directly (Three stores working-space).
 
 // userData.giColor / userData.giEmissive hint → [r,g,b] linear, or null. Accepts a
@@ -215,10 +213,6 @@ function materialToUber(material) {
     const opacity = Number.isFinite(material.opacity) ? material.opacity : 1;
     const alphaTest = Number.isFinite(material.alphaTest) ? material.alphaTest : 0;
     const em = emissiveScaled(material, [0, 0, 0]);
-    // Dispersion strength: the kernel reads this as the per-wavelength IOR
-    // spread n(λ) = ior ± dispersionB across the visible band. three's
-    // MeshPhysicalMaterial.dispersion drives it (0 = none).
-    const dispersionB = Number.isFinite(material.dispersion) ? material.dispersion : 0;
 
     // UV transform + normalScale: read from the primary present map (all maps in
     // a material almost always share one transform). Fast-not-accurate: a single
@@ -258,7 +252,7 @@ function materialToUber(material) {
         Math.max(1, ior),
         em[0], em[1], em[2],
         Math.min(1, Math.max(0, opacity)),
-        dispersionB,
+        0,                      // [11] reserved
         -1, -1, -1, -1, -1,   // [12..16] map layers, filled by buildMaterialTextures
         normalScale,
         repX, repY, offX, offY,
@@ -642,7 +636,7 @@ function flattenBVHRoot(rootBuffer, expectedTriCount) {
         }
         const n32 = item.n32;
         if (n32 < 0 || (n32 & 7) !== 0 || (n32 >>> 3) >= nodeCapacity || records.length >= nodeCapacity) {
-            throw new Error(`spectral_scene: BVH flatten walked outside the node buffer (n32=${n32}, visited=${records.length}, nodes=${nodeCapacity}) — three-mesh-bvh internal layout drifted; flattenBVHRoot expects the 0.9.4+ parent-relative child encoding.`);
+            throw new Error(`gi_scene: BVH flatten walked outside the node buffer (n32=${n32}, visited=${records.length}, nodes=${nodeCapacity}) — three-mesh-bvh internal layout drifted; flattenBVHRoot expects the 0.9.4+ parent-relative child encoding.`);
         }
         const isLeaf = u16[n32 * 2 + 15] === 0xFFFF;
         const idx = records.length;
@@ -671,13 +665,13 @@ function flattenBVHRoot(rootBuffer, expectedTriCount) {
     }
 
     if (records.length !== nodeCapacity) {
-        throw new Error(`spectral_scene: BVH flatten visited ${records.length} nodes but the buffer holds ${nodeCapacity} — three-mesh-bvh internal layout drifted.`);
+        throw new Error(`gi_scene: BVH flatten visited ${records.length} nodes but the buffer holds ${nodeCapacity} — three-mesh-bvh internal layout drifted.`);
     }
     if (Number.isFinite(expectedTriCount) && flattenedTris !== expectedTriCount) {
-        throw new Error(`spectral_scene: BVH flatten accounted for ${flattenedTris} triangles, expected ${expectedTriCount} — three-mesh-bvh internal layout drifted.`);
+        throw new Error(`gi_scene: BVH flatten accounted for ${flattenedTris} triangles, expected ${expectedTriCount} — three-mesh-bvh internal layout drifted.`);
     }
 
-    // Records are serialized at POOL-assembly time (buildSpectralScene) so a
+    // Records are serialized at POOL-assembly time (buildGiScene) so a
     // per-geometry BLAS can be placed at any base offset: miss links and leaf
     // triOffsets get the pool bases added there.
     return records;
@@ -705,8 +699,7 @@ export function collectLights(THREE, scene, camera = null) {
         const cr = (c?.isColor ? c.r : 1) * k;
         const cg = (c?.isColor ? c.g : 1) * k;
         const cb = (c?.isColor ? c.b : 1) * k;
-        // A black light emits nothing; hosts gate band-specific emitters (an IR
-        // illuminator under night vision) through the light's colour.
+        // A black light emits nothing.
         if (cr <= 0 && cg <= 0 && cb <= 0) return;
         let type = 1, range = 0, decay = 2, cosAngle = -1, cosPen = -1, w = 0, h = 0;
         dir.set(0, 0, -1);
@@ -828,7 +821,7 @@ export function collectEmitterRecords(THREE, scene, camera = null) {
 //   gatherLocalSoup     — CPU gather of the local soup (main thread, linear)
 //   buildLocalBlasTree  — the three-mesh-bvh build (main thread or blas_worker)
 //   finishLocalBlas     — flatten the root + BVH-ordered materials (main thread)
-// buildLocalBlas composes the three synchronously; buildSpectralScene uses the
+// buildLocalBlas composes the three synchronously; buildGiScene uses the
 // worker pool for cache misses when one is available and falls back to it.
 function gatherLocalSoup(d) {
     const { pos, index, normal, uv } = d;
@@ -1240,7 +1233,7 @@ function attrIdentity(attr) {
     return id;
 }
 
-export async function buildSpectralScene({
+export async function buildGiScene({
     THREE,
     scene,
     camera = null,

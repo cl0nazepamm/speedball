@@ -1,4 +1,4 @@
-// blas_worker.js — off-thread three-mesh-bvh build for spectral_scene's BLASes.
+// blas_worker.js — off-thread three-mesh-bvh build for gi_scene's BLASes.
 //
 // three-mesh-bvh's packed-tree builder (src/core/build/buildTree.js and the
 // modules it imports) is pure typed-array code with no `three` import, so a
@@ -9,7 +9,7 @@
 // false })` would (same buildPackedTree code path over a duck-typed bvh whose
 // primitive bounds mirror MeshBVH.computePrimitiveBounds), permutes the index
 // in place, and transfers both buffers back with the root node buffer.
-// spectral_scene.js then flattens that root exactly as it does for a
+// gi_scene.js then flattens that root exactly as it does for a
 // main-thread build, so the two paths are byte-for-byte interchangeable.
 //
 // Everything the worker runs is also exported, so hosts and smoke tests can

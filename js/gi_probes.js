@@ -1,7 +1,7 @@
 // gi_probes.js — SPEEDBALL GI DDGI irradiance field.
 //
 // A world-space grid of octahedral irradiance probes traced against the
-// stackless two-level BVH spectral_scene.js builds and spectral_traverse.js
+// stackless two-level BVH gi_scene.js builds and gi_traverse.js
 // walks. Shared TSL math runs
 // in WebGPU compute or WebGL2 fragment passes; neither solve reads back to the CPU.
 //
@@ -30,17 +30,17 @@ import {
     positionViewDirection, cameraWorldMatrix, roughness,
 } from 'three/tsl';
 
-// buildSpectralScene (pulls three-mesh-bvh) is lazy-loaded in rebuild() so
+// buildGiScene (pulls three-mesh-bvh) is lazy-loaded in rebuild() so
 // importing this module for the GiProbeNode (e.g. from max_lights_node.js) does
 // NOT drag the CPU BVH builder into that module graph.
-let _buildSpectralScene = null;
+let _buildGiScene = null;
 let _createBlasCache = null;
 let _getBlasWorkerState = null;
 let _rebindMaterialMapsArenaBuild = null;
 let _collectLights = null;       // cheap light/emitter re-collect for reactivity (no BVH rebuild)
 let _emissiveScaled = null;
 let _LIGHT_STRIDE = 16;
-import { buildTraversal, T_MAX, RAY_EPS, PI } from './spectral_traverse.js';
+import { buildTraversal, T_MAX, RAY_EPS, PI } from './gi_traverse.js';
 import { createWebGLProbeBackend, webglProbeSupport, disposeProbeTexture } from './gi_webgl.js';
 import { octEncodeNode, octDecodeNode } from './gi_oct.js';
 import { createProbeBudgetController } from './gi_budget.js';
@@ -134,7 +134,7 @@ const GI_CHEBY_BIAS_CELL = 0.08;       // Chebyshev SELF-OCCLUSION tolerance as 
                                        // small enough to stay UNDER wall thickness so leak-free
                                        // visibility through real walls is preserved.
 const MAX_TRIANGLES = 4_000_000;
-const MAX_LIGHTS = 64;             // matches spectral_scene LIGHT_STRIDE table
+const MAX_LIGHTS = 64;             // matches gi_scene LIGHT_STRIDE table
 const GI_EMITTER_INJECT_CAP = 16;
 const GI_EMITTER_VIS_RETENTION = 0.8;
 const GI_LIGHTS_PER_CELL = 16;
@@ -1127,7 +1127,7 @@ export function createProbeField({
     let giLightGridDirty = false;
     let buildDirty = true;
     // Monotonic invalidation token for the CPU soup. A native/browser scene
-    // update can arrive while buildSpectralScene is yielding to material-map
+    // update can arrive while buildGiScene is yielding to material-map
     // extraction; the token prevents that request from being cleared by the
     // older build when it resumes.
     let buildGeneration = 0;
@@ -2125,7 +2125,7 @@ export function createProbeField({
                             const reachesHit = isDir.or(lrange.lessThanEqual(float(0.0))).or(dist.lessThan(lrange));
                             If(ndl.greaterThan(float(0.0)).and(reachesHit), () => {
                                 const lcol = loadLightVec3(lb, 7);
-                                // Black lights (e.g. a host-gated IR illuminator) skip the shadow query.
+                                // Black lights skip the shadow query.
                                 const lpeak = tslMax(tslMax(lcol.x, lcol.y), lcol.z);
                                 If(ndl.mul(lpeak).greaterThan(float(0.0)), () => {
                                     const ldecay = lights.element(lb.add(uint(11)));
@@ -2174,7 +2174,7 @@ export function createProbeField({
                 } else {
                     // NEE over ALL lights (count small; loop avoids sampling noise).
                     Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
-                        // stride matches spectral_scene LIGHT_STRIDE (17).
+                        // stride matches gi_scene LIGHT_STRIDE (17).
                         const lb = li.mul(uint(17)).toVar();
                         const ltype = lights.element(lb);
                         If(ltype.lessThan(float(2.5)), () => {
@@ -3172,9 +3172,9 @@ export function createProbeField({
     }
 
     async function ensureSceneBuilder() {
-        if (!_buildSpectralScene) {
-            const mod = await import('./spectral_scene.js');
-            _buildSpectralScene = mod.buildSpectralScene;
+        if (!_buildGiScene) {
+            const mod = await import('./gi_scene.js');
+            _buildGiScene = mod.buildGiScene;
             _createBlasCache = mod.createBlasCache || null;
             _getBlasWorkerState = mod.getBlasWorkerState || null;
             _rebindMaterialMapsArenaBuild = mod.rebindMaterialMapsArenaBuild || null;
@@ -3188,11 +3188,11 @@ export function createProbeField({
             _emissiveScaled = mod.emissiveScaled || null;
             if (Number.isFinite(mod.LIGHT_STRIDE)) _LIGHT_STRIDE = mod.LIGHT_STRIDE;
         }
-        return _buildSpectralScene;
+        return _buildGiScene;
     }
 
     // Auto-fit the grid to the TRACED geometry only — honour the SAME visibility gate
-    // the BVH uses (spectral_scene.objectIsRenderable: userData.maxjsVisible !== false).
+    // the BVH uses (gi_scene.objectIsRenderable: userData.maxjsVisible !== false).
     // Box3.setFromObject(scene) would include the sky dome — a unit box scaled to
     // ~camera.far (≈15× the model) — plus probe-helper/gizmo meshes, ballooning the grid
     // so probes land in open air and the injected irradiance washes out to ~nothing.
@@ -3415,7 +3415,7 @@ export function createProbeField({
         // divisions/rays change (buildDirty=false) skips the synchronous MeshBVH build.
         let built = cachedBuilt;
         if (!built || buildDirty) {
-            const buildSpectralScene = await ensureSceneBuilder();
+            const buildGiScene = await ensureSceneBuilder();
             if (disposed) return false;
             // Capture after the lazy import: changes that land while the module
             // loads are included in this build. Changes during the build's own
@@ -3428,7 +3428,7 @@ export function createProbeField({
                 mapsArena.maxLayers = Number(renderer?.backend?.device?.limits?.maxTextureArrayLayers)
                     || mapsArena.maxLayers;
             }
-            built = await buildSpectralScene({
+            built = await buildGiScene({
                 THREE,
                 scene,
                 maxTriangles: MAX_TRIANGLES,
@@ -4198,7 +4198,7 @@ export function createProbeField({
     // DEFORM (deformSignature → in-place gather+refit), not a rebuild — this
     // split is what keeps a streamed vertex animation from arming the ~200 ms
     // MeshBVH rebuild the moment the stream pauses. SkinnedMesh is skipped to
-    // mirror the BVH build (spectral_scene isTraceableMesh): GPU skinning
+    // mirror the BVH build (gi_scene isTraceableMesh): GPU skinning
     // never lands in the soup, so its churn must not schedule rebuilds.
     // CONSUMER CONTRACT: hosts streaming geometry must not bump identity or
     // version on data that did not change. A byte-identical index re-send
@@ -4288,7 +4288,7 @@ export function createProbeField({
         return h;
     }
     // Moving-object fast path: rewrite the instance table + TLAS in place from
-    // the live matrixWorlds (spectral_scene updateTransforms) and re-upload the
+    // the live matrixWorlds (gi_scene updateTransforms) and re-upload the
     // small materials buffer. No soup rewrite, no MeshBVH rebuild, no shader
     // recompile — probes re-trace the moved geometry on the next solve pass.
     // A null result means the instance set changed under us → full rebuild.
@@ -4310,7 +4310,7 @@ export function createProbeField({
     }
     // Material-VALUE fast path: as long as the probes keep tracing, a
     // non-structural material edit is FREE — the affected resident uber records
-    // are rewritten in place (spectral_scene updateMaterialValues) and those few
+    // are rewritten in place (gi_scene updateMaterialValues) and those few
     // floats re-uploaded; the field re-converges through the bounded per-texel
     // change detector, multi-bounce included. No soup rewrite, no MeshBVH, no
     // recompile. Structural drift (map binding, material reassignment, dedup
@@ -4330,7 +4330,7 @@ export function createProbeField({
         return true;
     }
     // Deforming-object fast path: re-gather the deformed BLAS vertex slices +
-    // refit their node bounds in place (spectral_scene updateDeforms — no
+    // refit their node bounds in place (gi_scene updateDeforms — no
     // MeshBVH, no allocation, no recompile), then re-upload ONLY the touched
     // slices of vertexData/bvhNodes plus the instance/TLAS tail. Probes
     // re-trace the deformed geometry on the next solve pass and re-converge
